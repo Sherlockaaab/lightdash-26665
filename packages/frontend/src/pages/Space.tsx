@@ -1,0 +1,537 @@
+import { subject } from '@casl/ability';
+import {
+    ContentType,
+    FeatureFlags,
+    LightdashMode,
+    ResourceViewItemType,
+    type ResourceViewSpaceItem,
+} from '@lightdash/common';
+import { Box, Group, Menu, Stack, Button, ActionIcon } from '@mantine-8/core';
+import { useDisclosure } from '@mantine-8/hooks';
+import {
+    IconDots,
+    IconFolderCog,
+    IconFolderPlus,
+    IconFolderX,
+    IconLock,
+    IconPlus,
+} from '@tabler/icons-react';
+import { useCallback, useState, type FC } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router';
+import EmptyStateLoader from '../components/common/EmptyStateLoader';
+import ErrorState from '../components/common/ErrorState';
+import MantineIcon from '../components/common/MantineIcon';
+import DashboardCreateModal from '../components/common/modal/DashboardCreateModal';
+import Page from '../components/common/Page/Page';
+import PageBreadcrumbs from '../components/common/PageBreadcrumbs';
+import InfiniteResourceTable from '../components/common/ResourceView/InfiniteResourceTable';
+import { ColumnVisibility } from '../components/common/ResourceView/types';
+import ShareSpaceModal from '../components/common/ShareSpaceModal';
+import SpaceActionModal from '../components/common/SpaceActionModal';
+import { ActionType } from '../components/common/SpaceActionModal/types';
+import SuboptimalState from '../components/common/SuboptimalState/SuboptimalState';
+import TransferItemsModal from '../components/common/TransferItemsModal/TransferItemsModal';
+import CreateResourceToSpace from '../components/Explorer/SpaceBrowser/CreateResourceToSpace';
+import { SpaceBrowserMenu } from '../components/Explorer/SpaceBrowser/SpaceBrowserMenu';
+import { AddToSpaceResources } from '../components/Explorer/SpaceBrowser/types';
+import ForbiddenPanel from '../components/ForbiddenPanel';
+import { useSpacePinningMutation } from '../hooks/pinning/useSpaceMutation';
+import { useContentAction } from '../hooks/useContent';
+import { useServerFeatureFlag } from '../hooks/useServerOrClientFeatureFlag';
+import { useSpace } from '../hooks/useSpaces';
+import { Can } from '../providers/Ability';
+import useApp from '../providers/App/useApp';
+import { FavoritesProvider } from '../providers/Favorites/FavoritesProvider';
+import useTracking from '../providers/Tracking/useTracking';
+import { EventName } from '../types/Events';
+
+const Space: FC = () => {
+    const { projectUuid, spaceUuid } = useParams<{
+        projectUuid: string;
+        spaceUuid: string;
+    }>() as {
+        projectUuid: string;
+        spaceUuid: string;
+    };
+    const {
+        data: space,
+        isInitialLoading,
+        error,
+    } = useSpace(projectUuid, spaceUuid);
+
+    const { mutate: pinSpace } = useSpacePinningMutation(projectUuid);
+    const { user, health } = useApp();
+    const { track } = useTracking();
+
+    const userCanManageSpace = user.data?.ability?.can(
+        'create',
+        subject('Space', {
+            organizationUuid: user.data?.organizationUuid,
+            projectUuid,
+        }),
+    );
+
+    const isDemo = health.data?.mode === LightdashMode.DEMO;
+    const dataAppsFlag = useServerFeatureFlag(FeatureFlags.EnableDataApps);
+    const dataAppsEnabled = dataAppsFlag.data?.enabled ?? false;
+    const navigate = useNavigate();
+    const location = useLocation();
+
+    const [updateSpace, setUpdateSpace] = useState<boolean>(false);
+    const [deleteSpace, setDeleteSpace] = useState<boolean>(false);
+    const [shareSpace, setShareSpace] = useState<boolean>(false);
+    const [
+        isTransferToSpaceOpen,
+        { open: openTransferToSpace, close: closeTransferToSpace },
+    ] = useDisclosure(false);
+    const [isCreateDashboardOpen, setIsCreateDashboardOpen] =
+        useState<boolean>(false);
+    const [isCreateNestedSpaceOpen, setIsCreateNestedSpaceOpen] =
+        useState<boolean>(false);
+    const [createToSpace, setCreateToSpace] = useState<AddToSpaceResources>();
+
+    const { mutateAsync: contentAction, isLoading: isContentActionLoading } =
+        useContentAction(projectUuid);
+
+    const handlePinToggleSpace = useCallback(
+        (spaceId: string) => pinSpace(spaceId),
+        [pinSpace],
+    );
+
+    if (isInitialLoading) {
+        return <EmptyStateLoader my="xl" title="Loading space" />;
+    }
+
+    if (error) {
+        return <ErrorState error={error.error} />;
+    }
+
+    if (space === undefined) {
+        return (
+            <div style={{ marginTop: '20px' }}>
+                <SuboptimalState
+                    title="Space does not exist"
+                    description={`We could not find space with uuid ${spaceUuid}`}
+                />
+            </div>
+        );
+    }
+
+    if (user.data?.ability?.cannot('view', subject('Space', { ...space }))) {
+        return <ForbiddenPanel />;
+    }
+
+    const userCanCreateDashboards = user.data?.ability?.can(
+        'create',
+        subject('Dashboard', { ...space }),
+    );
+
+    const userCanCreateCharts = user.data?.ability?.can(
+        'create',
+        subject('SavedChart', { ...space }),
+    );
+
+    // Data apps have a project-level `create:DataApp` scope (no @space variant
+    // for create), so we combine it with `manage:DataApp` against the space —
+    // the latter is only granted to space EDITOR/ADMIN (or project admins),
+    // mirroring the implicit space-role check that dashboards/charts get for
+    // free via their space-scoped create scope.
+    const userCanCreateDataApps =
+        dataAppsEnabled &&
+        user.data?.ability?.can(
+            'create',
+            subject('DataApp', {
+                organizationUuid: user.data?.organizationUuid,
+                projectUuid,
+            }),
+        ) &&
+        user.data?.ability?.can('manage', subject('DataApp', { ...space }));
+
+    const userCanManageProject = user.data?.ability?.can(
+        'manage',
+        subject('Project', {
+            organizationUuid: user.data?.organizationUuid,
+            projectUuid: projectUuid,
+        }),
+    );
+
+    const userCanManageSpaceAndHasNoDirectAccessToSpace =
+        userCanManageProject &&
+        !space.access.find((a) => a.userUuid === user.data?.userUuid)
+            ?.hasDirectAccess;
+
+    return (
+        <FavoritesProvider projectUuid={projectUuid}>
+            <Page
+                title={space?.name}
+                withCenteredRoot
+                withCenteredContent
+                withXLargePaddedContent
+                withLargeContent
+            >
+                <Stack gap="xxl" w="100%">
+                    <Group justify="space-between">
+                        <PageBreadcrumbs
+                            items={[
+                                {
+                                    title: 'Spaces',
+                                    to: `/projects/${projectUuid}/spaces`,
+                                },
+                                ...(space.breadcrumbs?.map(
+                                    (breadcrumb, index) => {
+                                        const isLastBreadcrumb =
+                                            index ===
+                                            (space.breadcrumbs?.length ?? 0) -
+                                                1;
+                                        const isAccessible =
+                                            breadcrumb.hasAccess;
+
+                                        return {
+                                            title: isAccessible ? (
+                                                breadcrumb.name
+                                            ) : (
+                                                <span
+                                                    style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        gap: 4,
+                                                    }}
+                                                >
+                                                    <MantineIcon
+                                                        icon={IconLock}
+                                                        size={14}
+                                                        color="ldGray.5"
+                                                    />
+                                                    {breadcrumb.name}
+                                                </span>
+                                            ),
+                                            active: isLastBreadcrumb,
+                                            ...(isAccessible
+                                                ? {
+                                                      to: `/projects/${projectUuid}/spaces/${breadcrumb.uuid}`,
+                                                      onClick: () => {
+                                                          if (
+                                                              user.data
+                                                                  ?.userUuid &&
+                                                              user.data
+                                                                  ?.organizationUuid
+                                                          ) {
+                                                              track({
+                                                                  name: EventName.SPACE_BREADCRUMB_CLICKED,
+                                                                  properties: {
+                                                                      userId: user
+                                                                          .data
+                                                                          ?.userUuid,
+                                                                      organizationId:
+                                                                          user
+                                                                              .data
+                                                                              ?.organizationUuid,
+                                                                      projectId:
+                                                                          projectUuid,
+                                                                  },
+                                                              });
+                                                          }
+                                                      },
+                                                  }
+                                                : {
+                                                      tooltipProps: {
+                                                          label: 'You do not have access to this space',
+                                                      },
+                                                  }),
+                                        };
+                                    },
+                                ) ?? []),
+                            ]}
+                        />
+
+                        <Group gap="xs">
+                            {!isDemo &&
+                                (userCanCreateDashboards ||
+                                    userCanCreateCharts ||
+                                    userCanCreateDataApps ||
+                                    userCanManageSpace) && (
+                                    <Menu
+                                        position="bottom-end"
+                                        shadow="md"
+                                        closeOnItemClick
+                                        withArrow
+                                        arrowPosition="center"
+                                    >
+                                        <Menu.Target>
+                                            <Box>
+                                                <Button
+                                                    data-testid="Space/AddButton"
+                                                    leftSection={
+                                                        <MantineIcon
+                                                            icon={IconPlus}
+                                                        />
+                                                    }
+                                                >
+                                                    Add
+                                                </Button>
+                                            </Box>
+                                        </Menu.Target>
+
+                                        <Menu.Dropdown>
+                                            {userCanManageSpace && (
+                                                <>
+                                                    <Menu.Item
+                                                        leftSection={
+                                                            <MantineIcon
+                                                                icon={
+                                                                    IconFolderPlus
+                                                                }
+                                                            />
+                                                        }
+                                                        onClick={() => {
+                                                            setIsCreateNestedSpaceOpen(
+                                                                true,
+                                                            );
+                                                        }}
+                                                    >
+                                                        Create space
+                                                    </Menu.Item>
+                                                    <Menu.Divider />
+                                                </>
+                                            )}
+
+                                            {userCanCreateDashboards ? (
+                                                <Menu.Item
+                                                    leftSection={
+                                                        <MantineIcon
+                                                            icon={IconPlus}
+                                                        />
+                                                    }
+                                                    onClick={() => {
+                                                        setIsCreateDashboardOpen(
+                                                            true,
+                                                        );
+                                                    }}
+                                                >
+                                                    Create new dashboard
+                                                </Menu.Item>
+                                            ) : null}
+
+                                            {userCanCreateCharts ? (
+                                                <Menu.Item
+                                                    leftSection={
+                                                        <MantineIcon
+                                                            icon={IconPlus}
+                                                        />
+                                                    }
+                                                    onClick={() => {
+                                                        setCreateToSpace(
+                                                            AddToSpaceResources.CHART,
+                                                        );
+                                                    }}
+                                                >
+                                                    Create new chart
+                                                </Menu.Item>
+                                            ) : null}
+
+                                            {userCanCreateDataApps ? (
+                                                <Menu.Item
+                                                    leftSection={
+                                                        <MantineIcon
+                                                            icon={IconPlus}
+                                                        />
+                                                    }
+                                                    onClick={() => {
+                                                        void navigate(
+                                                            `/projects/${projectUuid}/apps/generate?spaceUuid=${space.uuid}`,
+                                                        );
+                                                    }}
+                                                >
+                                                    Create new data app
+                                                </Menu.Item>
+                                            ) : null}
+                                        </Menu.Dropdown>
+                                    </Menu>
+                                )}
+                            <Can I="manage" this={subject('Space', space)}>
+                                <SpaceBrowserMenu
+                                    onRename={() => setUpdateSpace(true)}
+                                    onDelete={() => setDeleteSpace(true)}
+                                    onTogglePin={() =>
+                                        handlePinToggleSpace(space?.uuid)
+                                    }
+                                    onTransferToSpace={() => {
+                                        openTransferToSpace();
+                                    }}
+                                    onShare={() => setShareSpace(true)}
+                                    isPinned={!!space?.pinnedListUuid}
+                                    spaceUuid={spaceUuid}
+                                >
+                                    <ActionIcon variant="default" size={36}>
+                                        <MantineIcon
+                                            icon={IconDots}
+                                            size="lg"
+                                        />
+                                    </ActionIcon>
+                                </SpaceBrowserMenu>
+                                {updateSpace && (
+                                    <SpaceActionModal
+                                        projectUuid={projectUuid}
+                                        spaceUuid={space?.uuid}
+                                        actionType={ActionType.UPDATE}
+                                        title="Update space"
+                                        confirmButtonLabel="Update"
+                                        icon={IconFolderCog}
+                                        onClose={() => setUpdateSpace(false)}
+                                        parentSpaceUuid={space.parentSpaceUuid}
+                                    />
+                                )}
+                                {deleteSpace && (
+                                    <SpaceActionModal
+                                        projectUuid={projectUuid}
+                                        spaceUuid={space?.uuid}
+                                        actionType={ActionType.DELETE}
+                                        parentSpaceUuid={null}
+                                        title="Delete space"
+                                        confirmButtonLabel="Delete"
+                                        confirmButtonColor="red"
+                                        icon={IconFolderX}
+                                        onSubmitForm={() => {
+                                            if (
+                                                location.pathname.includes(
+                                                    space?.uuid,
+                                                )
+                                            ) {
+                                                if (space?.parentSpaceUuid) {
+                                                    void navigate(
+                                                        `/projects/${projectUuid}/spaces/${space.parentSpaceUuid}`,
+                                                    );
+                                                } else {
+                                                    void navigate(
+                                                        `/projects/${projectUuid}/home`,
+                                                    );
+                                                }
+                                            }
+                                        }}
+                                        onClose={() => {
+                                            setDeleteSpace(false);
+                                        }}
+                                    />
+                                )}
+                                {shareSpace && (
+                                    <ShareSpaceModal
+                                        space={space}
+                                        projectUuid={projectUuid}
+                                        opened
+                                        onClose={() => setShareSpace(false)}
+                                    />
+                                )}
+                            </Can>
+                        </Group>
+                    </Group>
+                    <InfiniteResourceTable
+                        filters={{
+                            projectUuid,
+                            spaceUuids: [spaceUuid],
+                            contentTypes: [
+                                ContentType.DASHBOARD,
+                                ContentType.CHART,
+                                ContentType.SPACE,
+                                ContentType.DATA_APP,
+                            ],
+                        }}
+                        contentTypeFilter={{
+                            defaultValue: undefined,
+                            options: [
+                                ContentType.DASHBOARD,
+                                ContentType.CHART,
+                                ...(dataAppsEnabled
+                                    ? [ContentType.DATA_APP]
+                                    : []),
+                            ],
+                        }}
+                        columnVisibility={{
+                            [ColumnVisibility.SPACE]: false,
+                        }}
+                        enableBottomToolbar={false}
+                        enableRowSelection={userCanManageSpace}
+                        adminContentView={userCanManageProject}
+                        initialAdminContentViewValue={
+                            userCanManageSpaceAndHasNoDirectAccessToSpace
+                                ? 'all'
+                                : 'shared'
+                        }
+                    />
+
+                    {createToSpace && (
+                        <CreateResourceToSpace resourceType={createToSpace} />
+                    )}
+                    <DashboardCreateModal
+                        projectUuid={projectUuid}
+                        defaultSpaceUuid={space.uuid}
+                        opened={isCreateDashboardOpen}
+                        onClose={() => setIsCreateDashboardOpen(false)}
+                        onConfirm={(dashboard) => {
+                            void navigate(
+                                `/projects/${projectUuid}/dashboards/${dashboard.uuid}/edit`,
+                            );
+
+                            setIsCreateDashboardOpen(false);
+                        }}
+                    />
+
+                    {isCreateNestedSpaceOpen && (
+                        <SpaceActionModal
+                            projectUuid={projectUuid}
+                            actionType={ActionType.CREATE}
+                            parentSpaceUuid={space.uuid}
+                            title={`Create space in "${space.name}"`}
+                            confirmButtonLabel="Create"
+                            icon={IconFolderPlus}
+                            onClose={() => setIsCreateNestedSpaceOpen(false)}
+                            spaceUuid={spaceUuid}
+                            onSubmitForm={() => {
+                                setIsCreateNestedSpaceOpen(false);
+                            }}
+                            shouldRedirect={false}
+                        />
+                    )}
+
+                    {isTransferToSpaceOpen && (
+                        <TransferItemsModal
+                            projectUuid={projectUuid}
+                            opened
+                            items={[
+                                {
+                                    data: {
+                                        ...space,
+                                        access: [],
+                                        accessListLength: 0,
+                                        dashboardCount: 0,
+                                        chartCount: 0,
+                                        childSpaceCount: 0,
+                                        appCount: 0,
+                                    },
+                                    type: ResourceViewItemType.SPACE,
+                                } satisfies ResourceViewSpaceItem,
+                            ]}
+                            isLoading={isContentActionLoading}
+                            onClose={closeTransferToSpace}
+                            onConfirm={async (newSpaceUuid) => {
+                                await contentAction({
+                                    action: {
+                                        type: 'move',
+                                        targetSpaceUuid: newSpaceUuid,
+                                    },
+                                    item: {
+                                        uuid: space.uuid,
+                                        contentType: ContentType.SPACE,
+                                    },
+                                });
+
+                                closeTransferToSpace();
+                            }}
+                        />
+                    )}
+                </Stack>
+            </Page>
+        </FavoritesProvider>
+    );
+};
+
+export default Space;

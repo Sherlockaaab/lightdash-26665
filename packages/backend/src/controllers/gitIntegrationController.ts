@@ -1,0 +1,277 @@
+import {
+    AdditionalMetric,
+    ApiErrorPayload,
+    ApiGitFileContent,
+    assertRegisteredAccount,
+    CustomDimension,
+    ForbiddenError,
+    PullRequestCreated,
+} from '@lightdash/common';
+import {
+    Body,
+    Deprecated,
+    Get,
+    Hidden,
+    Middlewares,
+    OperationId,
+    Path,
+    Post,
+    Query,
+    Request,
+    Response,
+    Route,
+    SuccessResponse,
+    Tags,
+} from '@tsoa/runtime';
+import express from 'express';
+import { toSessionUser } from '../auth/account';
+import { lightdashConfig } from '../config/lightdashConfig';
+import {
+    allowApiKeyAuthentication,
+    getDeprecatedRouteMiddleware,
+    isAuthenticated,
+    unauthorisedInDemo,
+} from './authentication';
+import { BaseController } from './baseController';
+
+@Route('/api/v1/projects/{projectUuid}/git-integration')
+@Response<ApiErrorPayload>('default', 'Error')
+@Tags('Git Integration')
+export class GitIntegrationController extends BaseController {
+    /**
+     * Create a pull request for custom metrics
+     * @summary Create PR for custom metrics
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/pull-requests/custom-metrics')
+    @OperationId('CreatePullRequestForCustomMetrics')
+    async CreatePullRequestForCustomMetrics(
+        @Path() projectUuid: string,
+        @Body()
+        body: {
+            customMetrics: AdditionalMetric[];
+            quoteChar?: `"` | `'`; // to be used in the yml dump options
+        },
+        @Request() req: express.Request,
+    ): Promise<{ status: 'ok'; results: PullRequestCreated }> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGitIntegrationService()
+                .createPullRequest(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    body.quoteChar || '"',
+                    {
+                        type: 'customMetrics',
+                        fields: body.customMetrics,
+                    },
+                ),
+        };
+    }
+
+    /**
+     * Create a pull request for custom dimensions
+     * @summary Create PR for custom dimensions
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/pull-requests/custom-dimensions')
+    @OperationId('CreatePullRequestForCustomDimensions')
+    async CreatePullRequestForCustomDimensions(
+        @Path() projectUuid: string,
+        @Body()
+        body: {
+            customDimensions: CustomDimension[];
+            quoteChar?: `"` | `'`; // to be used in the yml dump options
+        },
+        @Request() req: express.Request,
+    ): Promise<{ status: 'ok'; results: PullRequestCreated }> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGitIntegrationService()
+                .createPullRequest(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    body.quoteChar || '"',
+                    {
+                        type: 'customDimensions',
+                        fields: body.customDimensions,
+                    },
+                ),
+        };
+    }
+
+    /**
+     * List git branches for the project repository
+     * @summary List git branches
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @SuccessResponse('200')
+    @Get('/branches')
+    @Hidden()
+    @OperationId('listBranches')
+    async listBranches(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+    ): Promise<{
+        status: 'ok';
+        results: Array<string>;
+    }> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGitIntegrationService()
+                .getBranches(toSessionUser(req.account), projectUuid),
+        };
+    }
+
+    /**
+     * Get the YAML file for an explore's base table
+     * @summary Get explore file
+     *
+     * @deprecated Use GET /api/v1/projects/{projectUuid}/git/branches/{branch}/files instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+        getDeprecatedRouteMiddleware(new Date('2026-06-10'), {
+            suffixMessage:
+                'Use GET /api/v1/projects/{projectUuid}/git/branches/{branch}/files instead.',
+        }),
+    ])
+    @SuccessResponse('200', 'Success')
+    @Get('/explores/{exploreName}/files')
+    @OperationId('GetGitFileForExplore')
+    @Deprecated()
+    async getFileForExplore(
+        @Path() projectUuid: string,
+        @Path() exploreName: string,
+        @Request() req: express.Request,
+    ): Promise<{ status: 'ok'; results: ApiGitFileContent }> {
+        assertRegisteredAccount(req.account);
+        if (!lightdashConfig.editYamlInUi.enabled) {
+            throw new ForbiddenError('Edit YAML in UI feature is not enabled');
+        }
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGitIntegrationService()
+                .getFileForExplore(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    exploreName,
+                ),
+        };
+    }
+
+    /**
+     * Get the file path for an explore's YAML file (without fetching content)
+     * @summary Get explore file path
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Get('/explores/{exploreName}/file-path')
+    @OperationId('GetGitFilePathForExplore')
+    async getFilePathForExplore(
+        @Path() projectUuid: string,
+        @Path() exploreName: string,
+        @Request() req: express.Request,
+    ): Promise<{ status: 'ok'; results: { filePath: string } }> {
+        assertRegisteredAccount(req.account);
+        if (!lightdashConfig.editYamlInUi.enabled) {
+            throw new ForbiddenError('Edit YAML in UI feature is not enabled');
+        }
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGitIntegrationService()
+                .getFilePathForExplore(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    exploreName,
+                ),
+        };
+    }
+
+    /**
+     * Create a pull request with arbitrary file changes
+     * @summary Create file PR
+     *
+     * @deprecated Use POST /api/v1/projects/{projectUuid}/git/branches/{branch}/pull-request instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+        getDeprecatedRouteMiddleware(new Date('2026-06-10'), {
+            suffixMessage:
+                'Use POST /api/v1/projects/{projectUuid}/git/branches/{branch}/pull-request instead.',
+        }),
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/pull-requests/file-change')
+    @OperationId('CreatePullRequestForFileChange')
+    @Deprecated()
+    async createPullRequestForFileChange(
+        @Path() projectUuid: string,
+        @Body()
+        body: {
+            filePath: string;
+            content: string;
+            originalSha: string;
+            title: string;
+            description: string;
+        },
+        @Request() req: express.Request,
+    ): Promise<{ status: 'ok'; results: PullRequestCreated }> {
+        assertRegisteredAccount(req.account);
+        if (!lightdashConfig.editYamlInUi.enabled) {
+            throw new ForbiddenError('Edit YAML in UI feature is not enabled');
+        }
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGitIntegrationService()
+                .createPullRequestWithFileChange(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    body.filePath,
+                    body.content,
+                    body.originalSha,
+                    body.title,
+                    body.description,
+                ),
+        };
+    }
+}

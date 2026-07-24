@@ -1,0 +1,699 @@
+import {
+    ForbiddenError,
+    ParameterError,
+    type ExternalConnection,
+    type SessionUser,
+} from '@lightdash/common';
+import { SecureFetchError } from '../../../utils/secureFetch/secureFetch';
+import * as secureFetchModule from '../../../utils/secureFetch/secureFetch';
+import { ExternalConnectionService } from './ExternalConnectionService';
+
+// Keep SecureFetchError real: auto-mocking the class would stub its
+// constructor and drop the reason/message the service forwards.
+vi.mock('../../../utils/secureFetch/secureFetch', async (importOriginal) => {
+    const actual =
+        await importOriginal<
+            typeof import('../../../utils/secureFetch/secureFetch')
+        >();
+    return { ...actual, secureFetch: vi.fn() };
+});
+
+const mockSecureFetch = vi.mocked(secureFetchModule.secureFetch);
+
+const baseConnection = (
+    overrides: Partial<ExternalConnection> = {},
+): ExternalConnection => ({
+    externalConnectionUuid: 'conn-1',
+    projectUuid: 'proj-1',
+    organizationUuid: 'org-1',
+    name: 'Weather API',
+    type: 'none',
+    origin: 'https://api.example.com',
+    instructions: null,
+    allowedPathPrefixes: ['/v1/'],
+    allowedMethods: ['GET', 'POST'],
+    allowedContentTypes: ['application/json'],
+    responseMaxBytes: 1_000_000,
+    requestMaxBytes: 10_000,
+    timeoutMs: 5_000,
+    rateLimitPerMinute: null,
+    apiKeyName: null,
+    apiKeyLocation: null,
+    oauthScopes: null,
+    customHeaders: null,
+    hasSecret: false,
+    createdByUserUuid: 'user-1',
+    updatedByUserUuid: 'user-1',
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    ...overrides,
+});
+
+const baseApp = () => ({
+    app_id: 'app-1',
+    project_uuid: 'proj-1',
+    space_uuid: null,
+    created_by_user_uuid: 'user-1',
+    organization_uuid: 'org-1',
+});
+
+const user = {
+    userUuid: 'user-1',
+    organizationUuid: 'org-1',
+    ability: { can: () => true },
+} as unknown as SessionUser;
+
+function buildService(opts: {
+    connection?: ExternalConnection | undefined;
+    secret?: string | null;
+    canView?: boolean;
+    rateCount?: number;
+    googleToken?: string;
+}) {
+    const externalConnectionModel = {
+        resolveAppAlias: vi.fn().mockResolvedValue(opts.connection),
+        getDecryptedSecret: vi.fn().mockResolvedValue(opts.secret ?? null),
+        incrementRateCounter: vi.fn().mockResolvedValue(opts.rateCount ?? 1),
+    };
+    const googleTokenProvider = {
+        getAccessToken: vi
+            .fn()
+            .mockResolvedValue(opts.googleToken ?? 'test-access-token'),
+    };
+    const appModel = {
+        getApp: vi.fn().mockResolvedValue(baseApp()),
+    };
+    const projectModel = {
+        getSummary: vi.fn().mockResolvedValue({ organizationUuid: 'org-1' }),
+    };
+    const spacePermissionService = {
+        getSpaceAccessContext: vi.fn().mockResolvedValue({}),
+    };
+    const analytics = { track: vi.fn() };
+
+    const service = new ExternalConnectionService({
+        externalConnectionModel,
+        appModel,
+        projectModel,
+        spacePermissionService,
+        analytics,
+        googleTokenProvider,
+    } as never);
+
+    // Force the CASL view decision deterministically.
+    vi.spyOn(
+        service as unknown as { createAuditedAbility: () => unknown },
+        'createAuditedAbility',
+    ).mockReturnValue({
+        can: () => opts.canView ?? true,
+        cannot: () => !(opts.canView ?? true),
+    });
+
+    return {
+        service,
+        externalConnectionModel,
+        appModel,
+        analytics,
+        googleTokenProvider,
+    };
+}
+
+beforeEach(() => {
+    mockSecureFetch.mockReset();
+    mockSecureFetch.mockResolvedValue({
+        status: 200,
+        contentType: 'application/json',
+        bodyText: '{"ok":true}',
+        truncated: false,
+    });
+});
+
+describe('ExternalConnectionService.proxyFetch', () => {
+    it('rejects when the alias is not linked to the app', async () => {
+        const { service } = buildService({ connection: undefined });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ForbiddenError);
+    });
+
+    it('throws ForbiddenError when the user cannot view the app', async () => {
+        const { service } = buildService({
+            connection: baseConnection(),
+            canView: false,
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ForbiddenError);
+    });
+
+    it('rejects a method not in the connection allowlist', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ allowedMethods: ['GET'] }),
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                method: 'POST',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+    });
+
+    it('rejects an absolute URL in path', async () => {
+        const { service } = buildService({ connection: baseConnection() });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: 'https://evil.com/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+    });
+
+    it('rejects .. traversal in path', async () => {
+        const { service } = buildService({ connection: baseConnection() });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/../admin',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+    });
+
+    it('rejects encoded-host //evil.com', async () => {
+        const { service } = buildService({ connection: baseConnection() });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '//evil.com/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+    });
+
+    it('rejects a path matching no allowed prefix', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ allowedPathPrefixes: ['/v1/'] }),
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/admin/secrets',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+    });
+
+    it('happy GET: calls secureFetch with the server-built URL and no body', async () => {
+        const { service } = buildService({ connection: baseConnection() });
+        const res = await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/today',
+            query: { city: 'oslo' },
+        });
+        expect(mockSecureFetch).toHaveBeenCalledTimes(1);
+        const [url, opts] = mockSecureFetch.mock.calls[0];
+        expect(url).toBe('https://api.example.com/v1/today?city=oslo');
+        expect(opts.method).toBe('GET');
+        expect(opts.body).toBeUndefined();
+        expect(opts.timeoutMs).toBe(5_000);
+        expect(opts.maxResponseBytes).toBe(1_000_000);
+        expect(opts.allowedContentTypes).toEqual(['application/json']);
+        expect(res).toEqual({
+            status: 200,
+            contentType: 'application/json',
+            body: { ok: true },
+            truncated: false,
+        });
+    });
+
+    it('GET is rate-limited like every other method', async () => {
+        const { service, externalConnectionModel } = buildService({
+            connection: baseConnection({ rateLimitPerMinute: 5 }),
+            rateCount: 1,
+        });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        expect(externalConnectionModel.incrementRateCounter).toHaveBeenCalled();
+    });
+
+    it('rejects a GET over the rate limit with a 429-class error', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ rateLimitPerMinute: 1 }),
+            rateCount: 2,
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toMatchObject({ statusCode: 429 });
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('happy POST: server sets Content-Type and serializes the body', async () => {
+        const { service } = buildService({ connection: baseConnection() });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            method: 'POST',
+            path: '/v1/echo',
+            body: { hello: 'world' },
+        });
+        const [, opts] = mockSecureFetch.mock.calls[0];
+        expect(opts.method).toBe('POST');
+        expect(opts.body).toBe('{"hello":"world"}');
+        expect(opts.headers!['Content-Type']).toBe('application/json');
+    });
+
+    it.each(['PUT', 'PATCH', 'DELETE'] as const)(
+        'happy %s: forwards the method and serializes the body when allowed',
+        async (method) => {
+            const { service } = buildService({
+                connection: baseConnection({
+                    allowedMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+                }),
+            });
+            await service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                method,
+                path: '/v1/echo',
+                body: { hello: 'world' },
+            });
+            const [, opts] = mockSecureFetch.mock.calls[0];
+            expect(opts.method).toBe(method);
+            expect(opts.body).toBe('{"hello":"world"}');
+            expect(opts.headers!['Content-Type']).toBe('application/json');
+        },
+    );
+
+    it('POST over requestMaxBytes is rejected', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ requestMaxBytes: 5 }),
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                method: 'POST',
+                path: '/v1/echo',
+                body: { hello: 'world' },
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('injects a bearer token into the Authorization header', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ type: 'bearer_token' }),
+            secret: 'tok_abc',
+        });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        const [, opts] = mockSecureFetch.mock.calls[0];
+        expect(opts.headers!.Authorization).toBe('Bearer tok_abc');
+    });
+
+    it('injects an api_key into a header', async () => {
+        const { service } = buildService({
+            connection: baseConnection({
+                type: 'api_key',
+                apiKeyName: 'X-Api-Key',
+                apiKeyLocation: 'header',
+            }),
+            secret: 'sec_123',
+        });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        const [url, opts] = mockSecureFetch.mock.calls[0];
+        expect(opts.headers!['X-Api-Key']).toBe('sec_123');
+        expect(url).not.toContain('sec_123');
+    });
+
+    it('injects an api_key into the query string', async () => {
+        const { service } = buildService({
+            connection: baseConnection({
+                type: 'api_key',
+                apiKeyName: 'apikey',
+                apiKeyLocation: 'query',
+            }),
+            secret: 'sec_q',
+        });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+            query: { a: '1' },
+        });
+        const [url, opts] = mockSecureFetch.mock.calls[0];
+        expect(new URL(url).searchParams.get('apikey')).toBe('sec_q');
+        expect(opts.headers!.Authorization).toBeUndefined();
+    });
+
+    it('fails closed when a bearer_token connection has no stored secret', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ type: 'bearer_token' }),
+            secret: null,
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when an api_key connection has no stored secret', async () => {
+        const { service } = buildService({
+            connection: baseConnection({
+                type: 'api_key',
+                apiKeyName: 'X-Api-Key',
+                apiKeyLocation: 'header',
+            }),
+            secret: null,
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    const KEYFILE_SECRET =
+        '{"type":"service_account","client_email":"a@b.iam.gserviceaccount.com","private_key":"k"}';
+
+    it('mints and injects a Google service account access token as a bearer token', async () => {
+        const { service, googleTokenProvider } = buildService({
+            connection: baseConnection({
+                type: 'google_service_account',
+                oauthScopes: ['https://www.googleapis.com/auth/bigquery'],
+            }),
+            secret: KEYFILE_SECRET,
+            googleToken: 'minted-access-token',
+        });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        expect(googleTokenProvider.getAccessToken).toHaveBeenCalledWith(
+            KEYFILE_SECRET,
+            ['https://www.googleapis.com/auth/bigquery'],
+        );
+        const [, opts] = mockSecureFetch.mock.calls[0];
+        expect(opts.headers!.Authorization).toBe('Bearer minted-access-token');
+    });
+
+    it('fails closed when a google_service_account connection has no stored secret', async () => {
+        const { service } = buildService({
+            connection: baseConnection({
+                type: 'google_service_account',
+                oauthScopes: ['https://www.googleapis.com/auth/bigquery'],
+            }),
+            secret: null,
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when Google token minting fails', async () => {
+        const { service, googleTokenProvider } = buildService({
+            connection: baseConnection({
+                type: 'google_service_account',
+                oauthScopes: ['https://www.googleapis.com/auth/bigquery'],
+            }),
+            secret: KEYFILE_SECRET,
+        });
+        googleTokenProvider.getAccessToken.mockRejectedValueOnce(
+            new Error('token endpoint unreachable'),
+        );
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('sends the connection custom headers alongside the injected auth', async () => {
+        const { service } = buildService({
+            connection: baseConnection({
+                type: 'bearer_token',
+                customHeaders: {
+                    'anthropic-version': '2023-06-01',
+                    Accept: 'application/json',
+                },
+            }),
+            secret: 'tok_abc',
+        });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        const [, opts] = mockSecureFetch.mock.calls[0];
+        expect(opts.headers!['anthropic-version']).toBe('2023-06-01');
+        expect(opts.headers!.Accept).toBe('application/json');
+        expect(opts.headers!.Authorization).toBe('Bearer tok_abc');
+    });
+
+    it('fails closed on a stored forbidden custom header (Content-Type)', async () => {
+        // Belt-and-braces: content-type is rejected at write time, but even a
+        // row that bypassed validation must fail closed rather than override.
+        const { service } = buildService({
+            connection: baseConnection({
+                customHeaders: { 'Content-Type': 'text/evil' },
+            }),
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                method: 'POST',
+                path: '/v1/echo',
+                body: {},
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('rejects an api_key configured to inject a forbidden header (Host)', async () => {
+        const { service } = buildService({
+            connection: baseConnection({
+                type: 'api_key',
+                apiKeyName: 'Host',
+                apiKeyLocation: 'header',
+            }),
+            secret: 'sec',
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it.each([['blocked_ip'], ['redirect'], ['too_large'], ['timeout']])(
+        'maps SecureFetchError(%s) to a ParameterError with no raw detail',
+        async (reason) => {
+            const { service } = buildService({ connection: baseConnection() });
+            mockSecureFetch.mockRejectedValueOnce(
+                new SecureFetchError(
+                    reason as never,
+                    `internal: connect to 10.0.0.1`,
+                ),
+            );
+            const promise = service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                path: '/v1/x',
+            });
+            await expect(promise).rejects.toBeInstanceOf(ParameterError);
+            const err = await promise.catch((e) => e);
+            expect(err.message).toBe(
+                `Upstream request was blocked (${reason})`,
+            );
+        },
+    );
+
+    it('forwards an upstream error response (status + body) instead of throwing', async () => {
+        mockSecureFetch.mockResolvedValueOnce({
+            status: 400,
+            contentType: 'application/json',
+            bodyText: '{"error":"anthropic-version header is required"}',
+            truncated: false,
+        });
+        const { service, analytics } = buildService({
+            connection: baseConnection(),
+        });
+        const res = await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        expect(res.status).toBe(400);
+        expect(res.body).toEqual({
+            error: 'anthropic-version header is required',
+        });
+        expect(analytics.track).toHaveBeenCalledWith(
+            expect.objectContaining({
+                properties: expect.objectContaining({
+                    status: 400,
+                    outcome: 'upstream_error',
+                }),
+            }),
+        );
+    });
+
+    it('rate-limits the 2nd POST over the limit with a 429-class error', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ rateLimitPerMinute: 1 }),
+            rateCount: 2,
+        });
+        const promise = service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            method: 'POST',
+            path: '/v1/x',
+            body: {},
+        });
+        await expect(promise).rejects.toMatchObject({ statusCode: 429 });
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('uses DEFAULT 60/min when rateLimitPerMinute is null', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ rateLimitPerMinute: null }),
+            rateCount: 61,
+        });
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                method: 'POST',
+                path: '/v1/x',
+                body: {},
+            }),
+        ).rejects.toMatchObject({ statusCode: 429 });
+    });
+
+    it('parses non-JSON content type as a raw string', async () => {
+        mockSecureFetch.mockResolvedValueOnce({
+            status: 200,
+            contentType: 'text/plain',
+            bodyText: 'plain text',
+            truncated: false,
+        });
+        const { service } = buildService({
+            connection: baseConnection({
+                allowedContentTypes: ['text/plain'],
+            }),
+        });
+        const res = await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        expect(res.body).toBe('plain text');
+    });
+
+    it('falls back to raw string when JSON content fails to parse', async () => {
+        mockSecureFetch.mockResolvedValueOnce({
+            status: 200,
+            contentType: 'application/json',
+            bodyText: 'not json{',
+            truncated: false,
+        });
+        const { service } = buildService({ connection: baseConnection() });
+        const res = await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        expect(res.body).toBe('not json{');
+    });
+
+    it('parses a structured-syntax +json content type (e.g. geo+json, with charset) as JSON', async () => {
+        mockSecureFetch.mockResolvedValueOnce({
+            status: 200,
+            contentType: 'application/geo+json; charset=utf-8',
+            bodyText: '{"type":"FeatureCollection","features":[]}',
+            truncated: false,
+        });
+        const { service } = buildService({
+            connection: baseConnection({
+                allowedContentTypes: ['application/geo+json'],
+            }),
+        });
+        const res = await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        expect(res.body).toEqual({ type: 'FeatureCollection', features: [] });
+    });
+
+    it('rejects a GET when the serialized query string exceeds requestMaxBytes', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ requestMaxBytes: 10 }),
+        });
+        // A query string longer than 10 bytes should be rejected before secureFetch.
+        await expect(
+            service.proxyFetch(user, 'proj-1', 'app-1', {
+                connectionAlias: 'weather',
+                method: 'GET',
+                path: '/v1/today',
+                query: { city: 'this-is-a-very-long-city-name' },
+            }),
+        ).rejects.toBeInstanceOf(ParameterError);
+        expect(mockSecureFetch).not.toHaveBeenCalled();
+    });
+
+    it('maps a malformed connection origin to a generic ParameterError (no stack exposed)', async () => {
+        const { service } = buildService({
+            connection: baseConnection({ origin: 'not-a-valid-url' }),
+        });
+        const promise = service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            path: '/v1/x',
+        });
+        await expect(promise).rejects.toBeInstanceOf(ParameterError);
+        // The raw TypeError from new URL() must not reach the client.
+        const err = await promise.catch((e) => e);
+        expect(err.message).not.toMatch(/Invalid URL/i);
+    });
+
+    it('emits an audit event without bodies or secrets', async () => {
+        const { service, analytics } = buildService({
+            connection: baseConnection({ type: 'bearer_token' }),
+            secret: 'tok_secret',
+        });
+        await service.proxyFetch(user, 'proj-1', 'app-1', {
+            connectionAlias: 'weather',
+            method: 'POST',
+            path: '/v1/x',
+            body: { secret_payload: 'do-not-log' },
+        });
+        expect(analytics.track).toHaveBeenCalledWith(
+            expect.objectContaining({
+                event: 'external_connection.fetch',
+                properties: expect.objectContaining({
+                    method: 'POST',
+                    path: '/v1/x',
+                    status: 200,
+                    outcome: 'ok',
+                }),
+            }),
+        );
+        const tracked = JSON.stringify(analytics.track.mock.calls);
+        expect(tracked).not.toContain('tok_secret');
+        expect(tracked).not.toContain('do-not-log');
+    });
+});

@@ -1,0 +1,94 @@
+import { type MetricWithAssociatedTimeDimension } from './catalog';
+import { DimensionType, type Dimension } from './field';
+import { FilterOperator } from './filter';
+
+/**
+ * Operators the Metrics Explorer filter UI can render (see getOperatorOptions).
+ * The compile-time validation of a metric's spotlight `default_filter` and the
+ * explorer's operator dropdown both read from this single list.
+ */
+export const METRICS_EXPLORER_FILTER_OPERATORS: readonly FilterOperator[] = [
+    FilterOperator.EQUALS,
+    FilterOperator.NOT_EQUALS,
+];
+
+/**
+ * A dimension whose type can be used to segment or filter in the Metrics
+ * Explorer: a string or boolean that is not a time-derived dimension.
+ */
+export const isMetricsExplorerCompatibleDimension = (
+    dimension: Pick<Dimension, 'type' | 'timeIntervalBaseDimensionName'>,
+): boolean =>
+    !dimension.timeIntervalBaseDimensionName &&
+    (dimension.type === DimensionType.STRING ||
+        dimension.type === DimensionType.BOOLEAN);
+
+export enum MetricExplorerComparison {
+    NONE = 'none',
+    PREVIOUS_PERIOD = 'previous_period',
+    DIFFERENT_METRIC = 'different_metric',
+}
+
+export type MetricExplorerPartialDateRange = [Date | null, Date | null];
+export type MetricExplorerDateRange = [Date, Date];
+
+export type MetricExplorerQuery =
+    | {
+          comparison: MetricExplorerComparison.NONE;
+          segmentDimension: string | null;
+      }
+    | {
+          comparison: MetricExplorerComparison.PREVIOUS_PERIOD;
+      }
+    | {
+          comparison: MetricExplorerComparison.DIFFERENT_METRIC;
+          metric: {
+              label: string;
+              table: string;
+              name: string;
+          };
+      };
+
+export type MetricExploreDataPoint = {
+    date: Date;
+    segment: string | null;
+    metric: {
+        value: number | null;
+        label: string | null;
+    };
+    compareMetric: {
+        value: number | null;
+        label: string | null;
+    };
+};
+
+export type MetricExploreDataPointWithDateValue = MetricExploreDataPoint & {
+    dateValue: number;
+};
+
+export type MetricsExplorerQueryResults = {
+    metric: MetricWithAssociatedTimeDimension;
+    points: MetricExploreDataPointWithDateValue[];
+};
+
+export type ApiMetricsExplorerQueryResults = {
+    status: 'ok';
+    results: MetricsExplorerQueryResults;
+};
+
+export enum MetricTotalComparisonType {
+    NONE = 'none',
+    PREVIOUS_PERIOD = 'previous_period',
+    ROLLING_DAYS = 'rolling_days',
+}
+
+export type MetricTotalResults = {
+    value: number | null;
+    comparisonValue: number | null;
+    metric: MetricWithAssociatedTimeDimension; // For now only previous period is supported in total query, so we only need the metric
+};
+
+export type ApiMetricsExplorerTotalResults = {
+    status: 'ok';
+    results: MetricTotalResults;
+};

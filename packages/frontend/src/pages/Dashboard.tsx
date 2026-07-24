@@ -1,0 +1,1119 @@
+import { subject } from '@casl/ability';
+import {
+    copyDateZoomTileTargets,
+    getShadowedReservedNames,
+    isEmptyDateZoomConfig,
+    normalizeDateZoomConfig,
+    pruneDateZoomConfig,
+    removeDateZoomTileTargets,
+    ContentType,
+    DateGranularity,
+    type UpdateDashboard,
+    type DashboardTile,
+    type Dashboard as IDashboard,
+} from '@lightdash/common';
+import { Button, Group, Text } from '@mantine-8/core';
+import { useDisclosure } from '@mantine-8/hooks';
+import {
+    ErrorBoundary as SentryErrorBoundary,
+    captureException,
+} from '@sentry/react';
+import { IconAlertCircle, IconCircleCheckFilled } from '@tabler/icons-react';
+import { useCallback, useEffect, useMemo, useState, type FC } from 'react';
+import { type Layout } from 'react-grid-layout';
+import { useBlocker, useNavigate, useParams } from 'react-router';
+import styles from '../components/common/Dashboard/Dashboard.module.css';
+import DashboardHeader from '../components/common/Dashboard/DashboardHeader';
+import ErrorState from '../components/common/ErrorState';
+import MantineModal from '../components/common/MantineModal';
+import DashboardDeleteModal from '../components/common/modal/DashboardDeleteModal';
+import DashboardDuplicateModal from '../components/common/modal/DashboardDuplicateModal';
+import { DashboardExportModal } from '../components/common/modal/DashboardExportModal';
+import Page from '../components/common/Page/Page';
+import PageSpinner from '../components/PageSpinner';
+import { useDashboardCommentsCheck } from '../features/comments';
+import { FilterBarPopoversProvider } from '../features/dashboardFilters/FilterRequirements/FilterBarPopoversProvider';
+import DashboardTabs from '../features/dashboardTabs';
+import {
+    appendNewTilesToBottom,
+    useUpdateDashboard,
+} from '../hooks/dashboard/useDashboard';
+import useDashboardStorage from '../hooks/dashboard/useDashboardStorage';
+import { useOrganization } from '../hooks/organization/useOrganization';
+import useToaster from '../hooks/toaster/useToaster';
+import { useContentAction } from '../hooks/useContent';
+import useApp from '../providers/App/useApp';
+import DashboardAiAgentContextBridge from '../providers/Dashboard/DashboardAiAgentContextBridge';
+import DashboardProvider from '../providers/Dashboard/DashboardProvider';
+import useDashboardContext from '../providers/Dashboard/useDashboardContext';
+import useDashboardTileStatusContext from '../providers/Dashboard/useDashboardTileStatusContext';
+import useFullscreen from '../providers/Fullscreen/useFullscreen';
+import '../styles/react-grid.css';
+
+const Dashboard: FC = () => {
+    const navigate = useNavigate();
+    const { projectUuid, dashboardUuid, mode } = useParams<{
+        projectUuid: string;
+        dashboardUuid: string;
+        mode?: string;
+    }>();
+
+    const { clearIsEditingDashboardChart, clearDashboardStorage } =
+        useDashboardStorage();
+
+    const isDashboardLoading = useDashboardContext((c) => c.isDashboardLoading);
+    const dashboard = useDashboardContext((c) => c.dashboard);
+
+    const dashboardError = useDashboardContext((c) => c.dashboardError);
+    const dashboardFilters = useDashboardContext((c) => c.dashboardFilters);
+    const dashboardTemporaryFilters = useDashboardContext(
+        (c) => c.dashboardTemporaryFilters,
+    );
+    const haveFiltersChanged = useDashboardContext((c) => c.haveFiltersChanged);
+    const setHaveFiltersChanged = useDashboardContext(
+        (c) => c.setHaveFiltersChanged,
+    );
+    const dashboardTiles = useDashboardContext((c) => c.dashboardTiles);
+    const setDashboardTiles = useDashboardContext((c) => c.setDashboardTiles);
+    const haveTilesChanged = useDashboardContext((c) => c.haveTilesChanged);
+    const setHaveTilesChanged = useDashboardContext(
+        (c) => c.setHaveTilesChanged,
+    );
+
+    const haveTabsChanged = useDashboardContext((c) => c.haveTabsChanged);
+    const setHaveTabsChanged = useDashboardContext((c) => c.setHaveTabsChanged);
+    const dashboardTabs = useDashboardContext((c) => c.dashboardTabs);
+    const setDashboardTabs = useDashboardContext((c) => c.setDashboardTabs);
+    const activeTab = useDashboardContext((c) => c.activeTab);
+    const setActiveTab = useDashboardContext((c) => c.setActiveTab);
+    const setDashboardFilters = useDashboardContext(
+        (c) => c.setDashboardFilters,
+    );
+    const dateZoomConfig = useDashboardContext((c) => c.dateZoomConfig);
+    const setDateZoomConfig = useDashboardContext((c) => c.setDateZoomConfig);
+    const resetDashboardFilters = useDashboardContext(
+        (c) => c.resetDashboardFilters,
+    );
+    const setDashboardTemporaryFilters = useDashboardContext(
+        (c) => c.setDashboardTemporaryFilters,
+    );
+    const isDateZoomDisabled = useDashboardContext((c) => c.isDateZoomDisabled);
+    const isAddFilterDisabled = useDashboardContext(
+        (c) => c.isAddFilterDisabled,
+    );
+    const requiredFiltersNote = useDashboardContext(
+        (c) => c.requiredFiltersNote,
+    );
+    const setRequiredFiltersNote = useDashboardContext(
+        (c) => c.setRequiredFiltersNote,
+    );
+    const isFilterRequirementsEnabled = useDashboardContext(
+        (c) => c.isFilterRequirementsEnabled,
+    );
+    const areAllChartsLoaded = useDashboardTileStatusContext(
+        (c) => c.areAllChartsLoaded,
+    );
+    const missingRequiredParameters = useDashboardContext(
+        (c) => c.missingRequiredParameters,
+    );
+    const refreshDashboardVersion = useDashboardContext(
+        (c) => c.refreshDashboardVersion,
+    );
+
+    const isEditMode = useMemo(() => mode === 'edit', [mode]);
+
+    const setSavedParameters = useDashboardContext((c) => c.setSavedParameters);
+    const parametersHaveChanged = useDashboardContext(
+        (c) => c.parametersHaveChanged,
+    );
+    const parameterValues = useDashboardContext((c) => c.parameterValues);
+    const clearAllParameters = useDashboardContext((c) => c.clearAllParameters);
+    const hasDateZoomDisabledChanged = useMemo(() => {
+        return (
+            (dashboard?.config?.isDateZoomDisabled || false) !==
+            isDateZoomDisabled
+        );
+    }, [dashboard, isDateZoomDisabled]);
+    const hasAddFilterDisabledChanged = useMemo(() => {
+        return (
+            (dashboard?.config?.isAddFilterDisabled || false) !==
+            isAddFilterDisabled
+        );
+    }, [dashboard, isAddFilterDisabled]);
+    const hasRequiredFiltersNoteChanged = useMemo(() => {
+        return (
+            (dashboard?.config?.requiredFiltersNote || undefined) !==
+            (requiredFiltersNote || undefined)
+        );
+    }, [dashboard, requiredFiltersNote]);
+    const oldestCacheTime = useDashboardTileStatusContext(
+        (c) => c.oldestCacheTime,
+    );
+    const preAggregateStatuses = useDashboardTileStatusContext(
+        (c) => c.preAggregateStatuses,
+    );
+    const dashboardParameters = useDashboardContext(
+        (c) => c.dashboardParameters,
+    );
+    const pinnedParameters = useDashboardContext((c) => c.pinnedParameters);
+    const toggleParameterPin = useDashboardContext((c) => c.toggleParameterPin);
+    const havePinnedParametersChanged = useDashboardContext(
+        (c) => c.havePinnedParametersChanged,
+    );
+    const setHavePinnedParametersChanged = useDashboardContext(
+        (c) => c.setHavePinnedParametersChanged,
+    );
+    const setPinnedParameters = useDashboardContext(
+        (c) => c.setPinnedParameters,
+    );
+    const parameterOrder = useDashboardContext((c) => c.parameterOrder);
+    const setParameterOrder = useDashboardContext((c) => c.setParameterOrder);
+    const hasParameterOrderChanged = useDashboardContext(
+        (c) => c.hasParameterOrderChanged,
+    );
+    const setHasParameterOrderChanged = useDashboardContext(
+        (c) => c.setHasParameterOrderChanged,
+    );
+    const dateZoomGranularities = useDashboardContext(
+        (c) => c.dateZoomGranularities,
+    );
+    const haveDateZoomGranularitiesChanged = useDashboardContext(
+        (c) => c.haveDateZoomGranularitiesChanged,
+    );
+    const setDateZoomGranularities = useDashboardContext(
+        (c) => c.setDateZoomGranularities,
+    );
+    const setHaveDateZoomGranularitiesChanged = useDashboardContext(
+        (c) => c.setHaveDateZoomGranularitiesChanged,
+    );
+    const defaultDateZoomGranularity = useDashboardContext(
+        (c) => c.defaultDateZoomGranularity,
+    );
+    const hasDefaultDateZoomGranularityChanged = useDashboardContext(
+        (c) => c.hasDefaultDateZoomGranularityChanged,
+    );
+    const setDefaultDateZoomGranularity = useDashboardContext(
+        (c) => c.setDefaultDateZoomGranularity,
+    );
+    const setHasDefaultDateZoomGranularityChanged = useDashboardContext(
+        (c) => c.setHasDefaultDateZoomGranularityChanged,
+    );
+    const hasDateZoomConfigChanged = useDashboardContext(
+        (c) => c.hasDateZoomConfigChanged,
+    );
+    const setHasDateZoomConfigChanged = useDashboardContext(
+        (c) => c.setHasDateZoomConfigChanged,
+    );
+
+    const parameterDefinitions = useDashboardContext(
+        (c) => c.parameterDefinitions,
+    );
+
+    const parameterReferences = useDashboardContext(
+        (c) => c.dashboardParameterReferences,
+    );
+
+    const referencedParameters = useMemo(() => {
+        return Object.fromEntries(
+            Object.entries(parameterDefinitions).filter(([key]) =>
+                parameterReferences.has(key),
+            ),
+        );
+    }, [parameterDefinitions, parameterReferences]);
+
+    const shadowedReservedNames = useMemo(
+        () => getShadowedReservedNames(Object.keys(referencedParameters)),
+        [referencedParameters],
+    );
+
+    const {
+        enabled: isFullScreenFeatureEnabled,
+        isFullscreen,
+        toggleFullscreen,
+    } = useFullscreen();
+    const { user } = useApp();
+    const { showToastError } = useToaster();
+
+    const { data: organization } = useOrganization();
+    const hasTemporaryFilters = useMemo(
+        () =>
+            dashboardTemporaryFilters.dimensions.length > 0 ||
+            dashboardTemporaryFilters.metrics.length > 0,
+        [dashboardTemporaryFilters],
+    );
+    // Callback to sync local state with server response after save
+    // This is needed when the backend modifies tiles (e.g., duplicating charts during tab duplication)
+    const handleDashboardUpdateSuccess = useCallback(
+        (updatedDashboard: IDashboard) => {
+            setDashboardTiles(updatedDashboard.tiles);
+            setDashboardTabs(updatedDashboard.tabs);
+        },
+        [setDashboardTiles, setDashboardTabs],
+    );
+
+    const {
+        mutate,
+        isSuccess,
+        reset,
+        isLoading: isSaving,
+    } = useUpdateDashboard(
+        dashboardUuid,
+        projectUuid,
+        false,
+        handleDashboardUpdateSuccess,
+    );
+
+    const { mutateAsync: contentAction, isLoading: isContentActionLoading } =
+        useContentAction(projectUuid);
+
+    const [isDeleteModalOpen, deleteModalHandlers] = useDisclosure();
+    const [isDuplicateModalOpen, duplicateModalHandlers] = useDisclosure();
+    const [isExportDashboardModalOpen, exportDashboardModalHandlers] =
+        useDisclosure();
+    const [isSaveVerificationModalOpen, saveVerificationModalHandlers] =
+        useDisclosure();
+
+    // tabs state
+    const [addingTab, setAddingTab] = useState<boolean>(false);
+
+    const tabsEnabled = dashboardTabs && dashboardTabs.length > 0;
+
+    const defaultTab = dashboardTabs?.[0];
+
+    useEffect(() => {
+        if (isDashboardLoading) return;
+        if (dashboardTiles) return;
+
+        setDashboardTiles(dashboard?.tiles ?? []);
+        setDashboardTabs(dashboard?.tabs ?? []);
+        setSavedParameters(dashboard?.parameters ?? {});
+    }, [
+        isDashboardLoading,
+        dashboard,
+        dashboardTiles,
+        setDashboardTiles,
+        setDashboardTabs,
+        setSavedParameters,
+    ]);
+
+    useEffect(() => {
+        if (isDashboardLoading) return;
+        if (dashboardTiles === undefined) return;
+        if (!dashboardUuid) return;
+
+        clearIsEditingDashboardChart();
+
+        const tilesStorageKey = `unsavedDashboardTiles:${dashboardUuid}`;
+        const unsavedDashboardTilesRaw =
+            sessionStorage.getItem(tilesStorageKey);
+        if (unsavedDashboardTilesRaw) {
+            sessionStorage.removeItem(tilesStorageKey);
+
+            try {
+                const unsavedDashboardTiles = JSON.parse(
+                    unsavedDashboardTilesRaw,
+                );
+                // If there are unsaved tiles, add them to the dashboard
+                setDashboardTiles(unsavedDashboardTiles);
+
+                setHaveTilesChanged(!!unsavedDashboardTiles);
+            } catch {
+                showToastError({
+                    title: 'Error parsing chart',
+                    subtitle: 'Unable to save chart in dashboard',
+                });
+                captureException(
+                    `Error parsing chart in dashboard. Attempted to parse: ${unsavedDashboardTilesRaw} `,
+                );
+            }
+        }
+
+        const tabsStorageKey = `dashboardTabs:${dashboardUuid}`;
+        const unsavedDashboardTabsRaw = sessionStorage.getItem(tabsStorageKey);
+
+        sessionStorage.removeItem(tabsStorageKey);
+
+        if (unsavedDashboardTabsRaw) {
+            try {
+                const unsavedDashboardTabs = JSON.parse(
+                    unsavedDashboardTabsRaw,
+                );
+                setDashboardTabs(unsavedDashboardTabs);
+                setHaveTabsChanged(!!unsavedDashboardTabs);
+            } catch {
+                showToastError({
+                    title: 'Error parsing tabs',
+                    subtitle: 'Unable to save tabs in dashboard',
+                });
+                captureException(
+                    `Error parsing tabs in dashboard. Attempted to parse: ${unsavedDashboardTabsRaw} `,
+                );
+            }
+        }
+    }, [
+        isDashboardLoading,
+        dashboardTiles,
+        dashboardUuid,
+        activeTab,
+        setHaveTilesChanged,
+        setDashboardTiles,
+        setDashboardTabs,
+        setHaveTabsChanged,
+        clearIsEditingDashboardChart,
+        showToastError,
+    ]);
+
+    const [gridWidth, setGridWidth] = useState(0);
+
+    useEffect(() => {
+        if (isSuccess) {
+            setHaveTilesChanged(false);
+            setHaveFiltersChanged(false);
+            setHavePinnedParametersChanged(false);
+            setHaveDateZoomGranularitiesChanged(false);
+            setHasDefaultDateZoomGranularityChanged(false);
+            setHasDateZoomConfigChanged(false);
+            // The saved config is the source of truth again
+            setRequiredFiltersNote(undefined);
+            setDashboardTemporaryFilters({
+                dimensions: [],
+                metrics: [],
+                tableCalculations: [],
+            });
+            reset();
+            if (dashboardTabs.length > 1) {
+                void navigate(
+                    `/projects/${projectUuid}/dashboards/${dashboardUuid}/view/tabs/${activeTab?.uuid}`,
+                    { replace: true },
+                );
+            } else {
+                void navigate(
+                    `/projects/${projectUuid}/dashboards/${dashboardUuid}/view`,
+                    { replace: true },
+                );
+            }
+        }
+    }, [
+        dashboardUuid,
+        navigate,
+        isSuccess,
+        projectUuid,
+        reset,
+        setDashboardTemporaryFilters,
+        setHaveFiltersChanged,
+        setHaveTilesChanged,
+        setHavePinnedParametersChanged,
+        setHaveDateZoomGranularitiesChanged,
+        setHasDefaultDateZoomGranularityChanged,
+        setHasDateZoomConfigChanged,
+        setRequiredFiltersNote,
+        dashboardTabs,
+        activeTab,
+    ]);
+
+    const handleToggleFullscreen = useCallback(async () => {
+        if (!isFullScreenFeatureEnabled) return;
+
+        const willBeFullscreen = !isFullscreen;
+
+        if (document.fullscreenElement && !willBeFullscreen) {
+            await document.exitFullscreen();
+        } else if (
+            document.fullscreenEnabled &&
+            !document.fullscreenElement &&
+            willBeFullscreen
+        ) {
+            await document.documentElement.requestFullscreen();
+        }
+
+        toggleFullscreen();
+    }, [isFullScreenFeatureEnabled, isFullscreen, toggleFullscreen]);
+
+    useEffect(() => {
+        if (!isFullScreenFeatureEnabled) return;
+
+        const onFullscreenChange = () => {
+            if (isFullscreen && !document.fullscreenElement) {
+                toggleFullscreen(false);
+            } else if (!isFullscreen && document.fullscreenElement) {
+                toggleFullscreen(true);
+            }
+        };
+
+        document.addEventListener('fullscreenchange', onFullscreenChange);
+
+        return () =>
+            document.removeEventListener(
+                'fullscreenchange',
+                onFullscreenChange,
+            );
+    });
+
+    const handleParameterChange = useDashboardContext((c) => c.setParameter);
+
+    const handleUpdateTiles = useCallback(
+        async (layout: Layout[]) => {
+            setDashboardTiles((currentDashboardTiles) =>
+                currentDashboardTiles?.map((tile) => {
+                    const layoutTile = layout.find(({ i }) => i === tile.uuid);
+                    if (
+                        layoutTile &&
+                        (tile.x !== layoutTile.x ||
+                            tile.y !== layoutTile.y ||
+                            tile.h !== layoutTile.h ||
+                            tile.w !== layoutTile.w)
+                    ) {
+                        return {
+                            ...tile,
+                            x: layoutTile.x,
+                            y: layoutTile.y,
+                            h: layoutTile.h,
+                            w: layoutTile.w,
+                        };
+                    }
+                    return tile;
+                }),
+            );
+
+            setHaveTilesChanged(true);
+        },
+        [setDashboardTiles, setHaveTilesChanged],
+    );
+
+    const handleAddTiles = useCallback(
+        async (
+            tiles: IDashboard['tiles'][number][],
+            // Map of new tile UUID → source tile UUID, so dashboard filter `tileTargets` are copied from the source.
+            tileUuidMapping?: Record<string, string>,
+        ) => {
+            let newTiles = tiles;
+            if (tabsEnabled) {
+                newTiles = tiles.map((tile: DashboardTile) => ({
+                    ...tile,
+                    tabUuid: activeTab ? activeTab.uuid : defaultTab?.uuid,
+                }));
+                setHaveTabsChanged(true);
+            }
+            setDashboardTiles((currentDashboardTiles) =>
+                appendNewTilesToBottom(currentDashboardTiles, newTiles),
+            );
+
+            setHaveTilesChanged(true);
+
+            // For each duplicated tile, copy the source tile's per-filter
+            // override (enabled/disabled + field mapping) onto the new tile's
+            // UUID. Without this, the new UUID is absent from `tileTargets`
+            // and `getDashboardFilterRulesForTile` falls back to auto-applying
+            // every matching filter — ignoring whatever was configured on the
+            // original.
+            if (tileUuidMapping && Object.keys(tileUuidMapping).length > 0) {
+                setDashboardFilters((prev) => {
+                    const updatedDimensions = prev.dimensions.map((filter) => {
+                        if (!filter.tileTargets) return filter;
+                        const nextTileTargets = { ...filter.tileTargets };
+                        let changed = false;
+                        for (const [newUuid, oldUuid] of Object.entries(
+                            tileUuidMapping,
+                        )) {
+                            if (oldUuid in nextTileTargets) {
+                                nextTileTargets[newUuid] =
+                                    nextTileTargets[oldUuid];
+                                changed = true;
+                            }
+                        }
+                        return changed
+                            ? { ...filter, tileTargets: nextTileTargets }
+                            : filter;
+                    });
+                    return { ...prev, dimensions: updatedDimensions };
+                });
+                setHaveFiltersChanged(true);
+
+                // Mirror the filter remap for date-zoom controls: copy each
+                // source tile's target onto its duplicate.
+                const mapping = Object.entries(tileUuidMapping).map(
+                    ([toTileUuid, fromTileUuid]) => ({
+                        fromTileUuid,
+                        toTileUuid,
+                    }),
+                );
+                const nextDateZoomConfig = copyDateZoomTileTargets(
+                    dateZoomConfig,
+                    mapping,
+                );
+                if (nextDateZoomConfig !== dateZoomConfig) {
+                    setDateZoomConfig(nextDateZoomConfig);
+                }
+            }
+        },
+        [
+            activeTab,
+            defaultTab,
+            tabsEnabled,
+            setDashboardTiles,
+            setHaveTilesChanged,
+            setHaveTabsChanged,
+            setDashboardFilters,
+            setHaveFiltersChanged,
+            dateZoomConfig,
+            setDateZoomConfig,
+        ],
+    );
+
+    const handleDeleteTile = useCallback(
+        async (tile: IDashboard['tiles'][number]) => {
+            setDashboardTiles((currentDashboardTiles) =>
+                currentDashboardTiles?.filter(
+                    (filteredTile) => filteredTile.uuid !== tile.uuid,
+                ),
+            );
+
+            setHaveTilesChanged(true);
+
+            // Drop the deleted tile's date-zoom target and prune any control
+            // left with no charts, so deleting the last attached tile doesn't
+            // leave a dangling control behind.
+            const nextDateZoomConfig = removeDateZoomTileTargets(
+                dateZoomConfig,
+                [tile.uuid],
+            );
+            if (nextDateZoomConfig !== dateZoomConfig) {
+                setDateZoomConfig(nextDateZoomConfig);
+            }
+        },
+        [
+            setDashboardTiles,
+            setHaveTilesChanged,
+            dateZoomConfig,
+            setDateZoomConfig,
+        ],
+    );
+
+    const handleBatchDeleteTiles = (
+        tilesToDelete: IDashboard['tiles'][number][],
+    ) => {
+        setDashboardTiles((currentDashboardTiles) =>
+            currentDashboardTiles?.filter(
+                (tile) => !tilesToDelete.includes(tile),
+            ),
+        );
+        setHaveTilesChanged(true);
+
+        const nextDateZoomConfig = removeDateZoomTileTargets(
+            dateZoomConfig,
+            tilesToDelete.map((tile) => tile.uuid),
+        );
+        if (nextDateZoomConfig !== dateZoomConfig) {
+            setDateZoomConfig(nextDateZoomConfig);
+        }
+    };
+
+    const handleEditTiles = useCallback(
+        (updatedTile: IDashboard['tiles'][number]) => {
+            setDashboardTiles((currentDashboardTiles) =>
+                currentDashboardTiles?.map((tile) =>
+                    tile.uuid === updatedTile.uuid ? updatedTile : tile,
+                ),
+            );
+            setHaveTilesChanged(true);
+        },
+        [setDashboardTiles, setHaveTilesChanged],
+    );
+
+    const handleCancel = useCallback(() => {
+        if (!dashboard) return;
+
+        sessionStorage.clear();
+
+        setDashboardTiles(dashboard.tiles);
+        setHaveTilesChanged(false);
+        setDashboardFilters(dashboard.filters);
+        setHaveFiltersChanged(false);
+        setHaveTabsChanged(false);
+        setDashboardTabs(dashboard.tabs);
+        setSavedParameters(dashboard.parameters ?? {});
+        setPinnedParameters(dashboard.config?.pinnedParameters ?? []);
+        setHavePinnedParametersChanged(false);
+        setHasParameterOrderChanged(false);
+        setDateZoomGranularities(
+            dashboard.config?.dateZoomGranularities ??
+                Object.values(DateGranularity),
+        );
+        setHaveDateZoomGranularitiesChanged(false);
+        setDefaultDateZoomGranularity(
+            dashboard.config?.defaultDateZoomGranularity,
+        );
+        setHasDefaultDateZoomGranularityChanged(false);
+        setDateZoomConfig(normalizeDateZoomConfig(dashboard.config));
+        setHasDateZoomConfigChanged(false);
+        setRequiredFiltersNote(undefined);
+
+        if (dashboardTabs.length > 0) {
+            void navigate(
+                `/projects/${projectUuid}/dashboards/${dashboardUuid}/view/tabs/${activeTab?.uuid}`,
+                { replace: true },
+            );
+        } else {
+            void navigate(
+                `/projects/${projectUuid}/dashboards/${dashboardUuid}/view`,
+                { replace: true },
+            );
+        }
+    }, [
+        dashboard,
+        dashboardUuid,
+        navigate,
+        projectUuid,
+        setDashboardTiles,
+        setHaveFiltersChanged,
+        setDashboardFilters,
+        setHaveTilesChanged,
+        setHaveTabsChanged,
+        setDashboardTabs,
+        dashboardTabs,
+        activeTab,
+        setSavedParameters,
+        setPinnedParameters,
+        setHavePinnedParametersChanged,
+        setDateZoomGranularities,
+        setHaveDateZoomGranularitiesChanged,
+        setDefaultDateZoomGranularity,
+        setHasDefaultDateZoomGranularityChanged,
+        setDateZoomConfig,
+        setHasDateZoomConfigChanged,
+        setHasParameterOrderChanged,
+        setRequiredFiltersNote,
+    ]);
+
+    const handleMoveDashboardToSpace = useCallback(
+        async (spaceUuid: string) => {
+            if (!dashboard) return;
+
+            await contentAction({
+                action: {
+                    type: 'move',
+                    targetSpaceUuid: spaceUuid,
+                },
+                item: {
+                    uuid: dashboard.uuid,
+                    contentType: ContentType.DASHBOARD,
+                },
+            });
+        },
+        [dashboard, contentAction],
+    );
+
+    useEffect(() => {
+        const checkReload = (event: BeforeUnloadEvent) => {
+            if (isEditMode && (haveTilesChanged || haveFiltersChanged)) {
+                const message =
+                    'You have unsaved changes to your dashboard! Are you sure you want to leave without saving?';
+                event.returnValue = message;
+                return message;
+            }
+        };
+        window.addEventListener('beforeunload', checkReload);
+        return () => window.removeEventListener('beforeunload', checkReload);
+    }, [haveTilesChanged, haveFiltersChanged, isEditMode]);
+
+    // Block navigating away if there are unsaved changes
+    const blocker = useBlocker(({ nextLocation }) => {
+        if (
+            isEditMode &&
+            (haveTilesChanged || haveFiltersChanged || haveTabsChanged) &&
+            !nextLocation.pathname.includes(
+                `/projects/${projectUuid}/dashboards/${dashboardUuid}`,
+            ) &&
+            // Allow user to add a new table
+            !sessionStorage.getItem(`unsavedDashboardTiles:${dashboardUuid}`)
+        ) {
+            return true; //blocks navigation
+        }
+        return false; // allow navigation
+    });
+
+    const handleEnterEditMode = useCallback(async () => {
+        resetDashboardFilters();
+
+        await refreshDashboardVersion();
+
+        // Defer the redirect
+        void Promise.resolve().then(() => {
+            return navigate(
+                {
+                    pathname:
+                        dashboardTabs.length > 0
+                            ? `/projects/${projectUuid}/dashboards/${dashboardUuid}/edit/tabs/${activeTab?.uuid}`
+                            : `/projects/${projectUuid}/dashboards/${dashboardUuid}/edit`,
+                    search: '',
+                },
+                { replace: true },
+            );
+        });
+    }, [
+        projectUuid,
+        dashboardUuid,
+        resetDashboardFilters,
+        refreshDashboardVersion,
+        navigate,
+        activeTab?.uuid,
+        dashboardTabs.length,
+    ]);
+
+    const hasTilesThatSupportFilters = useDashboardContext(
+        (c) => c.hasTilesThatSupportFilters,
+    );
+
+    if (isDashboardLoading) {
+        return <PageSpinner />;
+    }
+
+    if (dashboardError) {
+        return <ErrorState error={dashboardError.error} />;
+    }
+
+    if (!dashboard) {
+        return (
+            <ErrorState
+                error={{
+                    name: 'NotExistsError',
+                    statusCode: 404,
+                    message: 'Dashboard not found',
+                    data: {},
+                }}
+            />
+        );
+    }
+
+    const canManageContentVerification =
+        user.data?.ability?.can(
+            'manage',
+            subject('ContentVerification', {
+                organizationUuid: user.data?.organizationUuid,
+                projectUuid,
+            }),
+        ) === true;
+
+    const isOwnVerification =
+        dashboard?.verification?.verifiedBy.userUuid === user.data?.userUuid;
+
+    const canPreserveVerification =
+        canManageContentVerification || isOwnVerification;
+
+    const shouldShowVerificationSaveOptions = !!dashboard?.verification;
+
+    const handleSaveDashboard = (preserveVerification?: boolean) => {
+        const dimensionFilters = [
+            ...dashboardFilters.dimensions,
+            ...dashboardTemporaryFilters.dimensions,
+        ];
+        // Reset value for required filter on save dashboard
+        const requiredFiltersWithoutValues = dimensionFilters.map((filter) => {
+            if (
+                filter.required ||
+                (isFilterRequirementsEnabled && filter.requiredGroupId)
+            ) {
+                return {
+                    ...filter,
+                    disabled: true,
+                    values: [],
+                };
+            }
+            return filter;
+        });
+
+        // Prune empty controls + dangling targets on save; omit the field
+        // entirely when no controls remain so untouched dashboards don't churn.
+        const prunedDateZoomConfig = pruneDateZoomConfig(dateZoomConfig);
+        const savedDateZoomConfig = hasDateZoomConfigChanged
+            ? isEmptyDateZoomConfig(prunedDateZoomConfig)
+                ? undefined
+                : prunedDateZoomConfig
+            : dashboard.config?.dateZoomConfig;
+
+        const dashboardUpdate: UpdateDashboard = {
+            tiles: dashboardTiles,
+            filters: {
+                dimensions: requiredFiltersWithoutValues,
+                metrics: [
+                    ...dashboardFilters.metrics,
+                    ...dashboardTemporaryFilters.metrics,
+                ],
+                tableCalculations: [
+                    ...dashboardFilters.tableCalculations,
+                    ...dashboardTemporaryFilters.tableCalculations,
+                ],
+            },
+            name: dashboard.name,
+            tabs: dashboardTabs,
+            config: {
+                isDateZoomDisabled,
+                isAddFilterDisabled,
+                pinnedParameters,
+                parameterOrder: hasParameterOrderChanged
+                    ? parameterOrder
+                    : dashboard.config?.parameterOrder,
+                dateZoomGranularities: haveDateZoomGranularitiesChanged
+                    ? dateZoomGranularities
+                    : dashboard.config?.dateZoomGranularities,
+                defaultDateZoomGranularity: hasDefaultDateZoomGranularityChanged
+                    ? defaultDateZoomGranularity
+                    : dashboard.config?.defaultDateZoomGranularity,
+                dateZoomConfig: savedDateZoomConfig,
+                requiredFiltersNote: requiredFiltersNote || undefined,
+            },
+            parameters: dashboardParameters,
+            ...(preserveVerification !== undefined
+                ? { preserveVerification }
+                : {}),
+        };
+
+        mutate(dashboardUpdate);
+    };
+
+    const dashboardHeaderProps = {
+        dashboard,
+        organizationUuid: organization?.organizationUuid,
+        isEditMode,
+        isSaving,
+        oldestCacheTime,
+        preAggregateStatuses,
+        allTilesLoaded: areAllChartsLoaded,
+        isFullscreen,
+        activeTabUuid: activeTab?.uuid,
+        dashboardTabs,
+        dashboardTiles,
+        isFullScreenFeatureEnabled,
+        onToggleFullscreen: handleToggleFullscreen,
+        hasDashboardChanged:
+            haveTilesChanged ||
+            haveFiltersChanged ||
+            hasTemporaryFilters ||
+            haveTabsChanged ||
+            hasDateZoomDisabledChanged ||
+            hasAddFilterDisabledChanged ||
+            hasRequiredFiltersNoteChanged ||
+            parametersHaveChanged ||
+            havePinnedParametersChanged ||
+            hasParameterOrderChanged ||
+            haveDateZoomGranularitiesChanged ||
+            hasDefaultDateZoomGranularityChanged ||
+            hasDateZoomConfigChanged,
+        onAddTiles: handleAddTiles,
+        onSaveDashboard: () => {
+            if (shouldShowVerificationSaveOptions) {
+                saveVerificationModalHandlers.open();
+                return;
+            }
+            handleSaveDashboard();
+        },
+        onCancel: handleCancel,
+        onMoveToSpace: handleMoveDashboardToSpace,
+        isMovingDashboardToSpace: isContentActionLoading,
+        onDuplicate: duplicateModalHandlers.open,
+        onDelete: deleteModalHandlers.open,
+        onExport: exportDashboardModalHandlers.open,
+        setAddingTab,
+        onSwitchTab: setActiveTab,
+        onEditClicked: handleEnterEditMode,
+        ...(isEditMode && { className: styles.stickyHeader }),
+    };
+
+    return (
+        <>
+            {blocker.state === 'blocked' && (
+                <MantineModal
+                    opened
+                    onClose={() => {
+                        blocker.reset();
+                    }}
+                    role="alertdialog"
+                    title="Unsaved changes"
+                    icon={IconAlertCircle}
+                    cancelLabel="Stay"
+                    actions={
+                        <Button
+                            color="red"
+                            onClick={() => {
+                                clearDashboardStorage();
+                                blocker.proceed();
+                            }}
+                        >
+                            Leave
+                        </Button>
+                    }
+                >
+                    <Text fw={500}>
+                        You have unsaved changes to your dashboard! Are you sure
+                        you want to leave without saving?
+                    </Text>
+                </MantineModal>
+            )}
+
+            <MantineModal
+                opened={isSaveVerificationModalOpen}
+                onClose={saveVerificationModalHandlers.close}
+                title="Save verified dashboard"
+            >
+                {canPreserveVerification ? (
+                    <>
+                        <Text mb="md">
+                            Keep this dashboard verified after saving?
+                        </Text>
+                        <Group justify="flex-end">
+                            <Button
+                                variant="default"
+                                loading={isSaving}
+                                onClick={() => {
+                                    saveVerificationModalHandlers.close();
+                                    handleSaveDashboard(false);
+                                }}
+                            >
+                                Save
+                            </Button>
+                            <Button
+                                color="green.7"
+                                leftSection={
+                                    <IconCircleCheckFilled size={16} />
+                                }
+                                loading={isSaving}
+                                onClick={() => {
+                                    saveVerificationModalHandlers.close();
+                                    handleSaveDashboard(true);
+                                }}
+                            >
+                                Save & verify
+                            </Button>
+                        </Group>
+                    </>
+                ) : (
+                    <>
+                        <Text mb="md">
+                            This dashboard is verified. Saving your changes will
+                            remove its verified status until someone verifies it
+                            again.
+                        </Text>
+                        <Group justify="flex-end">
+                            <Button
+                                variant="default"
+                                onClick={saveVerificationModalHandlers.close}
+                            >
+                                Cancel
+                            </Button>
+                            <Button
+                                loading={isSaving}
+                                onClick={() => {
+                                    saveVerificationModalHandlers.close();
+                                    handleSaveDashboard(false);
+                                }}
+                            >
+                                Save anyway
+                            </Button>
+                        </Group>
+                    </>
+                )}
+            </MantineModal>
+
+            <Page
+                title={dashboard.name}
+                noContentPadding
+                withFullHeight
+                fullPageScroll
+            >
+                <div>
+                    <DashboardHeader {...dashboardHeaderProps} />
+
+                    {/* Coordinates filter chip / rules popovers across the dashboard */}
+                    <FilterBarPopoversProvider>
+                        <DashboardTabs
+                            isEditMode={isEditMode}
+                            hasTilesThatSupportFilters={
+                                hasTilesThatSupportFilters
+                            }
+                            // parameters
+                            parameters={referencedParameters}
+                            shadowedReservedNames={shadowedReservedNames}
+                            parameterValues={parameterValues}
+                            onParameterChange={handleParameterChange}
+                            onParameterClearAll={clearAllParameters}
+                            isParameterLoading={!areAllChartsLoaded}
+                            missingRequiredParameters={
+                                missingRequiredParameters
+                            }
+                            pinnedParameters={pinnedParameters}
+                            onParameterPin={toggleParameterPin}
+                            parameterOrder={parameterOrder}
+                            onParameterReorder={setParameterOrder}
+                            // tabs
+                            activeTab={activeTab}
+                            addingTab={addingTab}
+                            dashboardTiles={dashboardTiles}
+                            handleAddTiles={handleAddTiles}
+                            handleUpdateTiles={handleUpdateTiles}
+                            handleDeleteTile={handleDeleteTile}
+                            handleBatchDeleteTiles={handleBatchDeleteTiles}
+                            handleEditTile={handleEditTiles}
+                            setGridWidth={setGridWidth}
+                            setAddingTab={setAddingTab}
+                        />
+                    </FilterBarPopoversProvider>
+                </div>
+                {isDeleteModalOpen && (
+                    <DashboardDeleteModal
+                        opened
+                        uuid={dashboard.uuid}
+                        onClose={deleteModalHandlers.close}
+                        onConfirm={() => {
+                            void navigate(
+                                `/projects/${projectUuid}/dashboards`,
+                                {
+                                    replace: true,
+                                },
+                            );
+                        }}
+                    />
+                )}
+                {isExportDashboardModalOpen && (
+                    <DashboardExportModal
+                        opened={isExportDashboardModalOpen}
+                        onClose={exportDashboardModalHandlers.close}
+                        dashboard={dashboard}
+                        gridWidth={gridWidth}
+                    />
+                )}
+                {isDuplicateModalOpen && (
+                    <DashboardDuplicateModal
+                        opened={isDuplicateModalOpen}
+                        uuid={dashboard.uuid}
+                        onClose={duplicateModalHandlers.close}
+                        onConfirm={duplicateModalHandlers.close}
+                    />
+                )}
+            </Page>
+        </>
+    );
+};
+
+const DashboardPage: FC = () => {
+    const { projectUuid, dashboardUuid } = useParams<{
+        projectUuid: string;
+        dashboardUuid: string;
+    }>();
+    const { user } = useApp();
+    const dashboardCommentsCheck = useDashboardCommentsCheck(user?.data);
+
+    return (
+        <DashboardProvider
+            key={dashboardUuid}
+            projectUuid={projectUuid}
+            dashboardCommentsCheck={dashboardCommentsCheck}
+        >
+            <SentryErrorBoundary fallback={() => <></>}>
+                <DashboardAiAgentContextBridge />
+            </SentryErrorBoundary>
+            <Dashboard />
+        </DashboardProvider>
+    );
+};
+
+export default DashboardPage;

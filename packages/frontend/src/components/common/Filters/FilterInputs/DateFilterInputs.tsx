@@ -1,0 +1,445 @@
+import {
+    DimensionType,
+    FilterOperator,
+    formatDate,
+    isCustomSqlDimension,
+    isDimension,
+    isFilterRule,
+    TimeFrames,
+    timeframeToUnitOfTime,
+    type BaseFilterRule,
+    type DateFilterRule,
+} from '@lightdash/common';
+import { Flex, Text } from '@mantine-8/core';
+import dayjs from 'dayjs';
+import { type FilterInputsProps } from '.';
+import { NumberInput } from '../../NumberInput';
+import useFiltersContext from '../useFiltersContext';
+import { getFirstDayOfWeek } from '../utils/filterDateUtils';
+import { getPlaceholderByFilterTypeAndOperator } from '../utils/getPlaceholderByFilterTypeAndOperator';
+import {
+    getInvalidDateFilterValue,
+    parseFilterDateValue,
+} from './DateFilterInputs.utils';
+import DefaultFilterInputs from './DefaultFilterInputs';
+import FilterDatePicker from './FilterDatePicker';
+import FilterDateRangePicker from './FilterDateRangePicker';
+import FilterDateTimePicker from './FilterDateTimePicker';
+import FilterDateTimeRangePicker from './FilterDateTimeRangePicker';
+import FilterMonthAndYearPicker from './FilterMonthAndYearPicker';
+import FilterPeriodToDateSelect from './FilterPeriodToDateSelect';
+import FilterQuarterPicker from './FilterQuarterPicker';
+import FilterUnitOfTimeAutoComplete from './FilterUnitOfTimeAutoComplete';
+import FilterWeekPicker from './FilterWeekPicker';
+import FilterYearPicker from './FilterYearPicker';
+
+const DateFilterInputs = <T extends BaseFilterRule = DateFilterRule>(
+    props: FilterInputsProps<T>,
+) => {
+    const { field, rule, onChange, popoverProps, disabled, filterType } = props;
+    const { startOfWeek } = useFiltersContext();
+
+    const isTimestamp =
+        !field ||
+        (isCustomSqlDimension(field) ? field.dimensionType : field.type) ===
+            DimensionType.TIMESTAMP;
+
+    if (!isFilterRule(rule)) {
+        throw new Error('DateFilterInputs expects a FilterRule');
+    }
+
+    const placeholder = getPlaceholderByFilterTypeAndOperator({
+        type: filterType,
+        operator: rule.operator,
+        disabled: rule.disabled && !rule.values,
+    });
+    const invalidDateFilterValue = getInvalidDateFilterValue(rule.values);
+
+    switch (rule.operator) {
+        case FilterOperator.EQUALS:
+        case FilterOperator.NOT_EQUALS:
+        case FilterOperator.GREATER_THAN:
+        case FilterOperator.GREATER_THAN_OR_EQUAL:
+        case FilterOperator.LESS_THAN:
+        case FilterOperator.LESS_THAN_OR_EQUAL:
+            if (isDimension(field) && field.timeInterval) {
+                switch (field.timeInterval.toUpperCase()) {
+                    case TimeFrames.WEEK:
+                        return (
+                            <Flex align="center" gap="xs" w="100%">
+                                <Text
+                                    c="dimmed"
+                                    style={{ whiteSpace: 'nowrap' }}
+                                    size="xs"
+                                >
+                                    week commencing
+                                </Text>
+
+                                <FilterWeekPicker
+                                    placeholder={placeholder}
+                                    disabled={disabled}
+                                    data-autofocus
+                                    invalidValue={invalidDateFilterValue}
+                                    value={
+                                        rule.values && rule.values[0]
+                                            ? parseFilterDateValue(
+                                                  rule.values[0],
+                                                  TimeFrames.WEEK,
+                                              )
+                                            : null
+                                    }
+                                    // FIXME: mantine v7
+                                    // mantine does not set the first day of the week based on the locale
+                                    // so we need to do it manually and always pass it as a prop
+                                    firstDayOfWeek={getFirstDayOfWeek(
+                                        startOfWeek,
+                                    )}
+                                    popoverProps={popoverProps}
+                                    onChange={(value: Date | null) => {
+                                        onChange({
+                                            ...rule,
+                                            values: value
+                                                ? [
+                                                      formatDate(
+                                                          value,
+                                                          TimeFrames.WEEK,
+                                                      ),
+                                                  ]
+                                                : [],
+                                        });
+                                    }}
+                                />
+                            </Flex>
+                        );
+                    case TimeFrames.MONTH:
+                        return (
+                            <FilterMonthAndYearPicker
+                                disabled={disabled}
+                                // FIXME: until mantine 7.4: https://github.com/mantinedev/mantine/issues/5401#issuecomment-1874906064
+                                // @ts-ignore
+                                placeholder={placeholder}
+                                data-autofocus
+                                popoverProps={popoverProps}
+                                invalidValue={invalidDateFilterValue}
+                                value={
+                                    rule.values && rule.values[0]
+                                        ? parseFilterDateValue(
+                                              rule.values[0],
+                                              TimeFrames.MONTH,
+                                          )
+                                        : null
+                                }
+                                onChange={(value: Date) => {
+                                    onChange({
+                                        ...rule,
+                                        values: [
+                                            formatDate(value, TimeFrames.MONTH),
+                                        ],
+                                    });
+                                }}
+                            />
+                        );
+                    case TimeFrames.QUARTER:
+                        const ruleValue = rule.values?.[0];
+                        const parsedValue = ruleValue
+                            ? parseFilterDateValue(ruleValue, TimeFrames.DAY)
+                            : null;
+                        return (
+                            <FilterQuarterPicker
+                                disabled={disabled}
+                                placeholder={placeholder}
+                                data-autofocus
+                                popoverProps={popoverProps}
+                                invalidValue={invalidDateFilterValue}
+                                value={parsedValue}
+                                onChange={(newDate: Date) => {
+                                    onChange({
+                                        ...rule,
+                                        values: [
+                                            formatDate(newDate, TimeFrames.DAY),
+                                        ],
+                                    });
+                                }}
+                            />
+                        );
+                    case TimeFrames.YEAR:
+                        return (
+                            <FilterYearPicker
+                                disabled={disabled}
+                                // FIXME: until mantine 7.4: https://github.com/mantinedev/mantine/issues/5401#issuecomment-1874906064
+                                // @ts-ignore
+                                placeholder={placeholder}
+                                data-autofocus
+                                popoverProps={popoverProps}
+                                invalidValue={invalidDateFilterValue}
+                                value={
+                                    rule.values && rule.values[0]
+                                        ? parseFilterDateValue(
+                                              rule.values[0],
+                                              TimeFrames.YEAR,
+                                          )
+                                        : null
+                                }
+                                onChange={(newDate: Date) => {
+                                    onChange({
+                                        ...rule,
+                                        values: [
+                                            formatDate(
+                                                newDate,
+                                                TimeFrames.YEAR,
+                                            ),
+                                        ],
+                                    });
+                                }}
+                            />
+                        );
+                    default:
+                        break;
+                }
+            }
+
+            if (isTimestamp) {
+                const value =
+                    rule.values && rule.values[0] && !invalidDateFilterValue
+                        ? dayjs(rule?.values?.[0]).toDate()
+                        : dayjs().toDate();
+
+                return (
+                    <FilterDateTimePicker
+                        disabled={disabled}
+                        // FIXME: until mantine 7.4: https://github.com/mantinedev/mantine/issues/5401#issuecomment-1874906064
+                        // @ts-ignore
+                        placeholder={placeholder}
+                        data-autofocus
+                        withSeconds
+                        // FIXME: mantine v7
+                        // mantine does not set the first day of the week based on the locale
+                        // so we need to do it manually and always pass it as a prop
+                        firstDayOfWeek={getFirstDayOfWeek(startOfWeek)}
+                        popoverProps={popoverProps}
+                        invalidValue={invalidDateFilterValue}
+                        value={value}
+                        onChange={(v: Date | null) => {
+                            onChange({
+                                ...rule,
+                                // format as an ISO string, not for display
+                                values: v === null ? [] : [dayjs(v).format()],
+                            });
+                        }}
+                    />
+                );
+            }
+
+            return (
+                <FilterDatePicker
+                    disabled={disabled}
+                    placeholder={placeholder}
+                    // FIXME: mantine v7
+                    // mantine does not set the first day of the week based on the locale
+                    // so we need to do it manually and always pass it as a prop
+                    firstDayOfWeek={getFirstDayOfWeek(startOfWeek)}
+                    popoverProps={popoverProps}
+                    data-autofocus
+                    invalidValue={invalidDateFilterValue}
+                    value={
+                        rule.values
+                            ? parseFilterDateValue(
+                                  rule.values[0],
+                                  TimeFrames.DAY,
+                              )
+                            : null
+                    }
+                    onChange={(value: Date | null) => {
+                        onChange({
+                            ...rule,
+                            values: value
+                                ? [formatDate(value, TimeFrames.DAY)]
+                                : [],
+                        });
+                    }}
+                />
+            );
+        case FilterOperator.IN_THE_PAST:
+        case FilterOperator.NOT_IN_THE_PAST:
+        case FilterOperator.IN_THE_NEXT:
+            const parsedValue = parseInt(rule.values?.[0], 10);
+            return (
+                <Flex gap="xs" w="100%">
+                    <NumberInput
+                        size="xs"
+                        flex="1 1 auto"
+                        miw={50}
+                        placeholder={placeholder}
+                        disabled={disabled}
+                        data-autofocus
+                        value={isNaN(parsedValue) ? undefined : parsedValue}
+                        min={0}
+                        onNumberChange={(value) =>
+                            onChange({
+                                ...rule,
+                                values: value !== undefined ? [value] : [],
+                            })
+                        }
+                    />
+
+                    <FilterUnitOfTimeAutoComplete
+                        disabled={disabled}
+                        style={{ flexShrink: 1, flexGrow: 3 }}
+                        isTimestamp={isTimestamp}
+                        minUnitOfTime={
+                            isDimension(field) && field.timeInterval
+                                ? timeframeToUnitOfTime(field.timeInterval)
+                                : undefined
+                        }
+                        unitOfTime={rule.settings?.unitOfTime}
+                        completed={rule.settings?.completed || false}
+                        comboboxProps={{
+                            withinPortal: popoverProps?.withinPortal,
+                        }}
+                        onDropdownOpen={popoverProps?.onOpen}
+                        onDropdownClose={popoverProps?.onClose}
+                        onChange={(value) =>
+                            onChange({
+                                ...rule,
+                                settings: {
+                                    unitOfTime: value.unitOfTime,
+                                    completed: value.completed,
+                                },
+                            })
+                        }
+                    />
+                </Flex>
+            );
+        case FilterOperator.IN_THE_CURRENT:
+        case FilterOperator.NOT_IN_THE_CURRENT:
+            return (
+                <FilterUnitOfTimeAutoComplete
+                    w="100%"
+                    disabled={disabled}
+                    isTimestamp={isTimestamp}
+                    unitOfTime={rule.settings?.unitOfTime}
+                    minUnitOfTime={
+                        isDimension(field) && field.timeInterval
+                            ? timeframeToUnitOfTime(field.timeInterval)
+                            : undefined
+                    }
+                    showOptionsInPlural={false}
+                    showCompletedOptions={false}
+                    data-autofocus={!rule.settings?.unitOfTime || undefined}
+                    completed={false}
+                    comboboxProps={{
+                        withinPortal: popoverProps?.withinPortal,
+                    }}
+                    onDropdownOpen={popoverProps?.onOpen}
+                    onDropdownClose={popoverProps?.onClose}
+                    onChange={(value) =>
+                        onChange({
+                            ...rule,
+                            settings: {
+                                unitOfTime: value.unitOfTime,
+                                completed: false,
+                            },
+                        })
+                    }
+                />
+            );
+        case FilterOperator.IN_BETWEEN:
+            const invalidStartValue = getInvalidDateFilterValue(
+                rule.values?.[0] ? [rule.values[0]] : undefined,
+            );
+            const invalidEndValue = getInvalidDateFilterValue(
+                rule.values?.[1] ? [rule.values[1]] : undefined,
+            );
+
+            if (isTimestamp) {
+                const startDate =
+                    rule.values?.[0] && !invalidStartValue
+                        ? dayjs(rule.values[0]).toDate()
+                        : null;
+                const endDate =
+                    rule.values?.[1] && !invalidEndValue
+                        ? dayjs(rule.values[1]).toDate()
+                        : null;
+
+                return (
+                    <FilterDateTimeRangePicker
+                        disabled={disabled}
+                        data-autofocus
+                        firstDayOfWeek={getFirstDayOfWeek(startOfWeek)}
+                        startValue={startDate}
+                        endValue={endDate}
+                        invalidStartValue={invalidStartValue}
+                        invalidEndValue={invalidEndValue}
+                        popoverProps={popoverProps}
+                        onChange={(value: [Date, Date] | null) => {
+                            onChange({
+                                ...rule,
+                                values: value
+                                    ? [
+                                          dayjs(value[0]).format(),
+                                          dayjs(value[1]).format(),
+                                      ]
+                                    : [],
+                            });
+                        }}
+                    />
+                );
+            }
+
+            const startDate = parseFilterDateValue(
+                rule.values?.[0],
+                TimeFrames.DAY,
+            );
+            const endDate = parseFilterDateValue(
+                rule.values?.[1],
+                TimeFrames.DAY,
+            );
+
+            return (
+                <FilterDateRangePicker
+                    disabled={disabled}
+                    data-autofocus
+                    firstDayOfWeek={getFirstDayOfWeek(startOfWeek)}
+                    startValue={startDate}
+                    endValue={endDate}
+                    invalidStartValue={invalidStartValue}
+                    invalidEndValue={invalidEndValue}
+                    popoverProps={popoverProps}
+                    onChange={(value: [Date, Date] | null) => {
+                        onChange({
+                            ...rule,
+                            values: value
+                                ? [
+                                      formatDate(value[0], TimeFrames.DAY),
+                                      formatDate(value[1], TimeFrames.DAY),
+                                  ]
+                                : [],
+                        });
+                    }}
+                />
+            );
+        case FilterOperator.IN_PERIOD_TO_DATE:
+            return (
+                <FilterPeriodToDateSelect
+                    disabled={disabled}
+                    unitOfTime={rule.settings?.unitOfTime}
+                    field={field}
+                    popoverProps={popoverProps}
+                    onChange={(unitOfTime) =>
+                        onChange({
+                            ...rule,
+                            settings: {
+                                unitOfTime,
+                                completed: false,
+                            },
+                        })
+                    }
+                />
+            );
+        default: {
+            return <DefaultFilterInputs {...props} />;
+        }
+    }
+};
+
+export default DateFilterInputs;

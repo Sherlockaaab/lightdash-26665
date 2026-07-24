@@ -1,0 +1,432 @@
+import {
+    AnyType,
+    attachTypesToModels,
+    catalogHasTimestampDomains,
+    convertExplores,
+    DbtManifestVersion,
+    DbtModelNode,
+    DbtPackages,
+    DbtRawModelNode,
+    DbtRpcGetManifestResults,
+    DEFAULT_SPOTLIGHT_CONFIG,
+    ensureCatalogTimestampDomainsKey,
+    Explore,
+    ExploreError,
+    friendlyName,
+    getCompiledModels,
+    getDbtManifestVersion,
+    getModelsFromManifest,
+    getSchemaStructureFromDbtModels,
+    InlineError,
+    InlineErrorType,
+    isSupportedDbtAdapter,
+    loadLightdashProjectConfig,
+    loadProjectContextFile,
+    ManifestValidator,
+    MissingCatalogEntryError,
+    normaliseModelDatabase,
+    NotFoundError,
+    ParseError,
+    SupportedDbtAdapter,
+    SupportedDbtVersions,
+    type LightdashProjectConfig,
+    type ProjectContextEntry,
+} from '@lightdash/common';
+import { WarehouseClient } from '@lightdash/warehouses';
+import * as Sentry from '@sentry/node';
+import fs from 'fs/promises';
+import path from 'path';
+import { LightdashAnalytics } from '../analytics/LightdashAnalytics';
+import { preAggregatePostProcessor } from '../ee/preAggregates/postProcessor';
+import Logger from '../logging/logger';
+import { traceSpan } from '../tracing/tracing';
+import {
+    CachedWarehouse,
+    DbtClient,
+    ProjectAdapter,
+    type TrackingParams,
+} from '../types';
+
+const postProcessors = [preAggregatePostProcessor];
+
+export class DbtBaseProjectAdapter implements ProjectAdapter {
+    dbtClient: DbtClient;
+
+    warehouseClient: WarehouseClient;
+
+    cachedWarehouse: CachedWarehouse;
+
+    dbtVersion: SupportedDbtVersions;
+
+    private readonly analytics: LightdashAnalytics | undefined;
+
+    dbtProjectDir?: string;
+
+    constructor(
+        dbtClient: DbtClient,
+        warehouseClient: WarehouseClient,
+        cachedWarehouse: CachedWarehouse,
+        dbtVersion: SupportedDbtVersions,
+        dbtProjectDir?: string,
+        analytics?: LightdashAnalytics,
+    ) {
+        this.dbtClient = dbtClient;
+        this.warehouseClient = warehouseClient;
+        this.cachedWarehouse = cachedWarehouse;
+        this.dbtVersion = dbtVersion;
+        this.dbtProjectDir = dbtProjectDir;
+        this.analytics = analytics;
+    }
+
+    async destroy(): Promise<void> {
+        Logger.debug(`Destroy base project adapter`);
+        await this.dbtClient.cleanup?.();
+    }
+
+    public async test(): Promise<void> {
+        Logger.debug('Test dbt client');
+        await this.dbtClient.test();
+        Logger.debug('Test warehouse client');
+        await this.warehouseClient.test();
+    }
+
+    public async getDbtPackages(): Promise<DbtPackages | undefined> {
+        Logger.debug(`Get dbt packages`);
+        if (this.dbtClient.getDbtPackages) {
+            return this.dbtClient.getDbtPackages();
+        }
+        return undefined;
+    }
+
+    public async getDbtManifest(): Promise<DbtRpcGetManifestResults> {
+        // Install dependencies first (same as compileAllExplores) — a git source's
+        // `dbt ls` fails without its packages installed.
+        if (this.dbtClient.installDeps !== undefined) {
+            Logger.debug('Install dependencies');
+            await this.dbtClient.installDeps();
+        }
+        Logger.debug(`Get dbt manifest`);
+        return this.dbtClient.getDbtManifest();
+    }
+
+    public async getLightdashProjectConfig(
+        trackingParams?: TrackingParams,
+    ): Promise<LightdashProjectConfig> {
+        if (!this.dbtProjectDir) {
+            return {
+                spotlight: DEFAULT_SPOTLIGHT_CONFIG,
+            };
+        }
+
+        const configPath = path.join(
+            this.dbtProjectDir,
+            'lightdash.config.yml',
+        );
+
+        try {
+            const fileContents = await fs.readFile(configPath, 'utf8');
+            const config = await loadLightdashProjectConfig(
+                fileContents,
+                async (lightdashConfig) => {
+                    if (trackingParams) {
+                        void this.analytics?.track({
+                            event: 'lightdashconfig.loaded',
+                            userId: trackingParams.userUuid,
+                            properties: {
+                                projectId: trackingParams.projectUuid,
+                                userId: trackingParams.userUuid,
+                                organizationId: trackingParams.organizationUuid,
+                                categories_count: Number(
+                                    Object.keys(
+                                        lightdashConfig.spotlight.categories ??
+                                            {},
+                                    ).length,
+                                ),
+                                default_visibility:
+                                    lightdashConfig.spotlight
+                                        .default_visibility,
+                            },
+                        });
+                    }
+                },
+            );
+            return config;
+        } catch (e) {
+            Logger.debug(`No lightdash.config.yml found in ${configPath}`);
+
+            if (e instanceof Error && 'code' in e && e.code === 'ENOENT') {
+                // Return default config if file doesn't exist
+                return {
+                    spotlight: DEFAULT_SPOTLIGHT_CONFIG,
+                };
+            }
+            throw e;
+        }
+    }
+
+    public async getProjectContext(): Promise<ProjectContextEntry[]> {
+        if (!this.dbtProjectDir) {
+            return [];
+        }
+
+        const configPath = path.join(
+            this.dbtProjectDir,
+            'lightdash.project_context.yml',
+        );
+
+        try {
+            const fileContents = await fs.readFile(configPath, 'utf8');
+            return loadProjectContextFile(fileContents);
+        } catch (e) {
+            Logger.debug(
+                `No lightdash.project_context.yml found in ${configPath}`,
+            );
+
+            if (e instanceof Error && 'code' in e && e.code === 'ENOENT') {
+                return [];
+            }
+            throw e;
+        }
+    }
+
+    public async compileAllExplores(
+        trackingParams?: TrackingParams,
+        loadSources: boolean = false,
+        allowPartialCompilation: boolean = false,
+    ): Promise<(Explore | ExploreError)[]> {
+        Logger.debug('Install dependencies');
+        // Install dependencies for dbt and fetch the manifest - may raise error meaning no explores compile
+        if (this.dbtClient.installDeps !== undefined) {
+            await this.dbtClient.installDeps();
+        }
+        Logger.debug('Get dbt manifest');
+        const { manifest, selectedModelIds } =
+            await this.dbtClient.getDbtManifest();
+        // Type of the target warehouse
+        if (!isSupportedDbtAdapter(manifest.metadata)) {
+            throw new ParseError(
+                `Dbt project not supported. Lightdash does not support adapter ${manifest.metadata.adapter_type}`,
+                {},
+            );
+        }
+
+        if (selectedModelIds) {
+            Logger.info(
+                `Manifest generated with selector, matched ${selectedModelIds.length} model(s)`,
+            );
+        }
+
+        const models = traceSpan(
+            { op: 'dbt', name: 'filterManifestModels' },
+            () => {
+                const startTime = Date.now();
+                const manifestModels = getModelsFromManifest(manifest);
+                Logger.info(`Manifest models ${manifestModels.length}`);
+                const compiledModels = getCompiledModels(
+                    manifestModels,
+                    selectedModelIds,
+                );
+                Logger.info(`Compiled models ${compiledModels.length}`);
+                const filtered = compiledModels.filter(
+                    (node: AnyType) =>
+                        ['model', 'seed'].includes(node.resource_type) &&
+                        node.meta,
+                ) as DbtRawModelNode[];
+                const elapsed = Date.now() - startTime;
+                Logger.info(
+                    `Filtered to ${filtered.length} model(s) in ${elapsed}ms`,
+                );
+                return filtered;
+            },
+        );
+
+        const adapterType = manifest.metadata.adapter_type;
+
+        const manifestVersion = getDbtManifestVersion(manifest);
+        Logger.info(
+            `Validate ${models.length} models in manifest with version ${manifestVersion}`,
+        );
+
+        if (models.length === 0) {
+            throw new NotFoundError(`No models found`);
+        }
+
+        const [validModels, failedExplores] =
+            DbtBaseProjectAdapter._validateDbtModel(
+                adapterType,
+                models,
+                manifestVersion,
+            );
+
+        const lightdashProjectConfig =
+            await this.getLightdashProjectConfig(trackingParams);
+
+        // Be lazy and try to attach types to the remaining models without refreshing the catalog
+        try {
+            if (this.cachedWarehouse?.warehouseCatalog === undefined) {
+                throw new MissingCatalogEntryError(
+                    `Warehouse catalog is undefined`,
+                    {},
+                );
+            }
+            // A cache written before timestamp domains existed would otherwise
+            // be reused forever (only missing entries trigger a refetch),
+            // leaving every column unclassified — refetch it once.
+            if (
+                !catalogHasTimestampDomains(
+                    this.cachedWarehouse.warehouseCatalog,
+                )
+            ) {
+                throw new MissingCatalogEntryError(
+                    `Cached warehouse catalog predates timestamp domains`,
+                    {},
+                );
+            }
+            Logger.info(`Attach types to ${validModels.length} models`);
+            const lazyTypedModels = attachTypesToModels(
+                validModels,
+                this.cachedWarehouse.warehouseCatalog,
+                true,
+                adapterType !== 'snowflake',
+            );
+            Logger.info('Convert explores');
+            const disableTimestampConversion =
+                this.warehouseClient.credentials.type === 'snowflake' &&
+                this.warehouseClient.credentials.disableTimestampConversion ===
+                    true;
+
+            const lazyExplores = await convertExplores(
+                lazyTypedModels,
+                loadSources,
+                adapterType,
+                this.warehouseClient,
+                lightdashProjectConfig,
+                {
+                    disableTimestampConversion,
+                    allowPartialCompilation,
+                    postProcessors,
+                },
+            );
+            Logger.info('Finished compiling explores');
+            return [...lazyExplores, ...failedExplores];
+        } catch (e) {
+            if (e instanceof MissingCatalogEntryError) {
+                Logger.info(
+                    'Get warehouse catalog after missing catalog error',
+                );
+                const modelCatalog =
+                    getSchemaStructureFromDbtModels(validModels);
+                Logger.info(
+                    `Fetching table metadata for ${modelCatalog.length} tables`,
+                );
+
+                const warehouseCatalog =
+                    await this.warehouseClient.getCatalog(modelCatalog);
+                // Clients only create the sidecar when they classify a column;
+                // stamp it (possibly empty) so the staleness check above can't
+                // refetch again on domain-less warehouses.
+                ensureCatalogTimestampDomainsKey(warehouseCatalog);
+                await this.cachedWarehouse?.onWarehouseCatalogChange(
+                    warehouseCatalog,
+                );
+
+                Logger.info(
+                    'Attach types to models after missing catalog error',
+                );
+                // Some types were missing so refresh the schema and try again
+                const typedModels = attachTypesToModels(
+                    validModels,
+                    warehouseCatalog,
+                    false,
+                    adapterType !== 'snowflake',
+                );
+                Logger.info('Convert explores after missing catalog error');
+                const disableTimestampConversion =
+                    this.warehouseClient.credentials.type === 'snowflake' &&
+                    this.warehouseClient.credentials
+                        .disableTimestampConversion === true;
+
+                const explores = await convertExplores(
+                    typedModels,
+                    loadSources,
+                    adapterType,
+                    this.warehouseClient,
+                    lightdashProjectConfig,
+                    {
+                        disableTimestampConversion,
+                        allowPartialCompilation,
+                        postProcessors,
+                    },
+                );
+                Logger.info(
+                    'Finished compiling explores after missing catalog error',
+                );
+                return [...explores, ...failedExplores];
+            }
+            throw e;
+        }
+    }
+
+    static _validateDbtModel(
+        adapterType: SupportedDbtAdapter,
+        models: DbtRawModelNode[],
+        manifestVersion: DbtManifestVersion,
+    ): [DbtModelNode[], ExploreError[]] {
+        const validator = new ManifestValidator(manifestVersion);
+        return models.reduce(
+            ([validModels, invalidModels], model) => {
+                let error: InlineError | undefined;
+                // Match against json schema
+                const [isValid, errorMessage] = validator.isModelValid(model);
+                if (!isValid) {
+                    error = {
+                        type: InlineErrorType.METADATA_PARSE_ERROR,
+                        message: errorMessage,
+                    };
+                } else if (
+                    isValid &&
+                    Object.values(model.columns).length <= 0
+                ) {
+                    error = {
+                        type: InlineErrorType.NO_DIMENSIONS_FOUND,
+                        message: 'No dimensions available',
+                    };
+                }
+                if (error) {
+                    // Seeds that fail validation are silently skipped —
+                    // they're only used as join targets, not standalone explores.
+                    if (model.resource_type === 'seed') {
+                        return [validModels, invalidModels];
+                    }
+                    const metaGroups: string[] | undefined = model.meta.groups;
+                    const exploreError: ExploreError = {
+                        name: model.name,
+                        label: model.meta.label || friendlyName(model.name),
+                        groupLabel: model.meta.group_label,
+                        ...(metaGroups && metaGroups.length > 0
+                            ? { groups: metaGroups }
+                            : {}),
+                        errors: [
+                            error.type === InlineErrorType.METADATA_PARSE_ERROR
+                                ? {
+                                      ...error,
+                                      message: `${
+                                          model.name ? `${model.name}: ` : ''
+                                      }${error.message}`,
+                                  }
+                                : error,
+                        ],
+                    };
+                    return [validModels, [...invalidModels, exploreError]];
+                }
+                // Fix null databases
+                const validatedModel = normaliseModelDatabase(
+                    model,
+                    adapterType,
+                );
+                return [[...validModels, validatedModel], invalidModels];
+            },
+            [[] as DbtModelNode[], [] as ExploreError[]],
+        );
+    }
+}

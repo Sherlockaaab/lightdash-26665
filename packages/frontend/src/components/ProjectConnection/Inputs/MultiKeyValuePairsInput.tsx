@@ -1,0 +1,124 @@
+import {
+    TextInput,
+    Button,
+    Flex,
+    Stack,
+    ActionIcon,
+    InputWrapper,
+} from '@mantine-8/core';
+import { IconHelpCircle, IconPlus, IconTrash } from '@tabler/icons-react';
+import get from 'lodash/get';
+import { useState, type ReactNode } from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import MantineIcon from '../../common/MantineIcon';
+import DocumentationHelpButton from '../../DocumentationHelpButton';
+import { useFormContext } from '../formContext';
+
+type Props = {
+    name: string;
+    label: string;
+    disabled?: boolean;
+    documentationUrl?: string;
+    labelHelp?: string | ReactNode;
+};
+export const MultiKeyValuePairsInput = ({
+    name,
+    label,
+    disabled,
+    documentationUrl,
+    labelHelp,
+}: Props) => {
+    const form = useFormContext();
+
+    const values: { id: string; key: string; value: string }[] =
+        get(form.values, name) ?? [];
+    const error = form.errors[name];
+
+    const addValue = () => {
+        form.insertListItem(name, {
+            id: uuidv4(),
+            key: '',
+            value: '',
+        });
+    };
+    const removeValue = (index: number) => {
+        form.removeListItem(name, index);
+    };
+
+    const [isLabelInfoOpen, setIsLabelInfoOpen] = useState<boolean>(false);
+
+    return (
+        <InputWrapper
+            styles={{
+                label: {
+                    display: 'flex',
+                    alignItems: 'center',
+                },
+            }}
+            label={
+                <>
+                    {label}
+
+                    <div style={{ flex: 1 }}></div>
+
+                    {documentationUrl && !labelHelp && (
+                        <DocumentationHelpButton href={documentationUrl} />
+                    )}
+
+                    {labelHelp && (
+                        <ActionIcon
+                            variant="subtle"
+                            color="gray"
+                            onClick={(
+                                e: React.MouseEvent<HTMLButtonElement>,
+                            ) => {
+                                e.preventDefault();
+                                setIsLabelInfoOpen(!isLabelInfoOpen);
+                            }}
+                        >
+                            <MantineIcon icon={IconHelpCircle} />
+                        </ActionIcon>
+                    )}
+                </>
+            }
+            description={isLabelInfoOpen && labelHelp}
+            error={error}
+        >
+            <Stack>
+                {values.map((value, index) => (
+                    <Flex key={value.id} gap="xs" align="center">
+                        <TextInput
+                            {...form.getInputProps(`${name}.${index}.key`)}
+                            placeholder="Key"
+                            disabled={disabled}
+                        />
+
+                        <TextInput
+                            {...form.getInputProps(`${name}.${index}.value`)}
+                            placeholder="Value"
+                            disabled={disabled}
+                        />
+
+                        <ActionIcon
+                            variant="subtle"
+                            color="gray"
+                            onClick={() => removeValue(index)}
+                            disabled={disabled}
+                        >
+                            <MantineIcon icon={IconTrash} />
+                        </ActionIcon>
+                    </Flex>
+                ))}
+
+                <Button
+                    size="sm"
+                    onClick={addValue}
+                    leftSection={<MantineIcon icon={IconPlus} />}
+                    disabled={disabled}
+                >
+                    Add variable
+                </Button>
+            </Stack>
+        </InputWrapper>
+    );
+};

@@ -1,0 +1,746 @@
+import { subject } from '@casl/ability';
+import {
+    assertUnreachable,
+    ChartSourceType,
+    isResourceViewItemChart,
+    isResourceViewItemDashboard,
+    ResourceViewItemType,
+    type ResourceViewItem,
+} from '@lightdash/common';
+import { ActionIcon, Box, Menu, Tooltip } from '@mantine-8/core';
+import {
+    IconCircleCheck,
+    IconCircleCheckFilled,
+    IconCode,
+    IconCopy,
+    IconDatabaseExport,
+    IconDots,
+    IconEdit,
+    IconFolderPlus,
+    IconFolderSymlink,
+    IconLayoutGridAdd,
+    IconPin,
+    IconPinnedOff,
+    IconStar,
+    IconStarFilled,
+    IconTrash,
+    IconUsers,
+} from '@tabler/icons-react';
+import { type FC, useState } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router';
+import { AskAiAgentMenuItem } from '../../../ee/features/aiCopilot/components/AskAiAgentMenuItem/AskAiAgentMenuItem';
+import { PromoteAppModal } from '../../../features/apps/components/PromoteAppModal';
+import { useDuplicateApp } from '../../../features/apps/hooks/useDuplicateApp';
+import { PromotionConfirmDialog } from '../../../features/promotion/components/PromotionConfirmDialog';
+import {
+    usePromoteChartDiffMutation,
+    usePromoteMutation,
+} from '../../../features/promotion/hooks/usePromoteChart';
+import {
+    usePromoteDashboardDiffMutation,
+    usePromoteDashboardMutation,
+} from '../../../features/promotion/hooks/usePromoteDashboard';
+import {
+    useUnverifyChartMutation,
+    useUnverifyDashboardMutation,
+    useVerifyChartMutation,
+    useVerifyDashboardMutation,
+} from '../../../hooks/useContentVerification';
+import { useProject } from '../../../hooks/useProject';
+import { useSpaceSummaries } from '../../../hooks/useSpaces';
+import useApp from '../../../providers/App/useApp';
+import useFavoritesContext from '../../../providers/Favorites/useFavoritesContext';
+import MantineIcon from '../MantineIcon';
+import {
+    ResourceViewItemAction,
+    type ResourceViewItemActionState,
+} from './types';
+
+export interface ResourceViewActionMenuCommonProps {
+    onAction: (newAction: ResourceViewItemActionState) => void;
+}
+
+interface ResourceViewActionMenuProps extends ResourceViewActionMenuCommonProps {
+    disabled?: boolean;
+    item: ResourceViewItem;
+    allowDelete?: boolean;
+    hideVerification?: boolean;
+    isOpen?: boolean;
+    onOpen?: () => void;
+    onClose?: () => void;
+}
+
+const ResourceViewActionMenu: FC<ResourceViewActionMenuProps> = ({
+    disabled = false,
+    item,
+    allowDelete = true,
+    hideVerification = false,
+    isOpen,
+    onOpen,
+    onClose,
+    onAction,
+}) => {
+    const { user } = useApp();
+    const location = useLocation();
+    const navigate = useNavigate();
+    const { projectUuid } = useParams<{ projectUuid: string }>();
+    const { data: project } = useProject(projectUuid);
+    const [isPromoteAppOpen, setIsPromoteAppOpen] = useState(false);
+    const { mutate: duplicateApp } = useDuplicateApp();
+    const organizationUuid = user.data?.organizationUuid;
+    const { data: spaces = [] } = useSpaceSummaries(projectUuid, true, {});
+    const isPinned = !!item.data.pinnedListUuid;
+    const isDashboardPage = location.pathname.includes('/dashboards');
+
+    const isChartOrDashboard =
+        isResourceViewItemChart(item) || isResourceViewItemDashboard(item);
+    const isVerified = isChartOrDashboard && item.data.verification !== null;
+    const userCanManageVerification =
+        user.data?.ability?.can(
+            'manage',
+            subject('ContentVerification', {
+                organizationUuid,
+                projectUuid,
+            }),
+        ) === true;
+
+    const { mutate: verifyChart } = useVerifyChartMutation();
+    const { mutate: unverifyChart } = useUnverifyChartMutation();
+    const { mutate: verifyDashboard } = useVerifyDashboardMutation();
+    const { mutate: unverifyDashboard } = useUnverifyDashboardMutation();
+
+    const { mutate: promoteChart } = usePromoteMutation();
+    const { mutate: promoteDashboard } = usePromoteDashboardMutation();
+    const {
+        mutate: getPromoteDashboardDiff,
+        data: promoteDashboardDiff,
+        reset: resetPromoteDashboardDiff,
+        isLoading: promoteDashboardDiffLoading,
+    } = usePromoteDashboardDiffMutation();
+    const {
+        mutate: getPromoteChartDiff,
+        data: promoteChartDiff,
+        reset: resetPromoteChartDiff,
+        isLoading: promoteChartDiffLoading,
+    } = usePromoteChartDiffMutation();
+
+    // Mirror the backend promote check: promoting also requires promote
+    // rights on the upstream (destination) project, so hide the action when
+    // an upstream exists but the user has no promote access there.
+    const promoteSubjectName =
+        item.type === ResourceViewItemType.CHART ? 'SavedChart' : 'Dashboard';
+    const promoteItemAccess = isChartOrDashboard
+        ? (() => {
+              const userAccess = spaces.find(
+                  (space) => space.uuid === item.data.spaceUuid,
+              )?.userAccess;
+              return userAccess ? [userAccess] : [];
+          })()
+        : [];
+    const userCanPromoteChart =
+        user.data?.ability?.can(
+            'promote',
+            subject(promoteSubjectName, {
+                organizationUuid,
+                projectUuid,
+                access: promoteItemAccess,
+            }),
+        ) &&
+        (project?.upstreamProjectUuid === undefined ||
+            user.data?.ability?.can(
+                'promote',
+                subject(promoteSubjectName, {
+                    organizationUuid,
+                    projectUuid: project.upstreamProjectUuid,
+                    access: promoteItemAccess,
+                }),
+            ));
+
+    const isSqlChart =
+        item.type === ResourceViewItemType.CHART &&
+        item.data.source === ChartSourceType.SQL;
+
+    // Personal (space-less) data apps can't be pinned — the backend rejects it.
+    const isPersonalDataApp =
+        item.type === ResourceViewItemType.DATA_APP && !item.data.spaceUuid;
+
+    // Match the app builder's wording: apps not yet in a space are "added",
+    // apps already in one are "moved".
+    const moveActionLabel =
+        item.type === ResourceViewItemType.DATA_APP
+            ? isPersonalDataApp
+                ? 'Add to space'
+                : 'Move to space'
+            : 'Move';
+
+    const favoritesContext = useFavoritesContext();
+    const isFavorited = favoritesContext?.isFavorited(item.data.uuid) ?? false;
+
+    let userCanManage = false;
+    switch (item.type) {
+        case ResourceViewItemType.CHART: {
+            const userAccess = spaces.find(
+                (space) => space.uuid === item.data.spaceUuid,
+            )?.userAccess;
+
+            if (isSqlChart) {
+                userCanManage =
+                    user.data?.ability?.can(
+                        'manage',
+                        subject('SqlRunner', {
+                            organizationUuid,
+                            projectUuid,
+                            access: userAccess ? [userAccess] : [],
+                        }),
+                    ) === true &&
+                    user.data?.ability?.can(
+                        'manage',
+                        subject('SavedChart', {
+                            ...item.data,
+                            projectUuid,
+                            organizationUuid,
+                            access: userAccess ? [userAccess] : [],
+                        }),
+                    ) === true;
+            } else {
+                userCanManage =
+                    user.data?.ability?.can(
+                        'manage',
+                        subject('SavedChart', {
+                            ...item.data,
+                            projectUuid,
+                            organizationUuid,
+                            access: userAccess ? [userAccess] : [],
+                        }),
+                    ) === true;
+            }
+            break;
+        }
+        case ResourceViewItemType.DASHBOARD: {
+            const userAccess = spaces.find(
+                (space) => space.uuid === item.data.spaceUuid,
+            )?.userAccess;
+            userCanManage =
+                user.data?.ability?.can(
+                    'manage',
+                    subject('Dashboard', {
+                        ...item.data,
+                        projectUuid,
+                        organizationUuid,
+                        access: userAccess ? [userAccess] : [],
+                    }),
+                ) === true;
+            break;
+        }
+        case ResourceViewItemType.SPACE: {
+            const userAccess = spaces.find(
+                (space) => space.uuid === item.data.uuid,
+            )?.userAccess;
+            userCanManage =
+                user.data?.ability?.can(
+                    'manage',
+                    subject('Space', {
+                        ...item.data,
+                        projectUuid,
+                        organizationUuid,
+                        access: userAccess ? [userAccess] : [],
+                    }),
+                ) === true;
+            break;
+        }
+        case ResourceViewItemType.DATA_APP: {
+            const userAccess = spaces.find(
+                (space) => space.uuid === item.data.spaceUuid,
+            )?.userAccess;
+            userCanManage =
+                user.data?.ability?.can(
+                    'manage',
+                    subject('DataApp', {
+                        organizationUuid,
+                        projectUuid,
+                        access: userAccess ? [userAccess] : [],
+                        createdByUserUuid: item.data.createdByUserUuid,
+                    }),
+                ) === true;
+            break;
+        }
+        default:
+            return assertUnreachable(item, 'Resource type not supported');
+    }
+
+    // Duplicating a data app forks it into the user's own personal app, so the
+    // backend only asks for view access plus `create:DataApp` — not manage
+    // rights on the source app.
+    const canDuplicateDataApp =
+        item.type === ResourceViewItemType.DATA_APP &&
+        user.data?.ability?.can(
+            'create',
+            subject('DataApp', {
+                organizationUuid,
+                projectUuid,
+            }),
+        ) === true;
+
+    if (!userCanManage && !canDuplicateDataApp && !favoritesContext) {
+        return null;
+    }
+
+    // Apps duplicate synchronously via a direct mutation; charts and dashboards
+    // open a modal that lets the user pick a name/space first.
+    const duplicateDataAppMenuItem = (
+        <Menu.Item
+            component="button"
+            role="menuitem"
+            leftSection={<MantineIcon icon={IconCopy} size={18} />}
+            onClick={() => {
+                if (!projectUuid) return;
+                duplicateApp(
+                    { projectUuid, appUuid: item.data.uuid },
+                    {
+                        onSuccess: ({ appUuid: newAppUuid }) => {
+                            void navigate(
+                                `/projects/${projectUuid}/apps/${newAppUuid}`,
+                            );
+                        },
+                    },
+                );
+            }}
+        >
+            Duplicate
+        </Menu.Item>
+    );
+
+    return (
+        <>
+            <Menu
+                disabled={disabled}
+                withinPortal
+                opened={isOpen}
+                position="bottom-start"
+                withArrow
+                arrowPosition="center"
+                shadow="md"
+                offset={-4}
+                closeOnItemClick
+                closeOnClickOutside
+                onClose={onClose}
+            >
+                <Menu.Target>
+                    <Box onClick={isOpen ? onClose : onOpen}>
+                        <ActionIcon
+                            disabled={disabled}
+                            aria-label="Menu"
+                            data-testid={`ResourceViewActionMenu/${item.data.name}`}
+                            variant="subtle"
+                            color="ldGray.6"
+                        >
+                            <IconDots size={16} />
+                        </ActionIcon>
+                    </Box>
+                </Menu.Target>
+
+                <Menu.Dropdown maw={320}>
+                    {favoritesContext && (
+                        <Menu.Item
+                            component="button"
+                            role="menuitem"
+                            leftSection={
+                                isFavorited ? (
+                                    <IconStarFilled size={18} color="orange" />
+                                ) : (
+                                    <IconStar size={18} />
+                                )
+                            }
+                            onClick={() => {
+                                favoritesContext.toggleFavorite(
+                                    item.type,
+                                    item.data.uuid,
+                                );
+                            }}
+                        >
+                            {isFavorited
+                                ? 'Remove from favorites'
+                                : 'Add to favorites'}
+                        </Menu.Item>
+                    )}
+
+                    {isChartOrDashboard && !isSqlChart && (
+                        <>
+                            <AskAiAgentMenuItem
+                                projectUuid={projectUuid}
+                                chartUuid={
+                                    isResourceViewItemChart(item)
+                                        ? item.data.uuid
+                                        : undefined
+                                }
+                                dashboardUuid={
+                                    isResourceViewItemDashboard(item)
+                                        ? item.data.uuid
+                                        : undefined
+                                }
+                                clickedFrom="resource_action_menu"
+                            />
+                            {/* TODO: add a create-issue entry point once the issues flow is finalized */}
+                        </>
+                    )}
+
+                    {(userCanManage || canDuplicateDataApp) &&
+                        favoritesContext && <Menu.Divider />}
+
+                    {/* A user who can't manage the app can still fork it. */}
+                    {!userCanManage &&
+                        canDuplicateDataApp &&
+                        duplicateDataAppMenuItem}
+
+                    {userCanManage && (
+                        <>
+                            {item.type === ResourceViewItemType.DATA_APP && (
+                                <Menu.Item
+                                    component="button"
+                                    role="menuitem"
+                                    leftSection={
+                                        <MantineIcon
+                                            icon={IconCode}
+                                            size={18}
+                                        />
+                                    }
+                                    onClick={() => {
+                                        if (!projectUuid) return;
+                                        void navigate(
+                                            `/projects/${projectUuid}/apps/${item.data.uuid}`,
+                                        );
+                                    }}
+                                >
+                                    Continue building
+                                </Menu.Item>
+                            )}
+
+                            <Menu.Item
+                                component="button"
+                                role="menuitem"
+                                leftSection={<IconEdit size={18} />}
+                                onClick={() => {
+                                    onAction({
+                                        type: ResourceViewItemAction.UPDATE,
+                                        item,
+                                    });
+                                }}
+                                style={isSqlChart ? { display: 'none' } : {}}
+                            >
+                                {item.type === ResourceViewItemType.SPACE
+                                    ? 'Update space'
+                                    : 'Rename'}
+                            </Menu.Item>
+
+                            {canDuplicateDataApp
+                                ? duplicateDataAppMenuItem
+                                : null}
+                            {item.type === ResourceViewItemType.CHART ||
+                            item.type === ResourceViewItemType.DASHBOARD ? (
+                                <Menu.Item
+                                    component="button"
+                                    role="menuitem"
+                                    leftSection={
+                                        <MantineIcon
+                                            icon={IconCopy}
+                                            size={18}
+                                        />
+                                    }
+                                    onClick={() => {
+                                        onAction({
+                                            type: ResourceViewItemAction.DUPLICATE,
+                                            item,
+                                        });
+                                    }}
+                                    style={
+                                        isSqlChart ? { display: 'none' } : {}
+                                    }
+                                >
+                                    Duplicate
+                                </Menu.Item>
+                            ) : null}
+
+                            {!isDashboardPage &&
+                                item.type === ResourceViewItemType.CHART && (
+                                    <Menu.Item
+                                        component="button"
+                                        role="menuitem"
+                                        leftSection={
+                                            <IconLayoutGridAdd size={18} />
+                                        }
+                                        onClick={() => {
+                                            onAction({
+                                                type: ResourceViewItemAction.ADD_TO_DASHBOARD,
+                                                item,
+                                            });
+                                        }}
+                                    >
+                                        Add to Dashboard
+                                    </Menu.Item>
+                                )}
+                            {userCanPromoteChart &&
+                                !isSqlChart &&
+                                item.type !== ResourceViewItemType.SPACE &&
+                                item.type !== ResourceViewItemType.DATA_APP && (
+                                    <Tooltip
+                                        label="You must enable first an upstream project in settings > Data ops"
+                                        disabled={
+                                            project?.upstreamProjectUuid !==
+                                            undefined
+                                        }
+                                        withinPortal
+                                    >
+                                        <div>
+                                            <Menu.Item
+                                                disabled={
+                                                    project?.upstreamProjectUuid ===
+                                                    undefined
+                                                }
+                                                leftSection={
+                                                    <MantineIcon
+                                                        icon={
+                                                            IconDatabaseExport
+                                                        }
+                                                    />
+                                                }
+                                                onClick={() => {
+                                                    if (
+                                                        item.type ===
+                                                        ResourceViewItemType.CHART
+                                                    ) {
+                                                        getPromoteChartDiff(
+                                                            item.data.uuid,
+                                                        );
+                                                    } else
+                                                        getPromoteDashboardDiff(
+                                                            item.data.uuid,
+                                                        );
+                                                }}
+                                            >
+                                                Promote{' '}
+                                                {item.type ===
+                                                ResourceViewItemType.CHART
+                                                    ? 'chart'
+                                                    : 'dashboard'}
+                                            </Menu.Item>
+                                        </div>
+                                    </Tooltip>
+                                )}
+                            {item.type === ResourceViewItemType.DATA_APP &&
+                                project?.upstreamProjectUuid !== undefined && (
+                                    <Menu.Item
+                                        leftSection={
+                                            <MantineIcon
+                                                icon={IconDatabaseExport}
+                                            />
+                                        }
+                                        onClick={() =>
+                                            setIsPromoteAppOpen(true)
+                                        }
+                                    >
+                                        Promote data app
+                                    </Menu.Item>
+                                )}
+
+                            {user.data?.ability.can(
+                                'manage',
+                                subject('PinnedItems', {
+                                    organizationUuid,
+                                    projectUuid,
+                                }),
+                            ) ? (
+                                <Menu.Item
+                                    component="button"
+                                    role="menuitem"
+                                    leftSection={
+                                        isPinned ? (
+                                            <IconPinnedOff size={18} />
+                                        ) : (
+                                            <IconPin size={18} />
+                                        )
+                                    }
+                                    onClick={() => {
+                                        onAction({
+                                            type: ResourceViewItemAction.PIN_TO_HOMEPAGE,
+                                            item,
+                                        });
+                                    }}
+                                    style={
+                                        isSqlChart || isPersonalDataApp
+                                            ? { display: 'none' }
+                                            : {}
+                                    }
+                                >
+                                    {isPinned
+                                        ? 'Unpin from homepage'
+                                        : 'Pin to homepage'}
+                                </Menu.Item>
+                            ) : null}
+
+                            {userCanManageVerification &&
+                                isChartOrDashboard &&
+                                !hideVerification && (
+                                    <Menu.Item
+                                        component="button"
+                                        role="menuitem"
+                                        leftSection={
+                                            isVerified ? (
+                                                <IconCircleCheckFilled
+                                                    size={18}
+                                                    color="var(--mantine-color-green-6)"
+                                                />
+                                            ) : (
+                                                <IconCircleCheck size={18} />
+                                            )
+                                        }
+                                        onClick={() => {
+                                            if (isVerified) {
+                                                if (
+                                                    isResourceViewItemChart(
+                                                        item,
+                                                    )
+                                                ) {
+                                                    unverifyChart(
+                                                        item.data.uuid,
+                                                    );
+                                                } else {
+                                                    unverifyDashboard(
+                                                        item.data.uuid,
+                                                    );
+                                                }
+                                            } else {
+                                                if (
+                                                    isResourceViewItemChart(
+                                                        item,
+                                                    )
+                                                ) {
+                                                    verifyChart(item.data.uuid);
+                                                } else {
+                                                    verifyDashboard(
+                                                        item.data.uuid,
+                                                    );
+                                                }
+                                            }
+                                        }}
+                                    >
+                                        {isVerified
+                                            ? 'Remove verification'
+                                            : 'Verify'}
+                                    </Menu.Item>
+                                )}
+
+                            <Menu.Divider
+                                display={isSqlChart ? 'none' : 'block'}
+                            />
+
+                            <Menu.Item
+                                component="button"
+                                role="menuitem"
+                                leftSection={
+                                    isPersonalDataApp ? (
+                                        <IconFolderPlus size={18} />
+                                    ) : (
+                                        <IconFolderSymlink size={18} />
+                                    )
+                                }
+                                onClick={() => {
+                                    onAction({
+                                        type: ResourceViewItemAction.TRANSFER_TO_SPACE,
+                                        item,
+                                    });
+                                }}
+                            >
+                                {moveActionLabel}
+                            </Menu.Item>
+
+                            {item.type === ResourceViewItemType.SPACE && (
+                                <Menu.Item
+                                    component="button"
+                                    role="menuitem"
+                                    leftSection={<IconUsers size={18} />}
+                                    onClick={() => {
+                                        onAction({
+                                            type: ResourceViewItemAction.SHARE,
+                                            item,
+                                        });
+                                    }}
+                                >
+                                    Share
+                                </Menu.Item>
+                            )}
+
+                            {allowDelete && (
+                                <>
+                                    <Menu.Divider />
+
+                                    <Menu.Item
+                                        component="button"
+                                        role="menuitem"
+                                        color="red"
+                                        leftSection={
+                                            <MantineIcon
+                                                icon={IconTrash}
+                                                size={18}
+                                            />
+                                        }
+                                        onClick={() => {
+                                            onAction({
+                                                type: ResourceViewItemAction.DELETE,
+                                                item,
+                                            });
+                                        }}
+                                    >
+                                        Delete{' '}
+                                        {item.type ===
+                                        ResourceViewItemType.DATA_APP
+                                            ? 'data app'
+                                            : item.type}
+                                    </Menu.Item>
+                                </>
+                            )}
+                        </>
+                    )}
+                </Menu.Dropdown>
+            </Menu>
+
+            {(promoteChartDiff || promoteChartDiffLoading) && (
+                <PromotionConfirmDialog
+                    type="chart"
+                    promotionChanges={promoteChartDiff}
+                    resourceName={item.data.name}
+                    onClose={() => {
+                        resetPromoteChartDiff();
+                    }}
+                    onConfirm={() => {
+                        promoteChart(item.data.uuid);
+                    }}
+                ></PromotionConfirmDialog>
+            )}
+            {(promoteDashboardDiff || promoteDashboardDiffLoading) && (
+                <PromotionConfirmDialog
+                    type="dashboard"
+                    resourceName={item.data.name}
+                    promotionChanges={promoteDashboardDiff}
+                    onClose={() => {
+                        resetPromoteDashboardDiff();
+                    }}
+                    onConfirm={() => {
+                        promoteDashboard(item.data.uuid);
+                    }}
+                ></PromotionConfirmDialog>
+            )}
+            {isPromoteAppOpen &&
+                projectUuid &&
+                item.type === ResourceViewItemType.DATA_APP && (
+                    <PromoteAppModal
+                        projectUuid={projectUuid}
+                        appUuid={item.data.uuid}
+                        opened
+                        onClose={() => setIsPromoteAppOpen(false)}
+                    />
+                )}
+        </>
+    );
+};
+
+export default ResourceViewActionMenu;

@@ -1,0 +1,9 @@
+export enum CommercialFeatureFlags {
+    Embedding = 'embedding',
+    Scim = 'scim-token-management',
+    AiCopilot = 'ai-copilot',
+    ServiceAccounts = 'service-accounts',
+    OrganizationWarehouseCredentials = 'organization-warehouse-credentials',
+    CustomRoles = 'custom-roles',
+    HomepageBuilder = 'homepage-builder',
+}

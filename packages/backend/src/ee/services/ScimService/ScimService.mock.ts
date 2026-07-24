@@ -1,0 +1,207 @@
+import { Ability } from '@casl/ability';
+import {
+    OrganizationMemberProfile,
+    OrganizationMemberRole,
+    PossibleAbilities,
+    ProjectType,
+    Role,
+    ServiceAcctAccount,
+} from '@lightdash/common';
+import { LightdashAnalytics } from '../../../analytics/LightdashAnalytics';
+import { lightdashConfigMock } from '../../../config/lightdashConfig.mock';
+import { EmailModel } from '../../../models/EmailModel';
+import { GroupsModel } from '../../../models/GroupsModel';
+import { OpenIdIdentityModel } from '../../../models/OpenIdIdentitiesModel';
+import { OrganizationMemberProfileModel } from '../../../models/OrganizationMemberProfileModel';
+import { ProjectModel } from '../../../models/ProjectModel/ProjectModel';
+import { RolesModel } from '../../../models/RolesModel';
+import { UserModel } from '../../../models/UserModel';
+import { CommercialFeatureFlagModel } from '../../models/CommercialFeatureFlagModel';
+import { ServiceAccountModel } from '../../models/ServiceAccountModel';
+import { ScimService } from './ScimService';
+
+// Mock SCIM service-account Account for tests that exercise audited ability checks.
+export const mockScimAccount = {
+    authentication: {
+        type: 'service-account' as const,
+        source: 'test-scim-token',
+    },
+    user: {
+        type: 'registered' as const,
+        id: 'scim-service-account-user-uuid',
+        userUuid: 'scim-service-account-user-uuid',
+        email: undefined,
+        firstName: 'SCIM service account',
+        lastName: '',
+        isActive: false,
+        role: OrganizationMemberRole.ADMIN,
+        ability: new Ability<PossibleAbilities>([
+            { subject: 'OrganizationMemberProfile', action: ['manage'] },
+            { subject: 'Group', action: ['manage'] },
+        ]),
+        abilityRules: [] as any, // eslint-disable-line @typescript-eslint/no-explicit-any
+        isTrackingAnonymized: false,
+        isMarketingOptedIn: false,
+        avatarUrl: null,
+        avatarGradient: null,
+        timezone: null,
+        isSetupComplete: true,
+        userId: 1,
+        createdAt: new Date('2024-01-01'),
+        updatedAt: new Date('2024-01-01'),
+    },
+    organization: {
+        organizationUuid: 'org-uuid',
+        name: 'Test Organization',
+        createdAt: new Date('2024-01-01'),
+    },
+    isAuthenticated: () => true,
+    isRegisteredUser: () => true,
+    isAnonymousUser: () => false,
+    isSessionUser: () => false,
+    isJwtUser: () => false,
+    isServiceAccount: () => true,
+    isPatUser: () => false,
+    isOauthUser: () => false,
+} as ServiceAcctAccount;
+
+// Mock user for testing
+export const mockUser: OrganizationMemberProfile = {
+    userUuid: 'test-uuid',
+    firstName: 'Test',
+    lastName: 'User',
+    email: 'test@example.com',
+    isActive: true,
+    role: OrganizationMemberRole.MEMBER,
+    roleUuid: undefined,
+    userCreatedAt: new Date(),
+    userUpdatedAt: new Date(),
+    organizationUuid: 'org-uuid',
+    avatarUrl: null,
+    avatarGradient: null,
+};
+
+// Mock projects for testing
+export const mockProjects = [
+    {
+        projectUuid: 'project-1-uuid',
+        name: 'Analytics Project',
+        type: ProjectType.DEFAULT,
+        organizationUuid: 'org-uuid',
+    },
+    {
+        projectUuid: 'project-2-uuid',
+        name: 'Marketing Project',
+        type: ProjectType.DEFAULT,
+        organizationUuid: 'org-uuid',
+    },
+    {
+        projectUuid: 'preview-project-uuid',
+        name: 'Preview Project',
+        type: ProjectType.PREVIEW,
+        organizationUuid: 'org-uuid',
+    },
+];
+
+// Mock custom roles for testing
+export const mockCustomRoles: Role[] = [
+    {
+        roleUuid: 'custom-role-1-uuid',
+        name: 'Data Analyst',
+        description: 'Custom data analyst role',
+        level: 'project',
+        organizationUuid: 'org-uuid',
+        ownerType: 'user',
+        createdBy: 'test-user-uuid',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+    },
+    {
+        roleUuid: 'custom-role-2-uuid',
+        name: 'Report Builder',
+        description: 'Custom report builder role',
+        level: 'project',
+        organizationUuid: 'org-uuid',
+        ownerType: 'user',
+        createdBy: 'test-user-uuid',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+    },
+];
+
+// Mock organization member profile model
+const organizationMemberProfileModelMock = {
+    getOrganizationMemberByUuid: vi.fn().mockResolvedValue(mockUser),
+    updateOrganizationMember: vi.fn().mockResolvedValue(mockUser),
+    createOrganizationMembershipByUuid: vi.fn().mockResolvedValue(mockUser),
+} as unknown as OrganizationMemberProfileModel;
+
+// Mock user model
+const userModelMock = {
+    findUserByEmail: vi.fn().mockResolvedValue(undefined),
+    createUser: vi.fn().mockResolvedValue({
+        userId: 1,
+        userUuid: mockUser.userUuid,
+        firstName: mockUser.firstName,
+        lastName: mockUser.lastName,
+        email: mockUser.email,
+        isActive: mockUser.isActive,
+        organizationUuid: mockUser.organizationUuid,
+    }),
+    updateUser: vi.fn().mockResolvedValue({
+        userId: 1,
+        userUuid: mockUser.userUuid,
+        firstName: mockUser.firstName,
+        lastName: mockUser.lastName,
+        email: mockUser.email,
+        isActive: mockUser.isActive,
+        organizationUuid: mockUser.organizationUuid,
+    }),
+    getUserDetailsByUuid: vi.fn().mockResolvedValue(mockUser),
+    getUserProjectRoles: vi.fn().mockResolvedValue([]),
+} as unknown as UserModel;
+
+// Mock analytics
+const analyticsMock = {
+    track: vi.fn(),
+} as unknown as LightdashAnalytics;
+
+// Mock email model
+const emailModelMock = {
+    verifyUserEmailIfExists: vi.fn().mockResolvedValue(undefined),
+} as unknown as EmailModel;
+
+export const ScimServiceArgumentsMock: ConstructorParameters<
+    typeof ScimService
+>[0] = {
+    lightdashConfig: lightdashConfigMock,
+    organizationMemberProfileModel: organizationMemberProfileModelMock,
+    userModel: userModelMock,
+    emailModel: emailModelMock,
+    analytics: analyticsMock,
+    groupsModel: {
+        removeUserFromAllGroups: vi.fn().mockResolvedValue(2),
+    } as unknown as GroupsModel,
+    serviceAccountModel: {} as ServiceAccountModel,
+    commercialFeatureFlagModel: {} as CommercialFeatureFlagModel,
+    rolesModel: {
+        removeUserProjectAccess: vi.fn().mockResolvedValue(undefined),
+        removeUserAccessFromAllProjects: vi.fn().mockResolvedValue(3),
+        getRolesByOrganizationUuid: vi.fn().mockResolvedValue(mockCustomRoles),
+        upsertSystemRoleProjectAccess: vi.fn().mockResolvedValue(undefined),
+        upsertCustomRoleProjectAccess: vi.fn().mockResolvedValue(undefined),
+        // New unified method used by ScimService to set org and project roles
+        setUserOrgAndProjectRoles: vi.fn().mockResolvedValue(undefined),
+        // Some code paths may still call this directly; keep a mock for safety
+        upsertOrganizationUserRoleAssignment: vi
+            .fn()
+            .mockResolvedValue(undefined),
+    } as unknown as RolesModel,
+    projectModel: {
+        getAllByOrganizationUuid: vi.fn().mockResolvedValue(mockProjects),
+    } as unknown as ProjectModel,
+    openIdIdentityModel: {
+        deleteIdentitiesByEmail: vi.fn().mockResolvedValue(0),
+        deleteIdentitiesByUserUuid: vi.fn().mockResolvedValue(0),
+    } as unknown as OpenIdIdentityModel,
+};

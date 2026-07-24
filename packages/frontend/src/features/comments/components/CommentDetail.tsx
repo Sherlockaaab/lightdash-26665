@@ -1,0 +1,184 @@
+import { sanitizeHtml, type Comment } from '@lightdash/common';
+import {
+    ActionIcon,
+    Box,
+    getDefaultZIndex,
+    Grid,
+    Group,
+    Menu,
+    Text,
+    Tooltip,
+} from '@mantine-8/core';
+import { useHover } from '@mantine-8/hooks';
+import {
+    IconArrowBackUp,
+    IconCircleCheck,
+    IconDotsVertical,
+    IconMessage,
+    IconTrash,
+} from '@tabler/icons-react';
+import { useMemo, type FC } from 'react';
+import { LightdashUserAvatar } from '../../../components/Avatar';
+import MantineIcon from '../../../components/common/MantineIcon';
+import { getNameInitials } from '../utils';
+import styles from './CommentDetail.module.css';
+import { CommentTimestamp } from './CommentTimestamp';
+
+type Props = {
+    comment: Comment;
+    canRemove: boolean;
+    canReply: boolean;
+    canResolve: boolean;
+    canUnresolve: boolean;
+    onRemove: () => void;
+    onReply?: () => void;
+    onResolve?: () => void;
+    onUnresolve?: () => void;
+};
+
+export const CommentDetail: FC<Props> = ({
+    comment,
+    canRemove,
+    onRemove,
+    canReply,
+    onReply,
+    canResolve,
+    onResolve,
+    canUnresolve,
+    onUnresolve,
+}) => {
+    const { ref, hovered } = useHover();
+
+    /**
+     * Content should already be sanitized from the API, but as an extra
+     * precaution we also sanitize it before rendering.
+     */
+    const sanitizedCommentTextHtml = useMemo(
+        () => sanitizeHtml(comment.textHtml),
+        [comment.textHtml],
+    );
+
+    return (
+        <Box ref={ref}>
+            <Grid columns={20}>
+                <Grid.Col span={2}>
+                    <LightdashUserAvatar
+                        size="sm"
+                        userUuid={comment.user.userUuid}
+                        avatarUrl={comment.user.avatarUrl}
+                        avatarGradient={comment.user.avatarGradient}
+                    >
+                        {getNameInitials(comment.user.name)}
+                    </LightdashUserAvatar>
+                </Grid.Col>
+                <Grid.Col span={18}>
+                    <Group justify="space-between">
+                        <Group gap="xs">
+                            <Text fz="xs" fw={600}>
+                                {comment.user.name}
+                            </Text>
+                            <CommentTimestamp timestamp={comment.createdAt} />
+                        </Group>
+
+                        <Group gap="two" opacity={hovered ? 1 : 0}>
+                            {canReply && onReply && (
+                                <Tooltip
+                                    label="Reply"
+                                    withinPortal
+                                    zIndex={getDefaultZIndex('popover') + 1}
+                                >
+                                    <ActionIcon
+                                        size="xs"
+                                        onClick={() => onReply()}
+                                        variant="subtle"
+                                        color="blue"
+                                    >
+                                        <MantineIcon icon={IconMessage} />
+                                    </ActionIcon>
+                                </Tooltip>
+                            )}
+                            {(canRemove ||
+                                (canResolve && onResolve) ||
+                                (canUnresolve && onUnresolve)) && (
+                                <Menu
+                                    position="right"
+                                    withArrow
+                                    withinPortal
+                                    zIndex={getDefaultZIndex('popover') + 1}
+                                >
+                                    <Menu.Target>
+                                        <ActionIcon
+                                            size="xs"
+                                            variant="subtle"
+                                            color="gray"
+                                        >
+                                            <MantineIcon
+                                                icon={IconDotsVertical}
+                                            />
+                                        </ActionIcon>
+                                    </Menu.Target>
+                                    <Menu.Dropdown
+                                        p={0}
+                                        onMouseDown={(e) => e.stopPropagation()}
+                                    >
+                                        {canResolve && onResolve && (
+                                            <Menu.Item
+                                                p="xs"
+                                                fz="xs"
+                                                leftSection={
+                                                    <MantineIcon
+                                                        color="green"
+                                                        icon={IconCircleCheck}
+                                                    />
+                                                }
+                                                onClick={() => onResolve()}
+                                            >
+                                                Resolve
+                                            </Menu.Item>
+                                        )}
+                                        {canUnresolve && onUnresolve && (
+                                            <Menu.Item
+                                                p="xs"
+                                                fz="xs"
+                                                leftSection={
+                                                    <MantineIcon
+                                                        icon={IconArrowBackUp}
+                                                    />
+                                                }
+                                                onClick={() => onUnresolve()}
+                                            >
+                                                Unresolve
+                                            </Menu.Item>
+                                        )}
+                                        {canRemove && (
+                                            <Menu.Item
+                                                p="xs"
+                                                fz="xs"
+                                                leftSection={
+                                                    <MantineIcon
+                                                        color="red"
+                                                        icon={IconTrash}
+                                                    />
+                                                }
+                                                onClick={() => onRemove()}
+                                            >
+                                                Delete
+                                            </Menu.Item>
+                                        )}
+                                    </Menu.Dropdown>
+                                </Menu>
+                            )}
+                        </Group>
+                    </Group>
+                    <Box
+                        className={styles.commentText}
+                        dangerouslySetInnerHTML={{
+                            __html: sanitizedCommentTextHtml,
+                        }}
+                        fz="xs"
+                    />
+                </Grid.Col>
+            </Grid>
+        </Box>
+    );
+};

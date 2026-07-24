@@ -1,0 +1,102 @@
+import {
+    ChartContent,
+    ContentSortByColumns,
+    ContentType,
+    SummaryContentBase,
+} from '@lightdash/common';
+import { Knex } from 'knex';
+
+/**
+ * Priority ranking for content types (lower number = higher priority)
+ */
+export enum ContentTypePriority {
+    SPACE = 1,
+    DASHBOARD = 2,
+    CHART = 3,
+    DATA_APP = 4,
+}
+
+export type ContentFilters = {
+    projectUuids?: string[];
+    spaceUuids?: string[];
+    /** Restrict to specific content uuids (e.g. resolving curated collections) */
+    uuids?: string[];
+    contentTypes?: ContentType[];
+    chart?: {
+        sources?: ChartContent['source'][];
+    };
+    search?: string;
+    space?: {
+        rootSpaces: boolean;
+        /**
+         * For nested views: child space UUIDs the user can access.
+         * Filters `WHERE space_uuid IN (...)` so inaccessible
+         * children are excluded before pagination.
+         */
+        accessibleChildSpaceUuids?: string[];
+    };
+    deleted?: boolean;
+    deletedByUserUuids?: string[];
+    includeDescendantCounts?: boolean;
+    // Client opt-in (set by the "All data apps" browse) to surface personal
+    // (space-less) apps. The service resolves it into `dataApps` below.
+    includePersonalDataApps?: boolean;
+    // Resolved by the service: which personal apps the caller may see.
+    // `personalForUserUuid` is always the caller (their own apps);
+    // `personalAdminProjectUuids` are projects where they can see everyone's.
+    dataApps?: {
+        personalForUserUuid: string;
+        personalAdminProjectUuids: string[];
+    };
+};
+
+export type ContentArgs = {
+    sortBy?: ContentSortByColumns;
+    sortDirection?: 'asc' | 'desc';
+};
+
+export type SummaryContentRow<
+    T extends Record<string, unknown> = Record<string, unknown>,
+> = {
+    content_type: ContentType;
+    content_type_rank: number;
+    uuid: string;
+    name: string;
+    description: string | null;
+    slug: string;
+    space_uuid: string;
+    space_name: string;
+    project_uuid: string;
+    project_name: string;
+    organization_uuid: string;
+    organization_name: string;
+    pinned_list_uuid: string | null;
+    created_at: Date;
+    created_by_user_uuid: string | null;
+    created_by_user_first_name: string | null;
+    created_by_user_last_name: string | null;
+    last_updated_at: Date | null;
+    last_updated_by_user_uuid: string | null;
+    last_updated_by_user_first_name: string | null;
+    last_updated_by_user_last_name: string | null;
+    views: number;
+    first_viewed_at: Date | null;
+    deleted_at: Date | null;
+    deleted_by_user_uuid: string | null;
+    deleted_by_user_first_name: string | null;
+    deleted_by_user_last_name: string | null;
+    verified_at: Date | null;
+    verified_by_user_uuid: string | null;
+    verified_by_user_first_name: string | null;
+    verified_by_user_last_name: string | null;
+    metadata: T;
+};
+
+export type ContentConfiguration<
+    T extends SummaryContentRow = SummaryContentRow,
+> = {
+    shouldQueryBeIncluded: (filters: ContentFilters) => boolean;
+    getSummaryQuery: (knex: Knex, filters: ContentFilters) => Knex.QueryBuilder;
+    shouldRowBeConverted: (value: SummaryContentRow) => value is T;
+    convertSummaryRow: (value: SummaryContentRow) => SummaryContentBase;
+};

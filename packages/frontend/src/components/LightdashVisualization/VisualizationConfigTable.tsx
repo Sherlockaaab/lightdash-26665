@@ -1,0 +1,48 @@
+import { ChartType } from '@lightdash/common';
+import { useEffect, type FC } from 'react';
+import useTableConfig from '../../hooks/tableVisualization/useTableConfig';
+import { type VisualizationTableConfigProps } from './types';
+
+const VisualizationTableConfig: FC<VisualizationTableConfigProps> = ({
+    itemsMap,
+    resultsData,
+    columnOrder,
+    validPivotDimensions,
+    initialPivotRows,
+    onPivotRowsChange,
+    initialChartConfig,
+    onChartConfigChange,
+    children,
+    invalidateCache,
+    parameters,
+}) => {
+    const tableConfig = useTableConfig(
+        initialChartConfig,
+        resultsData,
+        itemsMap,
+        columnOrder,
+        validPivotDimensions,
+        initialPivotRows,
+        onPivotRowsChange,
+        invalidateCache,
+        parameters,
+    );
+
+    useEffect(() => {
+        if (!onChartConfigChange || !tableConfig.validConfig) return;
+
+        onChartConfigChange({
+            type: ChartType.TABLE,
+            config: tableConfig.validConfig,
+        });
+    }, [tableConfig, onChartConfigChange]);
+
+    return children({
+        visualizationConfig: {
+            chartType: ChartType.TABLE,
+            chartConfig: tableConfig,
+        },
+    });
+};
+
+export default VisualizationTableConfig;

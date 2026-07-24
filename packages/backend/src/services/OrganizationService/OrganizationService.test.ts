@@ -1,0 +1,193 @@
+import { Ability } from '@casl/ability';
+import {
+    LightdashInstallType,
+    OrganizationMemberRole,
+    type PossibleAbilities,
+    type SessionUser,
+} from '@lightdash/common';
+import { analyticsMock } from '../../analytics/LightdashAnalytics.mock';
+import { buildAccount } from '../../auth/account/account.mock';
+import { lightdashConfigMock } from '../../config/lightdashConfig.mock';
+import { FeatureFlagModel } from '../../models/FeatureFlagModel/FeatureFlagModel';
+import { GroupsModel } from '../../models/GroupsModel';
+import { OnboardingModel } from '../../models/OnboardingModel/OnboardingModel';
+import { OrganizationAllowedEmailDomainsModel } from '../../models/OrganizationAllowedEmailDomainsModel';
+import { OrganizationMemberProfileModel } from '../../models/OrganizationMemberProfileModel';
+import { OrganizationModel } from '../../models/OrganizationModel';
+import { ProjectModel } from '../../models/ProjectModel/ProjectModel';
+import { UserModel } from '../../models/UserModel';
+import { OrganizationService } from './OrganizationService';
+import { organization, user } from './OrganizationService.mock';
+
+const projectModel = {
+    hasProjects: vi.fn(async () => true),
+    getProjectGroupAccesses: vi.fn(),
+};
+const organizationModel = {
+    get: vi.fn(async () => organization),
+    create: vi.fn<OrganizationModel['create']>(async () => organization),
+    hasOrgs: vi.fn<OrganizationModel['hasOrgs']>(async () => false),
+};
+const userModel = {
+    hasUsers: vi.fn<UserModel['hasUsers']>(async () => false),
+    joinOrg: vi.fn<UserModel['joinOrg']>(async () => user),
+};
+const featureFlagModel = {
+    get: vi.fn<FeatureFlagModel['get']>(async ({ featureFlagId }) => ({
+        id: featureFlagId,
+        enabled: true,
+    })),
+};
+vi.spyOn(analyticsMock, 'track');
+const organizationMemberProfileModel = {
+    getOrganizationMembersAndGroups: vi.fn(),
+};
+
+describe('organization service', () => {
+    const organizationService = new OrganizationService({
+        lightdashConfig: lightdashConfigMock,
+        analytics: analyticsMock,
+        organizationModel: organizationModel as unknown as OrganizationModel,
+        projectModel: projectModel as unknown as ProjectModel,
+        onboardingModel: {} as OnboardingModel,
+        organizationMemberProfileModel:
+            organizationMemberProfileModel as unknown as OrganizationMemberProfileModel,
+        userModel: userModel as unknown as UserModel,
+        organizationAllowedEmailDomainsModel:
+            {} as OrganizationAllowedEmailDomainsModel,
+        groupsModel: {} as GroupsModel,
+        featureFlagModel: featureFlagModel as unknown as FeatureFlagModel,
+    });
+
+    afterEach(() => {
+        vi.clearAllMocks();
+    });
+
+    beforeEach(() => {
+        process.env = {
+            LIGHTDASH_INSTALL_TYPE: LightdashInstallType.UNKNOWN,
+        };
+    });
+
+    it('tracks the onboarding flow when creating an organization', async () => {
+        await organizationService.createAndJoinOrg(
+            { ...user, organizationUuid: undefined },
+            { name: 'Organization' },
+        );
+
+        expect(analyticsMock.track).toHaveBeenCalledWith({
+            event: 'organization.created',
+            userId: user.userUuid,
+            properties: {
+                type: 'self-hosted',
+                organizationId: organization.organizationUuid,
+                organizationName: organization.name,
+                onboardingFlow: 'new',
+            },
+        });
+    });
+
+    it('Should return needsProject false if there are projects in DB', async () => {
+        const account = buildAccount({ accountType: 'session' });
+        expect(await organizationService.get(account)).toEqual({
+            ...organization,
+            needsProject: false,
+            // Default account is a developer (not an org admin), so the pgwire
+            // connection details are withheld — only `enabled` is exposed.
+            pgWire: {
+                enabled: false,
+                tlsRequired: true,
+                host: null,
+                port: null,
+            },
+        });
+    });
+    it('Should return needsProject true if there are no projects in DB', async () => {
+        const account = buildAccount({ accountType: 'session' });
+        (
+            projectModel.hasProjects as import('vitest').Mock
+        ).mockImplementationOnce(async () => false);
+        expect(await organizationService.get(account)).toEqual({
+            ...organization,
+            needsProject: true,
+            pgWire: {
+                enabled: false,
+                tlsRequired: true,
+                host: null,
+                port: null,
+            },
+        });
+    });
+
+    it('Should expose pgwire connection details to org admins', async () => {
+        const account = buildAccount({ accountType: 'session' });
+        account.user.ability = new Ability<PossibleAbilities>([
+            { subject: 'Organization', action: 'manage' },
+        ]);
+        const result = await organizationService.get(account);
+        expect(result.pgWire).toEqual({
+            enabled: false,
+            tlsRequired: true,
+            host: 'test.lightdash.cloud',
+            port: null,
+        });
+    });
+
+    it('Should withhold pgwire connection details from non-admins', async () => {
+        const account = buildAccount({ accountType: 'session' });
+        account.user.ability = new Ability<PossibleAbilities>([
+            { subject: 'Organization', action: 'view' },
+        ]);
+        const result = await organizationService.get(account);
+        expect(result.pgWire).toEqual({
+            enabled: false,
+            tlsRequired: true,
+            host: null,
+            port: null,
+        });
+    });
+
+    it('getUsers falls back to the member org role when their group has a custom role', async () => {
+        // Group access carries a custom-role UUID (coalesced from role_uuid),
+        // which is not a system ProjectMemberRole and must not throw.
+        const customRoleUuid = 'ac5ac86a-b8a6-47fa-9679-40520dcb6136';
+        const projectUuid = 'project-1';
+        const groupUuid = 'group-1';
+        const adminUser: SessionUser = {
+            ...user,
+            ability: new Ability<PossibleAbilities>([
+                { subject: 'OrganizationMemberProfile', action: 'manage' },
+            ]),
+        };
+        const member = {
+            userUuid: 'member-1',
+            email: 'member@lightdash.com',
+            firstName: 'Member',
+            lastName: 'One',
+            organizationUuid: organization.organizationUuid,
+            role: OrganizationMemberRole.MEMBER,
+            isActive: true,
+            isInviteExpired: false,
+            groups: [{ uuid: groupUuid, name: 'Custom group' }],
+        };
+        organizationMemberProfileModel.getOrganizationMembersAndGroups.mockResolvedValueOnce(
+            { pagination: undefined, data: [member] },
+        );
+        projectModel.getProjectGroupAccesses.mockResolvedValueOnce([
+            { projectUuid, groupUuid, role: customRoleUuid },
+        ]);
+
+        const result = await organizationService.getUsers(
+            adminUser,
+            10,
+            undefined,
+            undefined,
+            projectUuid,
+        );
+
+        // Assert the behavioural outcome: a custom-role group must not throw and
+        // the member keeps their own org role (no system-role conversion).
+        expect(result.data).toHaveLength(1);
+        expect(result.data[0].role).toBe(OrganizationMemberRole.MEMBER);
+    });
+});

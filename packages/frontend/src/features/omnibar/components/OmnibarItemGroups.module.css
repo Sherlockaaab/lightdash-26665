@@ -1,0 +1,31 @@
+.accordionControl {
+    height: var(--mantine-spacing-xxl);
+    padding-left: var(--mantine-spacing-md);
+    padding-right: var(--mantine-spacing-md);
+    background-color: light-dark(
+        var(--mantine-color-ldGray-0),
+        var(--mantine-color-ldDark-2)
+    );
+
+    &:hover {
+        background-color: light-dark(
+            var(--mantine-color-ldGray-1),
+            var(--mantine-color-ldDark-3)
+        );
+    }
+}
+
+.accordionLabel {
+    padding: 0;
+}
+
+.groupLabel {
+    color: light-dark(
+        var(--mantine-color-ldGray-6),
+        var(--mantine-color-ldGray-7)
+    );
+}
+
+.accordionContent {
+    padding: var(--mantine-spacing-xs);
+}

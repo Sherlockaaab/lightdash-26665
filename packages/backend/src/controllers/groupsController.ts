@@ -1,0 +1,351 @@
+import {
+    ApiCreateProjectGroupAccess,
+    ApiErrorPayload,
+    ApiGroupMembersResponse,
+    ApiGroupResponse,
+    ApiSuccessEmpty,
+    ApiUpdateProjectGroupAccess,
+    assertRegisteredAccount,
+    CreateProjectGroupAccess,
+    UpdateGroupWithMembers,
+} from '@lightdash/common';
+import {
+    Body,
+    Delete,
+    Deprecated,
+    Get,
+    Middlewares,
+    OperationId,
+    Patch,
+    Path,
+    Post,
+    Put,
+    Query,
+    Request,
+    Response,
+    Route,
+    Tags,
+} from '@tsoa/runtime';
+import express from 'express';
+import { toSessionUser } from '../auth/account';
+import {
+    CreateDBProjectGroupAccess,
+    UpdateDBProjectGroupAccess,
+} from '../database/entities/projectGroupAccess';
+import {
+    allowApiKeyAuthentication,
+    getDeprecatedRouteMiddleware,
+    isAuthenticated,
+    unauthorisedInDemo,
+} from './authentication';
+import { BaseController } from './baseController';
+
+@Route('/api/v1/groups')
+@Response<ApiErrorPayload>('default', 'Error')
+@Tags('User Groups')
+export class GroupsController extends BaseController {
+    /**
+     * Get group details
+     * @summary Get group
+     * @param groupUuid unique id of the group
+     * @param includeMembers number of members to include
+     * @param offset offset of members to include
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @Get('{groupUuid}')
+    @OperationId('getGroup')
+    async getGroup(
+        @Path() groupUuid: string,
+        @Request() req: express.Request,
+        @Query() includeMembers?: number,
+        @Query() offset?: number,
+    ): Promise<ApiGroupResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGroupService()
+                .get(
+                    toSessionUser(req.account),
+                    groupUuid,
+                    includeMembers,
+                    offset,
+                ),
+        };
+    }
+
+    /**
+     * Delete a group
+     * @summary Delete group
+     * @param unique id of the group to delete
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @Delete('{groupUuid}')
+    @OperationId('deleteGroup')
+    async deleteGroup(
+        @Path() groupUuid: string,
+        @Request() req: express.Request,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        await this.services
+            .getGroupService()
+            .delete(toSessionUser(req.account), groupUuid);
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    /**
+     * Add a Lightdash user to a group
+     * @summary Add user to group
+     * @param groupUuid the UUID for the group to add the user to
+     * @param userUuid the UUID for the user to add to the group
+     *
+     * @deprecated Use PATCH /api/v1/groups/{groupUuid} with the full member set instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+        getDeprecatedRouteMiddleware(new Date('2026-06-10'), {
+            suffixMessage:
+                'Use PATCH /api/v1/groups/{groupUuid} with the full member set instead.',
+        }),
+    ])
+    @Put('{groupUuid}/members/{userUuid}')
+    @OperationId('addUserToGroup')
+    @Deprecated()
+    async addUserToGroup(
+        @Path() groupUuid: string,
+        @Path() userUuid: string,
+        @Request() req: express.Request,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        const createdMember = await this.services
+            .getGroupService()
+            .addGroupMember(toSessionUser(req.account), {
+                groupUuid,
+                userUuid,
+            });
+        this.setStatus(createdMember === undefined ? 204 : 201);
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    /**
+     * Remove a user from a group
+     * @summary Remove user from group
+     * @param groupUuid the UUID for the group to remove the user from
+     * @param userUuid the UUID for the user to remove from the group
+     *
+     * @deprecated Use PATCH /api/v1/groups/{groupUuid} with the full member set instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+        getDeprecatedRouteMiddleware(new Date('2026-06-10'), {
+            suffixMessage:
+                'Use PATCH /api/v1/groups/{groupUuid} with the full member set instead.',
+        }),
+    ])
+    @Delete('{groupUuid}/members/{userUuid}')
+    @OperationId('removeUserFromGroup')
+    @Deprecated()
+    async removeUserFromGroup(
+        @Path() groupUuid: string,
+        @Path() userUuid: string,
+        @Request() req: express.Request,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        const deleted = await this.services
+            .getGroupService()
+            .removeGroupMember(toSessionUser(req.account), {
+                userUuid,
+                groupUuid,
+            });
+        this.setStatus(deleted ? 200 : 204);
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    /**
+     * View members of a group
+     * @summary Get group members
+     * @param groupUuid the UUID for the group to view the members of
+     *
+     * @deprecated Use GET /api/v1/groups/{groupUuid}?includeMembers=N instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        getDeprecatedRouteMiddleware(new Date('2026-06-10'), {
+            suffixMessage:
+                'Use GET /api/v1/groups/{groupUuid}?includeMembers=N instead.',
+        }),
+    ])
+    @Get('{groupUuid}/members')
+    @OperationId('getGroupMembers')
+    @Deprecated()
+    async getGroupMembers(
+        @Path() groupUuid: string,
+        @Request() req: express.Request,
+    ): Promise<ApiGroupMembersResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGroupService()
+                .getGroupMembers(toSessionUser(req.account), groupUuid),
+        };
+    }
+
+    /**
+     * Update a group
+     * @summary Update group
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @Patch('{groupUuid}')
+    @OperationId('updateGroup')
+    async updateGroup(
+        @Path() groupUuid: string,
+        @Request() req: express.Request,
+        @Body() body: UpdateGroupWithMembers,
+    ): Promise<ApiGroupResponse> {
+        assertRegisteredAccount(req.account);
+        const group = await this.services
+            .getGroupService()
+            .update(toSessionUser(req.account), groupUuid, body);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: group,
+        };
+    }
+
+    /**
+     * Add project access to a group
+     * @summary Add project access to group
+     *
+     * @deprecated Use ProjectRoleAssignments instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+        getDeprecatedRouteMiddleware(new Date('2025-08-26'), {
+            suffixMessage: 'Use ProjectRoleAssignments instead.',
+        }),
+    ])
+    @Post('{groupUuid}/projects/{projectUuid}')
+    @OperationId('addProjectAccessToGroup')
+    async addProjectAccessToGroup(
+        @Path() groupUuid: string,
+        @Path() projectUuid: string,
+        @Body() projectGroupAccess: Pick<CreateProjectGroupAccess, 'role'>,
+        @Request() req: express.Request,
+    ): Promise<ApiCreateProjectGroupAccess> {
+        assertRegisteredAccount(req.account);
+        const results = await this.services
+            .getGroupService()
+            .addProjectAccess(toSessionUser(req.account), {
+                groupUuid,
+                projectUuid,
+                role: projectGroupAccess.role,
+            });
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results,
+        };
+    }
+
+    /**
+     * Update project access for a group
+     * @summary Update project access for group
+     *
+     *  @deprecated Use ProjectRoleAssignments instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+        getDeprecatedRouteMiddleware(new Date('2025-08-26'), {
+            suffixMessage: 'Use ProjectRoleAssignments instead.',
+        }),
+    ])
+    @Patch('{groupUuid}/projects/{projectUuid}')
+    @OperationId('updateProjectAccessForGroup')
+    async updateProjectAccessForGroup(
+        @Path() groupUuid: string,
+        @Path() projectUuid: string,
+        @Body()
+        projectGroupAccess: UpdateDBProjectGroupAccess,
+        @Request() req: express.Request,
+    ): Promise<ApiUpdateProjectGroupAccess> {
+        assertRegisteredAccount(req.account);
+        const results = await this.services
+            .getGroupService()
+            .updateProjectAccess(
+                toSessionUser(req.account),
+                { groupUuid, projectUuid },
+                projectGroupAccess,
+            );
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results,
+        };
+    }
+
+    /**
+     * Remove project access from a group
+     * @summary Remove project access from group
+     *
+     * @deprecated Use ProjectRoleAssignments instead
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+        getDeprecatedRouteMiddleware(new Date('2025-08-26'), {
+            suffixMessage: 'Use ProjectRoleAssignments instead.',
+        }),
+    ])
+    @Delete('{groupUuid}/projects/{projectUuid}')
+    @OperationId('removeProjectAccessFromGroup')
+    async removeProjectAccessFromGroup(
+        @Path() groupUuid: string,
+        @Path() projectUuid: string,
+        @Request() req: express.Request,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        const removed = await this.services
+            .getGroupService()
+            .removeProjectAccess(toSessionUser(req.account), {
+                groupUuid,
+                projectUuid,
+            });
+        this.setStatus(removed ? 200 : 204);
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+}

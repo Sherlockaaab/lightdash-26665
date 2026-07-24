@@ -1,0 +1,207 @@
+import { z } from 'zod';
+
+export const DEFAULT_OPENAI_MODEL_NAME = 'gpt-5.4';
+export const DEFAULT_ANTHROPIC_MODEL_NAME = 'claude-sonnet-4-6';
+export const DEFAULT_DEFAULT_AI_PROVIDER = 'openai';
+export const DEFAULT_OPENROUTER_MODEL_NAME = 'openai/gpt-5.2-2025-12-11';
+export const DEFAULT_BEDROCK_MODEL_NAME = 'claude-sonnet-4-5';
+
+export const DEFAULT_OPENAI_EMBEDDING_MODEL = 'text-embedding-3-small';
+export const DEFAULT_AZURE_EMBEDDING_MODEL = 'text-embedding-3-small';
+export const DEFAULT_BEDROCK_EMBEDDING_MODEL = 'cohere.embed-english-v3';
+
+/**
+ * Caps tool-result descriptions to keep AI agent context windows under control.
+ * Oversized tool outputs accumulate across the agent loop and can exceed the
+ * model's context limit.
+ */
+export const DEFAULT_AI_TOOL_DESCRIPTION_MAX_CHARS = 600;
+
+const customHeadersSchema = z.record(z.string()).default({});
+
+// Capability of the gateway/endpoint the provider points at, not a feature
+// toggle — some LLM gateways don't support streaming (SSE) completions.
+const supportsStreamingSchema = z.boolean().default(true);
+
+export const AI_PROVIDER_KEYS = [
+    'openai',
+    'azure',
+    'anthropic',
+    'openrouter',
+    'bedrock',
+] as const;
+
+export const aiCopilotConfigSchema = z
+    .object({
+        defaultProvider: z
+            .enum(AI_PROVIDER_KEYS)
+            .default(DEFAULT_DEFAULT_AI_PROVIDER),
+        // Providers whose instance-level API key belongs to the customer
+        // rather than Lightdash (e.g. a dedicated cloud deployment configured
+        // with the customer's own key). Only affects the `keyManagement`
+        // dimension on AI usage analytics; org BYO keys are tracked separately
+        // at config resolution.
+        selfManagedProviders: z.array(z.enum(AI_PROVIDER_KEYS)).default([]),
+        defaultEmbeddingModelProvider: z
+            .enum(['openai', 'bedrock', 'azure'])
+            .default(DEFAULT_DEFAULT_AI_PROVIDER),
+        providers: z.object({
+            openai: z
+                .object({
+                    apiKey: z.string(),
+                    modelName: z.string().default(DEFAULT_OPENAI_MODEL_NAME),
+                    embeddingModelName: z
+                        .string()
+                        .default(DEFAULT_OPENAI_EMBEDDING_MODEL),
+                    baseUrl: z.string().optional(),
+                    availableModels: z.array(z.string()).optional(),
+                    zeroDataRetention: z.boolean().default(false),
+                    customHeaders: customHeadersSchema,
+                    supportsStreaming: supportsStreamingSchema,
+                })
+                .optional(),
+            azure: z
+                .object({
+                    endpoint: z.string(),
+                    apiKey: z.string(),
+                    apiVersion: z.string(),
+                    deploymentName: z.string(),
+                    deploymentSupportsReasoning: z.boolean().default(false),
+                    embeddingDeploymentName: z
+                        .string()
+                        .default(DEFAULT_AZURE_EMBEDDING_MODEL),
+                    useDeploymentBasedUrls: z.boolean().default(true),
+                    customHeaders: customHeadersSchema,
+                    supportsStreaming: supportsStreamingSchema,
+                })
+                .optional(),
+            anthropic: z
+                .object({
+                    apiKey: z.string(),
+                    modelName: z.string().default(DEFAULT_ANTHROPIC_MODEL_NAME),
+                    availableModels: z.array(z.string()).optional(),
+                    customHeaders: customHeadersSchema,
+                    supportsStreaming: supportsStreamingSchema,
+                })
+                .optional(),
+            openrouter: z
+                .object({
+                    apiKey: z.string(),
+                    /** @ref https://openrouter.ai/docs/features/provider-routing#provider-sorting */
+                    sortOrder: z
+                        .enum(['price', 'throughput', 'latency'])
+                        .default('latency'),
+                    /** @ref https://openrouter.ai/models */
+                    allowedProviders: z
+                        .array(z.enum(['anthropic', 'openai', 'google']))
+                        .default(['openai']),
+                    modelName: z
+                        .string()
+                        .default(DEFAULT_OPENROUTER_MODEL_NAME),
+                    customHeaders: customHeadersSchema,
+                    supportsStreaming: supportsStreamingSchema,
+                })
+                .optional(),
+            bedrock: z
+                .union([
+                    z.object({
+                        apiKey: z.string(),
+                        region: z.string(),
+                        inferenceProfilePrefix: z.string().optional(),
+                        modelName: z
+                            .string()
+                            .default(DEFAULT_BEDROCK_MODEL_NAME),
+                        embeddingModelName: z
+                            .string()
+                            .default(DEFAULT_BEDROCK_EMBEDDING_MODEL),
+                        availableModels: z.array(z.string()).optional(),
+                        customHeaders: customHeadersSchema,
+                        supportsStreaming: supportsStreamingSchema,
+                    }),
+                    z.object({
+                        region: z.string(),
+                        accessKeyId: z.string(),
+                        secretAccessKey: z.string(),
+                        sessionToken: z.string().optional(),
+                        inferenceProfilePrefix: z.string().optional(),
+                        modelName: z
+                            .string()
+                            .default(DEFAULT_BEDROCK_MODEL_NAME),
+                        embeddingModelName: z
+                            .string()
+                            .default(DEFAULT_BEDROCK_EMBEDDING_MODEL),
+                        availableModels: z.array(z.string()).optional(),
+                        customHeaders: customHeadersSchema,
+                        supportsStreaming: supportsStreamingSchema,
+                    }),
+                    z.object({
+                        useDefaultCredentials: z.literal(true),
+                        region: z.string(),
+                        inferenceProfilePrefix: z.string().optional(),
+                        modelName: z
+                            .string()
+                            .default(DEFAULT_BEDROCK_MODEL_NAME),
+                        embeddingModelName: z
+                            .string()
+                            .default(DEFAULT_BEDROCK_EMBEDDING_MODEL),
+                        availableModels: z.array(z.string()).optional(),
+                        customHeaders: customHeadersSchema,
+                        supportsStreaming: supportsStreamingSchema,
+                    }),
+                ])
+                .optional(),
+        }),
+        enabled: z.boolean(),
+        requiresFeatureFlag: z.boolean(),
+        telemetryEnabled: z.boolean(),
+        debugLoggingEnabled: z.boolean(),
+        askAiButtonEnabled: z.boolean(),
+        embeddingEnabled: z.boolean(),
+        maxQueryLimit: z.number().positive(),
+        runSqlMaxLimit: z.number().positive(),
+        verifiedAnswerSimilarityThreshold: z
+            .number()
+            .min(0)
+            .max(1)
+            .default(0.6),
+        mcpConnectionTimeoutMs: z.number().positive().default(20_000),
+        mcpAllowPrivateAddresses: z.boolean().default(false),
+        toolDescriptionMaxChars: z
+            .number()
+            .int()
+            .positive()
+            .default(DEFAULT_AI_TOOL_DESCRIPTION_MAX_CHARS),
+    })
+    .refine(
+        ({ providers, defaultProvider, enabled }) =>
+            !(enabled && providers[defaultProvider] === undefined),
+        ({ defaultProvider }) => ({
+            message: `Configuration for the default provider "${defaultProvider}" must be present`,
+            params: {
+                defaultProvider,
+            },
+            path: ['providers'],
+        }),
+    )
+    .refine(
+        ({
+            providers,
+            defaultEmbeddingModelProvider,
+            enabled,
+            embeddingEnabled,
+        }) =>
+            !(
+                enabled &&
+                embeddingEnabled &&
+                providers[defaultEmbeddingModelProvider] === undefined
+            ),
+        ({ defaultEmbeddingModelProvider }) => ({
+            message: `Configuration for the default embedding provider "${defaultEmbeddingModelProvider}" must be present`,
+            params: {
+                defaultEmbeddingModelProvider,
+            },
+            path: ['providers'],
+        }),
+    );
+
+export type AiCopilotConfigSchemaType = z.infer<typeof aiCopilotConfigSchema>;

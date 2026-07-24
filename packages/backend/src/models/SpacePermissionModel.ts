@@ -1,0 +1,842 @@
+import {
+    DirectSpaceAccess,
+    DirectSpaceAccessOrigin,
+    getUserAvatarUrl,
+    InvalidSpaceStateError,
+    isUserAvatarColorValue,
+    NotFoundError,
+    OrganizationSpaceAccess,
+    ProjectSpaceAccess,
+    ProjectSpaceAccessOrigin,
+    SpaceAccessUserMetadata,
+    SpaceMemberRole,
+    type SpaceGroup,
+    type SpaceInheritanceChain,
+} from '@lightdash/common';
+import { Knex } from 'knex';
+import { EmailTableName } from '../database/entities/emails';
+import { GroupMembershipTableName } from '../database/entities/groupMemberships';
+import { GroupTableName } from '../database/entities/groups';
+import { OrganizationMembershipsTableName } from '../database/entities/organizationMemberships';
+import { OrganizationTableName } from '../database/entities/organizations';
+import { ProjectGroupAccessTableName } from '../database/entities/projectGroupAccess';
+import { ProjectMembershipsTableName } from '../database/entities/projectMemberships';
+import { ProjectTableName } from '../database/entities/projects';
+import { ScopedRolesTableName } from '../database/entities/roles';
+import {
+    SpaceGroupAccessTableName,
+    SpaceTableName,
+    SpaceUserAccessTableName,
+} from '../database/entities/spaces';
+import { UserAvatarsTableName } from '../database/entities/userAvatars';
+import { UserTableName } from '../database/entities/users';
+import { wrapSentryTransaction } from '../utils';
+
+export type RawSpaceUserAccess = {
+    userUuid: string;
+    email: string | null;
+    isInternal: boolean;
+    role: SpaceMemberRole;
+};
+
+export type RawSpaceGroupAccess = {
+    groupUuid: string;
+    name: string | null;
+    role: SpaceMemberRole;
+};
+
+export type RawSpaceDirectAccess = {
+    users: RawSpaceUserAccess[];
+    groups: RawSpaceGroupAccess[];
+};
+
+/**
+ * Custom-role assignments persist a placeholder `viewer` in `role` and the
+ * real role in `role_uuid`, so callers need the uuid to derive the
+ * effective role from the custom role's scopes.
+ */
+export type ProjectSpaceAccessWithCustomRole = ProjectSpaceAccess & {
+    roleUuid: string | null;
+};
+
+/**
+ * Org-level custom-role assignments persist a placeholder `member` in
+ * `organization_memberships.role`; the real role lives in `role_uuid`.
+ */
+export type OrganizationSpaceAccessWithCustomRole = OrganizationSpaceAccess & {
+    roleUuid: string | null;
+};
+
+export class SpacePermissionModel {
+    constructor(private readonly database: Knex) {}
+
+    /** Returns only rows persisted directly against each space. */
+    async getRawDirectAccess(
+        spaceUuids: string[],
+        { trx = this.database }: { trx?: Knex } = {},
+    ): Promise<Record<string, RawSpaceDirectAccess>> {
+        const result: Record<string, RawSpaceDirectAccess> = Object.fromEntries(
+            spaceUuids.map((spaceUuid) => [
+                spaceUuid,
+                { users: [], groups: [] },
+            ]),
+        );
+
+        if (spaceUuids.length === 0) return result;
+
+        const [users, groups] = await Promise.all([
+            trx(SpaceUserAccessTableName)
+                .innerJoin(
+                    SpaceTableName,
+                    `${SpaceTableName}.space_uuid`,
+                    `${SpaceUserAccessTableName}.space_uuid`,
+                )
+                .innerJoin(
+                    ProjectTableName,
+                    `${ProjectTableName}.project_id`,
+                    `${SpaceTableName}.project_id`,
+                )
+                .innerJoin(
+                    UserTableName,
+                    `${UserTableName}.user_uuid`,
+                    `${SpaceUserAccessTableName}.user_uuid`,
+                )
+                .leftJoin(
+                    OrganizationMembershipsTableName,
+                    function joinSourceOrganizationMembership() {
+                        this.on(
+                            `${OrganizationMembershipsTableName}.user_id`,
+                            `${UserTableName}.user_id`,
+                        ).andOn(
+                            `${OrganizationMembershipsTableName}.organization_id`,
+                            `${ProjectTableName}.organization_id`,
+                        );
+                    },
+                )
+                .leftJoin(EmailTableName, function joinPrimaryEmail() {
+                    this.on(
+                        `${EmailTableName}.user_id`,
+                        `${UserTableName}.user_id`,
+                    ).andOnVal(`${EmailTableName}.is_primary`, true);
+                })
+                .whereIn(`${SpaceUserAccessTableName}.space_uuid`, spaceUuids)
+                .select<
+                    Array<
+                        RawSpaceUserAccess & {
+                            spaceUuid: string;
+                            organizationMemberUserId: number | null;
+                        }
+                    >
+                >({
+                    spaceUuid: `${SpaceUserAccessTableName}.space_uuid`,
+                    userUuid: `${SpaceUserAccessTableName}.user_uuid`,
+                    email: `${EmailTableName}.email`,
+                    organizationMemberUserId: `${OrganizationMembershipsTableName}.user_id`,
+                    isInternal: `${UserTableName}.is_internal`,
+                    role: `${SpaceUserAccessTableName}.space_role`,
+                })
+                .orderBy(`${SpaceUserAccessTableName}.space_uuid`)
+                .orderBy(`${EmailTableName}.email`)
+                .orderBy(`${SpaceUserAccessTableName}.user_uuid`),
+            trx(SpaceGroupAccessTableName)
+                .innerJoin(
+                    SpaceTableName,
+                    `${SpaceTableName}.space_uuid`,
+                    `${SpaceGroupAccessTableName}.space_uuid`,
+                )
+                .innerJoin(
+                    ProjectTableName,
+                    `${ProjectTableName}.project_id`,
+                    `${SpaceTableName}.project_id`,
+                )
+                .leftJoin(
+                    GroupTableName,
+                    function joinSourceOrganizationGroup() {
+                        this.on(
+                            `${GroupTableName}.group_uuid`,
+                            `${SpaceGroupAccessTableName}.group_uuid`,
+                        ).andOn(
+                            `${GroupTableName}.organization_id`,
+                            `${ProjectTableName}.organization_id`,
+                        );
+                    },
+                )
+                .whereIn(`${SpaceGroupAccessTableName}.space_uuid`, spaceUuids)
+                .select<
+                    Array<
+                        RawSpaceGroupAccess & {
+                            spaceUuid: string;
+                        }
+                    >
+                >({
+                    spaceUuid: `${SpaceGroupAccessTableName}.space_uuid`,
+                    groupUuid: `${SpaceGroupAccessTableName}.group_uuid`,
+                    name: `${GroupTableName}.name`,
+                    role: `${SpaceGroupAccessTableName}.space_role`,
+                })
+                .orderBy(`${SpaceGroupAccessTableName}.space_uuid`)
+                .orderBy(`${GroupTableName}.name`)
+                .orderBy(`${SpaceGroupAccessTableName}.group_uuid`),
+        ]);
+
+        for (const { spaceUuid, organizationMemberUserId, ...user } of users) {
+            result[spaceUuid]?.users.push({
+                ...user,
+                email: organizationMemberUserId === null ? null : user.email,
+            });
+        }
+        for (const { spaceUuid, ...group } of groups) {
+            result[spaceUuid]?.groups.push(group);
+        }
+
+        return result;
+    }
+
+    /**
+     * Gets direct space access for a list of spaces
+     * @param spaceUuids - the uuids of the spaces to get direct access for
+     * @param filters - the filters to apply to the query
+     * @returns a record of space uuids to direct space access
+     */
+    async getDirectSpaceAccess(
+        spaceUuids: string[],
+        filters?: { userUuid?: string },
+        { trx = this.database }: { trx?: Knex } = {},
+    ): Promise<Record<string, DirectSpaceAccess[]>> {
+        return wrapSentryTransaction(
+            'SpaceModel.getDirectSpaceAccess',
+            { spaceUuidsCount: spaceUuids.length },
+            async () => {
+                const spacesDirectAccess: DirectSpaceAccess[] = await trx(
+                    SpaceUserAccessTableName,
+                )
+                    .select({
+                        userUuid: `${SpaceUserAccessTableName}.user_uuid`,
+                        spaceUuid: `${SpaceUserAccessTableName}.space_uuid`,
+                        groupUuid: trx.raw(`NULL`),
+                        role: `${SpaceUserAccessTableName}.space_role`,
+                        from: trx.raw(
+                            `'${DirectSpaceAccessOrigin.USER_ACCESS}'`,
+                        ),
+                    })
+                    .whereIn(
+                        `${SpaceUserAccessTableName}.space_uuid`,
+                        spaceUuids,
+                    )
+                    .modify((qb) => {
+                        if (filters?.userUuid) {
+                            void qb.where(
+                                `${SpaceUserAccessTableName}.user_uuid`,
+                                filters.userUuid,
+                            );
+                        }
+                    })
+                    .union(
+                        trx(SpaceGroupAccessTableName)
+                            .select({
+                                userUuid: `${UserTableName}.user_uuid`,
+                                spaceUuid: `${SpaceGroupAccessTableName}.space_uuid`,
+                                groupUuid: `${SpaceGroupAccessTableName}.group_uuid`,
+                                role: `${SpaceGroupAccessTableName}.space_role`,
+                                from: trx.raw(
+                                    `'${DirectSpaceAccessOrigin.GROUP_ACCESS}'`,
+                                ),
+                            })
+                            .innerJoin(
+                                GroupMembershipTableName,
+                                `${GroupMembershipTableName}.group_uuid`,
+                                `${SpaceGroupAccessTableName}.group_uuid`,
+                            )
+                            .innerJoin(
+                                UserTableName,
+                                `${GroupMembershipTableName}.user_id`,
+                                `${UserTableName}.user_id`,
+                            )
+                            .whereIn(
+                                `${SpaceGroupAccessTableName}.space_uuid`,
+                                spaceUuids,
+                            )
+                            .modify((qb) => {
+                                if (filters?.userUuid) {
+                                    void qb.where(
+                                        `${UserTableName}.user_uuid`,
+                                        filters.userUuid,
+                                    );
+                                }
+                            }),
+                    )
+                    .union(
+                        // "All project members" — explicit project members
+                        trx(SpaceTableName)
+                            .select({
+                                userUuid: `${UserTableName}.user_uuid`,
+                                spaceUuid: `${SpaceTableName}.space_uuid`,
+                                groupUuid: trx.raw(`NULL`),
+                                role: `${SpaceTableName}.project_member_access_role`,
+                                from: trx.raw(
+                                    `'${DirectSpaceAccessOrigin.GROUP_ACCESS}'`,
+                                ),
+                            })
+                            .innerJoin(
+                                ProjectMembershipsTableName,
+                                `${ProjectMembershipsTableName}.project_id`,
+                                `${SpaceTableName}.project_id`,
+                            )
+                            .innerJoin(
+                                UserTableName,
+                                `${ProjectMembershipsTableName}.user_id`,
+                                `${UserTableName}.user_id`,
+                            )
+                            .whereIn(`${SpaceTableName}.space_uuid`, spaceUuids)
+                            .whereNotNull(
+                                `${SpaceTableName}.project_member_access_role`,
+                            )
+                            .whereNull(`${SpaceTableName}.deleted_at`)
+                            .modify((qb) => {
+                                if (filters?.userUuid) {
+                                    void qb.where(
+                                        `${UserTableName}.user_uuid`,
+                                        filters.userUuid,
+                                    );
+                                }
+                            }),
+                    )
+                    .union(
+                        // "All project members" — org members with project access
+                        // (org role above 'member' implies project access)
+                        trx(SpaceTableName)
+                            .select({
+                                userUuid: `${UserTableName}.user_uuid`,
+                                spaceUuid: `${SpaceTableName}.space_uuid`,
+                                groupUuid: trx.raw(`NULL`),
+                                role: `${SpaceTableName}.project_member_access_role`,
+                                from: trx.raw(
+                                    `'${DirectSpaceAccessOrigin.GROUP_ACCESS}'`,
+                                ),
+                            })
+                            .innerJoin(
+                                ProjectTableName,
+                                `${ProjectTableName}.project_id`,
+                                `${SpaceTableName}.project_id`,
+                            )
+                            .innerJoin(
+                                OrganizationMembershipsTableName,
+                                `${OrganizationMembershipsTableName}.organization_id`,
+                                `${ProjectTableName}.organization_id`,
+                            )
+                            .innerJoin(
+                                UserTableName,
+                                `${UserTableName}.user_id`,
+                                `${OrganizationMembershipsTableName}.user_id`,
+                            )
+                            .whereIn(`${SpaceTableName}.space_uuid`, spaceUuids)
+                            .whereNotNull(
+                                `${SpaceTableName}.project_member_access_role`,
+                            )
+                            .whereNull(`${SpaceTableName}.deleted_at`)
+                            .where(
+                                `${OrganizationMembershipsTableName}.role`,
+                                '!=',
+                                'member',
+                            )
+                            .modify((qb) => {
+                                if (filters?.userUuid) {
+                                    void qb.where(
+                                        `${UserTableName}.user_uuid`,
+                                        filters.userUuid,
+                                    );
+                                }
+                            }),
+                    );
+
+                return spacesDirectAccess.reduce<
+                    Record<string, DirectSpaceAccess[]>
+                >((acc, spaceDirectAccess) => {
+                    if (!acc[spaceDirectAccess.spaceUuid]) {
+                        acc[spaceDirectAccess.spaceUuid] = [];
+                    }
+
+                    acc[spaceDirectAccess.spaceUuid].push(spaceDirectAccess);
+                    return acc;
+                }, {});
+            },
+        );
+    }
+
+    /**
+     * Gets space access for a list of spaces based on the project
+     * @param spaceUuids - the uuids of the spaces to get access for
+     * @param filters - the filters to apply to the query
+     * @returns a record of space uuids to space access
+     */
+    async getProjectSpaceAccess(
+        spaceUuids: string[],
+        filters?: { userUuid?: string },
+        { trx = this.database }: { trx?: Knex } = {},
+    ): Promise<Record<string, ProjectSpaceAccessWithCustomRole[]>> {
+        return wrapSentryTransaction(
+            'SpaceModel.getProjectSpaceAccess',
+            { spaceUuidsCount: spaceUuids.length },
+            async () => {
+                const projectSpacesAccess: ProjectSpaceAccessWithCustomRole[] =
+                    await trx(SpaceTableName)
+                        .select({
+                            userUuid: `${UserTableName}.user_uuid`,
+                            spaceUuid: `${SpaceTableName}.space_uuid`,
+                            role: `${ProjectMembershipsTableName}.role`,
+                            roleUuid: `${ProjectMembershipsTableName}.role_uuid`,
+                            from: trx.raw(
+                                `'${ProjectSpaceAccessOrigin.PROJECT_MEMBERSHIP}'`,
+                            ),
+                        })
+                        .innerJoin(
+                            ProjectTableName,
+                            `${ProjectTableName}.project_id`,
+                            `${SpaceTableName}.project_id`,
+                        )
+                        .innerJoin(
+                            ProjectMembershipsTableName,
+                            `${ProjectMembershipsTableName}.project_id`,
+                            `${ProjectTableName}.project_id`,
+                        )
+                        .innerJoin(
+                            UserTableName,
+                            `${UserTableName}.user_id`,
+                            `${ProjectMembershipsTableName}.user_id`,
+                        )
+                        .whereIn(`${SpaceTableName}.space_uuid`, spaceUuids)
+                        .modify((qb) => {
+                            if (filters?.userUuid) {
+                                void qb.where(
+                                    `${UserTableName}.user_uuid`,
+                                    filters.userUuid,
+                                );
+                            }
+                        })
+                        .union(
+                            trx(SpaceTableName)
+                                .select({
+                                    userUuid: `${UserTableName}.user_uuid`,
+                                    spaceUuid: `${SpaceTableName}.space_uuid`,
+                                    role: `${ProjectGroupAccessTableName}.role`,
+                                    roleUuid: `${ProjectGroupAccessTableName}.role_uuid`,
+                                    from: trx.raw(
+                                        `'${ProjectSpaceAccessOrigin.GROUP_MEMBERSHIP}'`,
+                                    ),
+                                })
+                                .innerJoin(
+                                    ProjectTableName,
+                                    `${ProjectTableName}.project_id`,
+                                    `${SpaceTableName}.project_id`,
+                                )
+                                .innerJoin(
+                                    ProjectGroupAccessTableName,
+                                    `${ProjectGroupAccessTableName}.project_uuid`,
+                                    `${ProjectTableName}.project_uuid`,
+                                )
+                                .innerJoin(
+                                    GroupMembershipTableName,
+                                    `${GroupMembershipTableName}.group_uuid`,
+                                    `${ProjectGroupAccessTableName}.group_uuid`,
+                                )
+                                .innerJoin(
+                                    UserTableName,
+                                    `${UserTableName}.user_id`,
+                                    `${GroupMembershipTableName}.user_id`,
+                                )
+                                .whereIn(
+                                    `${SpaceTableName}.space_uuid`,
+                                    spaceUuids,
+                                )
+                                .modify((qb) => {
+                                    if (filters?.userUuid) {
+                                        void qb.where(
+                                            `${UserTableName}.user_uuid`,
+                                            filters.userUuid,
+                                        );
+                                    }
+                                }),
+                        );
+
+                return projectSpacesAccess.reduce<
+                    Record<string, ProjectSpaceAccessWithCustomRole[]>
+                >((acc, projectSpaceAccess) => {
+                    if (!acc[projectSpaceAccess.spaceUuid]) {
+                        acc[projectSpaceAccess.spaceUuid] = [];
+                    }
+
+                    acc[projectSpaceAccess.spaceUuid].push(projectSpaceAccess);
+                    return acc;
+                }, {});
+            },
+        );
+    }
+
+    /**
+     * Gets the scope names for a list of custom roles
+     * @param roleUuids - the uuids of the roles to get scopes for
+     * @returns a record of role uuids to scope names
+     */
+    async getRoleScopes(
+        roleUuids: string[],
+        { trx = this.database }: { trx?: Knex } = {},
+    ): Promise<Record<string, string[]>> {
+        if (roleUuids.length === 0) return {};
+
+        const rows = await trx(ScopedRolesTableName)
+            .whereIn('role_uuid', roleUuids)
+            .select<{ roleUuid: string; scopeName: string }[]>({
+                roleUuid: 'role_uuid',
+                scopeName: 'scope_name',
+            });
+
+        return rows.reduce<Record<string, string[]>>(
+            (acc, { roleUuid, scopeName }) => {
+                if (!acc[roleUuid]) {
+                    acc[roleUuid] = [];
+                }
+                acc[roleUuid].push(scopeName);
+                return acc;
+            },
+            {},
+        );
+    }
+
+    /**
+     * Gets space access for a list of spaces based on the organization
+     * @param spaceUuids - the uuids of the spaces to get access for
+     * @param filters - the filters to apply to the query
+     * @returns a record of space uuids to space access
+     */
+    async getOrganizationSpaceAccess(
+        spaceUuids: string[],
+        filters?: { userUuid?: string },
+        { trx = this.database }: { trx?: Knex } = {},
+    ): Promise<Record<string, OrganizationSpaceAccessWithCustomRole[]>> {
+        return wrapSentryTransaction(
+            'SpaceModel.getOrganizationSpaceAccess',
+            { spaceUuidsCount: spaceUuids.length },
+            async () => {
+                const organizationSpacesAccess: OrganizationSpaceAccessWithCustomRole[] =
+                    await trx(SpaceTableName)
+                        .select({
+                            userUuid: `${UserTableName}.user_uuid`,
+                            spaceUuid: `${SpaceTableName}.space_uuid`,
+                            role: `${OrganizationMembershipsTableName}.role`,
+                            roleUuid: `${OrganizationMembershipsTableName}.role_uuid`,
+                        })
+                        .innerJoin(
+                            ProjectTableName,
+                            `${ProjectTableName}.project_id`,
+                            `${SpaceTableName}.project_id`,
+                        )
+                        .innerJoin(
+                            OrganizationTableName,
+                            `${OrganizationTableName}.organization_id`,
+                            `${ProjectTableName}.organization_id`,
+                        )
+                        .innerJoin(
+                            OrganizationMembershipsTableName,
+                            `${OrganizationMembershipsTableName}.organization_id`,
+                            `${OrganizationTableName}.organization_id`,
+                        )
+                        .innerJoin(
+                            UserTableName,
+                            `${UserTableName}.user_id`,
+                            `${OrganizationMembershipsTableName}.user_id`,
+                        )
+                        .whereIn(`${SpaceTableName}.space_uuid`, spaceUuids)
+                        .modify((qb) => {
+                            if (filters?.userUuid) {
+                                void qb.where(
+                                    `${UserTableName}.user_uuid`,
+                                    filters.userUuid,
+                                );
+                            }
+                        });
+
+                return organizationSpacesAccess.reduce<
+                    Record<string, OrganizationSpaceAccessWithCustomRole[]>
+                >((acc, organizationSpaceAccess) => {
+                    if (!acc[organizationSpaceAccess.spaceUuid]) {
+                        acc[organizationSpaceAccess.spaceUuid] = [];
+                    }
+
+                    acc[organizationSpaceAccess.spaceUuid].push(
+                        organizationSpaceAccess,
+                    );
+                    return acc;
+                }, {});
+            },
+        );
+    }
+
+    async getSpaceInfo(
+        spaceUuids: string[],
+        { trx = this.database }: { trx?: Knex } = {},
+    ): Promise<
+        Record<
+            string,
+            {
+                inheritParentPermissions: boolean;
+                projectUuid: string;
+                organizationUuid: string;
+            }
+        >
+    > {
+        return wrapSentryTransaction(
+            'SpaceModel.getSpaceInfo',
+            { spaceUuidsCount: spaceUuids.length },
+            async () => {
+                if (spaceUuids.length === 0) {
+                    return {};
+                }
+
+                const rows = await trx(SpaceTableName)
+                    .select({
+                        spaceUuid: `${SpaceTableName}.space_uuid`,
+                        inheritParentPermissions: `${SpaceTableName}.inherit_parent_permissions`,
+                        projectUuid: `${ProjectTableName}.project_uuid`,
+                        organizationUuid: `${OrganizationTableName}.organization_uuid`,
+                    })
+                    .innerJoin(
+                        ProjectTableName,
+                        `${ProjectTableName}.project_id`,
+                        `${SpaceTableName}.project_id`,
+                    )
+                    .innerJoin(
+                        OrganizationTableName,
+                        `${OrganizationTableName}.organization_id`,
+                        `${ProjectTableName}.organization_id`,
+                    )
+                    .whereIn(`${SpaceTableName}.space_uuid`, spaceUuids);
+
+                return rows.reduce<
+                    Record<
+                        string,
+                        {
+                            inheritParentPermissions: boolean;
+                            projectUuid: string;
+                            organizationUuid: string;
+                        }
+                    >
+                >((acc, row) => {
+                    acc[row.spaceUuid] = {
+                        inheritParentPermissions: row.inheritParentPermissions,
+                        projectUuid: row.projectUuid,
+                        organizationUuid: row.organizationUuid,
+                    };
+                    return acc;
+                }, {});
+            },
+        );
+    }
+
+    async getUserMetadataByUuids(
+        userUuids: string[],
+    ): Promise<Record<string, SpaceAccessUserMetadata>> {
+        return wrapSentryTransaction(
+            'SpacePermissionModel.getUserMetadataByUuids',
+            { userUuidsCount: userUuids.length },
+            async () => {
+                if (userUuids.length === 0) return {};
+
+                const rows = await this.database(UserTableName)
+                    .leftJoin(EmailTableName, function joinPrimaryEmail() {
+                        this.on(
+                            `${UserTableName}.user_id`,
+                            '=',
+                            `${EmailTableName}.user_id`,
+                        ).andOnVal(`${EmailTableName}.is_primary`, true);
+                    })
+                    .leftJoin(
+                        UserAvatarsTableName,
+                        `${UserTableName}.user_uuid`,
+                        `${UserAvatarsTableName}.user_uuid`,
+                    )
+                    .whereIn(`${UserTableName}.user_uuid`, userUuids)
+                    .select<
+                        {
+                            userUuid: string;
+                            firstName: string;
+                            lastName: string;
+                            email: string | null;
+                            isInternal: boolean;
+                            avatarGradient: string | null;
+                            avatarContentHash: string | null;
+                        }[]
+                    >({
+                        userUuid: `${UserTableName}.user_uuid`,
+                        firstName: `${UserTableName}.first_name`,
+                        lastName: `${UserTableName}.last_name`,
+                        email: `${EmailTableName}.email`,
+                        isInternal: `${UserTableName}.is_internal`,
+                        avatarGradient: `${UserTableName}.avatar_gradient`,
+                        avatarContentHash: `${UserAvatarsTableName}.content_hash`,
+                    });
+
+                return Object.fromEntries(
+                    rows.map((r) => [
+                        r.userUuid,
+                        {
+                            firstName: r.firstName,
+                            lastName: r.lastName,
+                            email: r.email ?? '',
+                            isInternal: r.isInternal,
+                            avatarUrl: r.avatarContentHash
+                                ? getUserAvatarUrl(
+                                      r.userUuid,
+                                      r.avatarContentHash,
+                                  )
+                                : null,
+                            avatarGradient:
+                                r.avatarGradient &&
+                                isUserAvatarColorValue(r.avatarGradient)
+                                    ? r.avatarGradient
+                                    : null,
+                        },
+                    ]),
+                );
+            },
+        );
+    }
+
+    /**
+     * Gets the group access for a space.
+     * @param spaceUuid - The UUID of the space to get group access for
+     * @returns The group access entries for the space (or its root space)
+     */
+    async getGroupAccess(spaceUuid: string): Promise<SpaceGroup[]> {
+        return wrapSentryTransaction(
+            'SpacePermissionModel.getGroupAccess',
+            {},
+            async () => {
+                const access = await this.database
+                    .table(SpaceGroupAccessTableName)
+                    .select({
+                        groupUuid: `${SpaceGroupAccessTableName}.group_uuid`,
+                        spaceRole: `${SpaceGroupAccessTableName}.space_role`,
+                        groupName: `${GroupTableName}.name`,
+                    })
+                    .leftJoin(
+                        `${GroupTableName}`,
+                        `${GroupTableName}.group_uuid`,
+                        `${SpaceGroupAccessTableName}.group_uuid`,
+                    )
+                    .where('space_uuid', spaceUuid);
+                return access;
+            },
+        );
+    }
+
+    /**
+     * Gets the inheritance chain for an array of spaces, walking up from the space
+     * to the first ancestor with inherit_parent_permissions=false (or root).
+     *
+     * The chain is ordered leaf-to-root.
+     *
+     * @param spaceUuids - The UUIDs of the spaces to get chains for
+     * @returns A record of space UUIDs to their inheritance chains
+     */
+    async getInheritanceChains(
+        spaceUuids: string[],
+        { trx = this.database }: { trx?: Knex } = {},
+    ): Promise<Record<string, SpaceInheritanceChain>> {
+        return wrapSentryTransaction(
+            'SpacePermissionModel.getInheritanceChains',
+            { spaceUuidsCount: spaceUuids.length },
+            async () => {
+                if (spaceUuids.length === 0) return {};
+
+                // NOTE: use a CTE instead of ltree path @> joins to walk the space
+                // hierarchy via parent_space_uuid FK. We have duplicate paths in the
+                // database due to legacy spaces and content as code and an ltree path
+                // @> join matches unrelated spaces due to those duplicates,
+                // breaking the inheritance chain and hiding users from "Who has access".
+                const ancestorRows: {
+                    requested_space_uuid: string;
+                    space_uuid: string;
+                    name: string;
+                    inherit_parent_permissions: boolean;
+                    parent_space_uuid: string | null;
+                }[] = await trx
+                    .raw(
+                        `
+                    WITH RECURSIVE chain AS (
+                        SELECT space_uuid AS requested_space_uuid,
+                               space_uuid, name, inherit_parent_permissions, parent_space_uuid,
+                               1 AS depth
+                        FROM ${SpaceTableName}
+                        WHERE space_uuid = ANY(?)
+                          AND deleted_at IS NULL
+
+                        UNION ALL
+
+                        SELECT c.requested_space_uuid,
+                               s.space_uuid, s.name, s.inherit_parent_permissions, s.parent_space_uuid,
+                               c.depth + 1
+                        FROM ${SpaceTableName} s
+                        JOIN chain c ON s.space_uuid = c.parent_space_uuid
+                        WHERE s.deleted_at IS NULL
+                    )
+                    SELECT requested_space_uuid, space_uuid, name, inherit_parent_permissions, parent_space_uuid
+                    FROM chain
+                    ORDER BY requested_space_uuid, depth ASC
+                    `,
+                        [spaceUuids],
+                    )
+                    .then((res: { rows: typeof ancestorRows }) => res.rows);
+
+                // Group ancestor rows by requested space (order is preserved)
+                const ancestorsBySpace = new Map<string, typeof ancestorRows>();
+                for (const row of ancestorRows) {
+                    let list = ancestorsBySpace.get(row.requested_space_uuid);
+                    if (!list) {
+                        list = [];
+                        ancestorsBySpace.set(row.requested_space_uuid, list);
+                    }
+                    list.push(row);
+                }
+
+                const result: Record<string, SpaceInheritanceChain> = {};
+                for (const requestedUuid of spaceUuids) {
+                    const myAncestors =
+                        ancestorsBySpace.get(requestedUuid) ?? [];
+                    if (myAncestors.length === 0) {
+                        // Space not found in DB — skip silently (caller
+                        // will notice the missing key in the result map).
+                        // eslint-disable-next-line no-continue
+                        continue;
+                    }
+
+                    // Walk from leaf toward root, collecting chain items
+                    const chain: SpaceInheritanceChain['chain'] = [];
+                    let lastAncestor: (typeof myAncestors)[number] | undefined;
+
+                    for (const ancestor of myAncestors) {
+                        chain.push({
+                            spaceUuid: ancestor.space_uuid,
+                            spaceName: ancestor.name,
+                            inheritParentPermissions:
+                                ancestor.inherit_parent_permissions,
+                        });
+                        lastAncestor = ancestor;
+
+                        if (!ancestor.inherit_parent_permissions) {
+                            break;
+                        }
+                    }
+
+                    const inheritsFromOrgOrProject =
+                        lastAncestor !== undefined &&
+                        lastAncestor.parent_space_uuid === null &&
+                        lastAncestor.inherit_parent_permissions === true;
+
+                    result[requestedUuid] = { chain, inheritsFromOrgOrProject };
+                }
+
+                return result;
+            },
+        );
+    }
+}

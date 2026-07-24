@@ -1,0 +1,696 @@
+import {
+    AiAgentReasoningTable,
+    AiAgentReasoningTableName,
+} from '../database/entities/aiAgentReasoning';
+import {
+    AnalyticsAppViews,
+    AnalyticsAppViewsTableName,
+    AnalyticsChartViews,
+    AnalyticsChartViewsTableName,
+    AnalyticsDashboardViews,
+    AnalyticsDashboardViewsTableName,
+} from '../database/entities/analytics';
+import {
+    AppsTable,
+    AppsTableName,
+    AppVersionsTable,
+    AppVersionsTableName,
+} from '../database/entities/apps';
+import {
+    CatalogTable,
+    CatalogTableName,
+    CatalogTagsTable,
+    CatalogTagsTableName,
+    MetricsTreeEdgesTableName,
+    MetricsTreeLocksTableName,
+    MetricsTreeNodesTableName,
+    MetricsTreesTableName,
+    type MetricsTreeEdgesTable,
+    type MetricsTreeLocksTable,
+    type MetricsTreeNodesTable,
+    type MetricsTreesTable,
+} from '../database/entities/catalog';
+import {
+    DashboardTileCommentsTable,
+    DashboardTileCommentsTableName,
+} from '../database/entities/comments';
+import {
+    ContentVerificationTable,
+    ContentVerificationTableName,
+} from '../database/entities/contentVerification';
+import {
+    DashboardsTableName,
+    DashboardTable,
+    DashboardTabsTable,
+    DashboardTabsTableName,
+    DashboardTileChartTable,
+    DashboardTileChartTableName,
+    DashboardTileDataAppsTable,
+    DashboardTileDataAppsTableName,
+    DashboardTileHeadingsTable,
+    DashboardTileHeadingsTableName,
+    DashboardTileLoomsTable,
+    DashboardTileLoomsTableName,
+    DashboardTileMarkdownsTable,
+    DashboardTileMarkdownsTableName,
+    DashboardTilesTableName,
+    DashboardTileTable,
+    DashboardTileTypesTableName,
+    DashboardVersionsTableName,
+    DashboardVersionTable,
+    DashboardViewsTableName,
+    DashboardViewTable,
+} from '../database/entities/dashboards';
+import {
+    DownloadAuditTable,
+    DownloadAuditTableName,
+} from '../database/entities/downloadAudit';
+import {
+    DownloadFileTable,
+    DownloadFileTableName,
+} from '../database/entities/downloadFile';
+import {
+    EmailOneTimePasscodesTableName,
+    EmailOneTimePasscodeTable,
+} from '../database/entities/emailOneTimePasscodes';
+import { EmailTable, EmailTableName } from '../database/entities/emails';
+import {
+    FeatureFlagOverridesTable,
+    FeatureFlagOverridesTableName,
+    FeatureFlagsTable,
+    FeatureFlagsTableName,
+} from '../database/entities/featureFlags';
+import {
+    GithubAppInstallationTable,
+    GithubAppInstallationTableName,
+} from '../database/entities/githubAppInstallation';
+import {
+    GitlabAppInstallationTable,
+    GitlabAppInstallationTableName,
+} from '../database/entities/gitlabAppInstallation';
+import {
+    GitUserCredentialsTable,
+    GitUserCredentialsTableName,
+} from '../database/entities/gitUserCredentials';
+import {
+    GroupMembershipTable,
+    GroupMembershipTableName,
+} from '../database/entities/groupMemberships';
+import { GroupTable, GroupTableName } from '../database/entities/groups';
+import {
+    InviteLinkTable,
+    InviteLinkTableName,
+} from '../database/entities/inviteLinks';
+import {
+    JobsTable,
+    JobsTableName,
+    JobStepsTable,
+    JobStepsTableName,
+} from '../database/entities/jobs';
+import {
+    NotificationsTable,
+    NotificationsTableName,
+} from '../database/entities/notifications';
+import {
+    OnboardingTable,
+    OnboardingTableName,
+} from '../database/entities/onboarding';
+import {
+    OpenIdIdentitiesTable,
+    OpenIdIdentitiesTableName,
+} from '../database/entities/openIdIdentities';
+import {
+    OrganizationColorPaletteTable,
+    OrganizationColorPaletteTableName,
+} from '../database/entities/organizationColorPalettes';
+import {
+    OrganizationDesignFilesTable,
+    OrganizationDesignFilesTableName,
+} from '../database/entities/organizationDesignFiles';
+import {
+    OrganizationDesignsTable,
+    OrganizationDesignsTableName,
+} from '../database/entities/organizationDesigns';
+import {
+    OrganizationDomainVerificationsTable,
+    OrganizationDomainVerificationsTableName,
+} from '../database/entities/organizationDomainVerifications';
+import {
+    OrganizationEmailDomainsTable,
+    OrganizationEmailDomainsTableName,
+} from '../database/entities/organizationEmailDomains';
+import {
+    OrganizationMembershipsTable,
+    OrganizationMembershipsTableName,
+} from '../database/entities/organizationMemberships';
+import {
+    OrganizationTable,
+    OrganizationTableName,
+} from '../database/entities/organizations';
+import {
+    OrganizationAllowedEmailDomainProjectsTable,
+    OrganizationAllowedEmailDomainProjectsTableName,
+    OrganizationAllowedEmailDomainsTable,
+    OrganizationAllowedEmailDomainsTableName,
+} from '../database/entities/organizationsAllowedEmailDomains';
+import {
+    OrganizationSettingsTable,
+    OrganizationSettingsTableName,
+} from '../database/entities/organizationSettings';
+import {
+    OrganizationSsoConfigurationsTable,
+    OrganizationSsoConfigurationsTableName,
+} from '../database/entities/organizationSsoConfigurations';
+import {
+    OrganizationWarehouseCredentialsTable,
+    OrganizationWarehouseCredentialsTableName,
+} from '../database/entities/organizationWarehouseCredentials';
+import {
+    PasswordLoginTable,
+    PasswordLoginTableName,
+} from '../database/entities/passwordLogins';
+import {
+    PasswordResetTable,
+    PasswordResetTableName,
+} from '../database/entities/passwordResetLinks';
+import {
+    PersistentDownloadFileTable,
+    PersistentDownloadFileTableName,
+} from '../database/entities/persistentDownloadFile';
+import {
+    PersonalAccessTokenTable,
+    PersonalAccessTokenTableName,
+} from '../database/entities/personalAccessTokens';
+import {
+    PinnedAppTable,
+    PinnedAppTableName,
+    PinnedChartTable,
+    PinnedChartTableName,
+    PinnedDashboardTable,
+    PinnedDashboardTableName,
+    PinnedListTable,
+    PinnedListTableName,
+    PinnedSpaceTable,
+    PinnedSpaceTableName,
+} from '../database/entities/pinnedList';
+import {
+    ProjectDbtSourcesTable,
+    ProjectDbtSourcesTableName,
+} from '../database/entities/projectDbtSources';
+import {
+    ProjectGroupAccessTable,
+    ProjectGroupAccessTableName,
+} from '../database/entities/projectGroupAccess';
+import {
+    ProjectMembershipsTable,
+    ProjectMembershipsTableName,
+} from '../database/entities/projectMemberships';
+import {
+    ProjectParametersTable,
+    ProjectParametersTableName,
+} from '../database/entities/projectParameters';
+import {
+    CachedExploresTable,
+    CachedExploresTableName,
+    CachedExploreTable,
+    CachedExploreTableName,
+    CachedWarehouseTable,
+    CachedWarehouseTableName,
+    ProjectTable,
+    ProjectTableName,
+} from '../database/entities/projects';
+import {
+    PullRequestsTable,
+    PullRequestsTableName,
+} from '../database/entities/pullRequests';
+import {
+    QueryHistoryTable,
+    QueryHistoryTableName,
+} from '../database/entities/queryHistory';
+import {
+    RolesTableName,
+    RoleTable,
+    ScopedRolesTableName,
+    ScopedRoleTable,
+} from '../database/entities/roles';
+import {
+    SavedChartAdditionalMetricTable,
+    SavedChartAdditionalMetricTableName,
+    SavedChartCustomDimensionsTable,
+    SavedChartCustomDimensionsTableName,
+    SavedChartCustomSqlDimensionsTable,
+    SavedChartCustomSqlDimensionsTableName,
+    SavedChartsTableName,
+    SavedChartTable,
+    SavedChartTableCalculationTable,
+    SavedChartTableCalculationTableName,
+    SavedChartVersionFieldsTable,
+    SavedChartVersionFieldsTableName,
+    SavedChartVersionSortsTable,
+    SavedChartVersionSortsTableName,
+    SavedChartVersionsTable,
+    SavedChartVersionsTableName,
+} from '../database/entities/savedCharts';
+import {
+    SavedSqlTable,
+    SavedSqlTableName,
+    SavedSqlVersionsTable,
+    SavedSqlVersionsTableName,
+} from '../database/entities/savedSql';
+import {
+    SchedulerEmailTargetTable,
+    SchedulerEmailTargetTableName,
+    SchedulerGoogleChatTargetTable,
+    SchedulerGoogleChatTargetTableName,
+    SchedulerLogTable,
+    SchedulerLogTableName,
+    SchedulerMsTeamsTargetTable,
+    SchedulerMsTeamsTargetTableName,
+    SchedulerSlackTargetTable,
+    SchedulerSlackTargetTableName,
+    SchedulerTable,
+    SchedulerTableName,
+} from '../database/entities/scheduler';
+import { SessionTable, SessionTableName } from '../database/entities/sessions';
+import { ShareTable, ShareTableName } from '../database/entities/share';
+import {
+    SlackAuthTokensTable,
+    SlackAuthTokensTableName,
+} from '../database/entities/slackAuthentication';
+import {
+    SlackChannelsTable,
+    SlackChannelsTableName,
+} from '../database/entities/slackChannels';
+import {
+    SpaceTable,
+    SpaceTableName,
+    SpaceUserAccessTable,
+    SpaceUserAccessTableName,
+} from '../database/entities/spaces';
+import {
+    SpotlightTableConfigTable,
+    SpotlightTableConfigTableName,
+} from '../database/entities/spotlightTableConfig';
+import {
+    SshKeyPairTable,
+    SshKeyPairTableName,
+} from '../database/entities/sshKeyPairs';
+import { TagsTable, TagsTableName } from '../database/entities/tags';
+import {
+    GroupUserAttributesTable,
+    GroupUserAttributeTable,
+    OrganizationMemberUserAttributesTable,
+    OrganizationMemberUserAttributeTable,
+    UserAttributesTable,
+    UserAttributeTable,
+} from '../database/entities/userAttributes';
+import {
+    UserAvatarsTable,
+    UserAvatarsTableName,
+} from '../database/entities/userAvatars';
+import {
+    UserFavoritesTable,
+    UserFavoritesTableName,
+} from '../database/entities/userFavorites';
+import {
+    UserOAuthGrantsTable,
+    UserOAuthGrantsTableName,
+} from '../database/entities/userOAuthGrants';
+import { UserTable, UserTableName } from '../database/entities/users';
+import {
+    ProjectUserWarehouseCredentialPreferenceTable,
+    ProjectUserWarehouseCredentialPreferenceTableName,
+    UserWarehouseCredentialsTable,
+    UserWarehouseCredentialsTableName,
+} from '../database/entities/userWarehouseCredentials';
+import {
+    ValidationTable,
+    ValidationTableName,
+} from '../database/entities/validation';
+import {
+    WarehouseAvailableTablesTable,
+    WarehouseAvailableTablesTableName,
+} from '../database/entities/warehouseAvailableTables';
+import {
+    WarehouseConnectCodeTable,
+    WarehouseConnectCodeTableName,
+} from '../database/entities/warehouseConnectCode';
+import {
+    WarehouseCredentialTable,
+    WarehouseCredentialTableName,
+} from '../database/entities/warehouseCredentials';
+import {
+    AgentOnboardingRunsTable,
+    AgentOnboardingRunsTableName,
+} from '../ee/database/entities/agentOnboarding';
+import {
+    AiAgentToolCallErrorTable,
+    AiAgentToolCallErrorTableName,
+    AiAgentToolCallTable,
+    AiAgentToolCallTableName,
+    AiAgentToolResultTable,
+    AiAgentToolResultTableName,
+    AiPromptContextTable,
+    AiPromptContextTableName,
+    AiPromptInterruptTable,
+    AiPromptInterruptTableName,
+    AiPromptSteerTable,
+    AiPromptSteerTableName,
+    AiPromptTable,
+    AiPromptTableName,
+    AiSlackPromptTable,
+    AiSlackPromptTableName,
+    AiSlackThreadTable,
+    AiSlackThreadTableName,
+    AiSqlApprovalTable,
+    AiSqlApprovalTableName,
+    AiThreadCompactionTable,
+    AiThreadCompactionTableName,
+    AiThreadShareTable,
+    AiThreadShareTableName,
+    AiThreadTable,
+    AiThreadTableName,
+    AiWebAppPromptTable,
+    AiWebAppPromptTableName,
+    AiWebAppThreadTable,
+    AiWebAppThreadTableName,
+    AiWritebackThreadTable,
+    AiWritebackThreadTableName,
+} from '../ee/database/entities/ai';
+import {
+    AiAgentGroupAccessTable,
+    AiAgentGroupAccessTableName,
+    AiAgentInstructionVersionsTable,
+    AiAgentInstructionVersionsTableName,
+    AiAgentIntegrationTable,
+    AiAgentIntegrationTableName,
+    AiAgentMcpServerTable,
+    AiAgentMcpServerTableName,
+    AiAgentSlackIntegrationTable,
+    AiAgentSlackIntegrationTableName,
+    AiAgentTable,
+    AiAgentTableName,
+    AiMcpServerCredentialTable,
+    AiMcpServerCredentialTableName,
+    AiMcpServerTable,
+    AiMcpServerTableName,
+} from '../ee/database/entities/aiAgent';
+import {
+    AiAgentDocumentAccessTable,
+    AiAgentDocumentAccessTableName,
+    AiAgentDocumentTable,
+    AiAgentDocumentTableName,
+} from '../ee/database/entities/aiAgentDocument';
+import {
+    AiAgentReviewClassifierRunTable,
+    AiAgentReviewClassifierRunTableName,
+    AiAgentReviewItemTable,
+    AiAgentReviewItemTableName,
+    AiAgentReviewRemediationEventsTable,
+    AiAgentReviewRemediationEventsTableName,
+    AiAgentReviewRemediationTable,
+    AiAgentReviewRemediationTableName,
+    AiAgentTurnSignalTable,
+    AiAgentTurnSignalTableName,
+} from '../ee/database/entities/aiAgentReviewClassifier';
+import {
+    AiAgentUserPreferencesTable,
+    AiAgentUserPreferencesTableName,
+} from '../ee/database/entities/aiAgentUserPreferences';
+import {
+    AiArtifactsTable,
+    AiArtifactsTableName,
+    AiArtifactVersionsTable,
+    AiArtifactVersionsTableName,
+} from '../ee/database/entities/aiArtifacts';
+import {
+    AiEvalPromptTable,
+    AiEvalPromptTableName,
+    AiEvalRunResultAssessmentTable,
+    AiEvalRunResultAssessmentTableName,
+    AiEvalRunResultTable,
+    AiEvalRunResultTableName,
+    AiEvalRunTable,
+    AiEvalRunTableName,
+    AiEvalTable,
+    AiEvalTableName,
+} from '../ee/database/entities/aiEvals';
+import {
+    AiReviewNotificationLogTable,
+    AiReviewNotificationLogTableName,
+    AiReviewNotificationSettingsTable,
+    AiReviewNotificationSettingsTableName,
+} from '../ee/database/entities/aiReviewNotifications';
+import {
+    AiRouterDecisionTable,
+    AiRouterDecisionTableName,
+    AiRouterTable,
+    AiRouterTableName,
+} from '../ee/database/entities/aiRouter';
+import {
+    DashboardSummariesTable,
+    DashboardSummariesTableName,
+} from '../ee/database/entities/dashboardSummaries';
+import {
+    AppExternalConnectionsTable,
+    AppExternalConnectionsTableName,
+    ExternalConnectionRateCountersTable,
+    ExternalConnectionRateCountersTableName,
+    ExternalConnectionSamplesTable,
+    ExternalConnectionSamplesTableName,
+    ExternalConnectionSecretsTable,
+    ExternalConnectionSecretsTableName,
+    ExternalConnectionsTable,
+    ExternalConnectionsTableName,
+} from '../ee/database/entities/externalConnections';
+import {
+    ManagedAgentActionsTable,
+    ManagedAgentActionsTableName,
+    ManagedAgentRunsTable,
+    ManagedAgentRunsTableName,
+    ManagedAgentSettingsTable,
+    ManagedAgentSettingsTableName,
+} from '../ee/database/entities/managedAgent';
+import {
+    McpClientInfoTable,
+    McpClientInfoTableName,
+    McpToolCallTable,
+    McpToolCallTableName,
+} from '../ee/database/entities/mcpToolCall';
+import {
+    PreAggregateDailyStatsTable,
+    PreAggregateDailyStatsTableName,
+} from '../ee/database/entities/preAggregateDailyStats';
+import {
+    PreAggregateDefinitionsTable,
+    PreAggregateDefinitionsTableName,
+    PreAggregateMaterializationsTable,
+    PreAggregateMaterializationsTableName,
+} from '../ee/database/entities/preAggregates';
+import {
+    ProjectCiStatusTable,
+    ProjectCiStatusTableName,
+} from '../ee/database/entities/projectCiStatus';
+import {
+    AnnouncementsTable,
+    AnnouncementsTableName,
+    HomepageAssignmentsTable,
+    HomepageAssignmentsTableName,
+    HomepagesTableName,
+    ProjectHomepagesTable,
+} from '../ee/database/entities/projectHomepages';
+import {
+    SchedulerAiAugmentationTable,
+    SchedulerAiAugmentationTableName,
+} from '../ee/database/entities/schedulerAiAugmentation';
+import {
+    ServiceAccountsTableName,
+    ServiceAccountTable,
+} from '../ee/database/entities/serviceAccounts';
+import {
+    SlackChannelProjectMappingsTable,
+    SlackChannelProjectMappingsTableName,
+} from '../ee/database/entities/slackChannelProjectMappings';
+
+declare module 'knex/types/tables' {
+    interface Tables {
+        [InviteLinkTableName]: InviteLinkTable;
+        [OrganizationTableName]: OrganizationTable;
+        [UserTableName]: UserTable;
+        [UserAvatarsTableName]: UserAvatarsTable;
+        [EmailTableName]: EmailTable;
+        [FeatureFlagsTableName]: FeatureFlagsTable;
+        [FeatureFlagOverridesTableName]: FeatureFlagOverridesTable;
+        [SessionTableName]: SessionTable;
+        [WarehouseCredentialTableName]: WarehouseCredentialTable;
+        [UserWarehouseCredentialsTableName]: UserWarehouseCredentialsTable;
+        [ProjectUserWarehouseCredentialPreferenceTableName]: ProjectUserWarehouseCredentialPreferenceTable;
+        [ProjectTableName]: ProjectTable;
+        [ProjectDbtSourcesTableName]: ProjectDbtSourcesTable;
+        [SavedChartsTableName]: SavedChartTable;
+        [SavedChartVersionsTableName]: SavedChartVersionsTable;
+        [SavedChartVersionFieldsTableName]: SavedChartVersionFieldsTable;
+        [SavedChartVersionSortsTableName]: SavedChartVersionSortsTable;
+        [SavedChartTableCalculationTableName]: SavedChartTableCalculationTable;
+        [SavedChartAdditionalMetricTableName]: SavedChartAdditionalMetricTable;
+        [SavedSqlTableName]: SavedSqlTable;
+        [SavedSqlVersionsTableName]: SavedSqlVersionsTable;
+        [SpaceTableName]: SpaceTable;
+        [DashboardsTableName]: DashboardTable;
+        [DashboardVersionsTableName]: DashboardVersionTable;
+        [DashboardViewsTableName]: DashboardViewTable;
+        [DashboardTilesTableName]: DashboardTileTable;
+        [DashboardTileTypesTableName]: DashboardTileTypesTable;
+        [DashboardTileChartTableName]: DashboardTileChartTable;
+        [DashboardTileLoomsTableName]: DashboardTileLoomsTable;
+        [DashboardTileMarkdownsTableName]: DashboardTileMarkdownsTable;
+        [DashboardTileHeadingsTableName]: DashboardTileHeadingsTable;
+        [DashboardTileDataAppsTableName]: DashboardTileDataAppsTable;
+        [OnboardingTableName]: OnboardingTable;
+        [OpenIdIdentitiesTableName]: OpenIdIdentitiesTable;
+        [OrganizationMembershipsTableName]: OrganizationMembershipsTable;
+        [PasswordResetTableName]: PasswordResetTable;
+        [PasswordLoginTableName]: PasswordLoginTable;
+        [CachedExploresTableName]: CachedExploresTable;
+        [CachedExploreTableName]: CachedExploreTable;
+        [CachedWarehouseTableName]: CachedWarehouseTable;
+        [JobsTableName]: JobsTable;
+        [JobStepsTableName]: JobStepsTable;
+        [PersonalAccessTokenTableName]: PersonalAccessTokenTable;
+        [ProjectMembershipsTableName]: ProjectMembershipsTable;
+        [ProjectGroupAccessTableName]: ProjectGroupAccessTable;
+        [ShareTableName]: ShareTable;
+        [SpaceUserAccessTableName]: SpaceUserAccessTable;
+        [SlackAuthTokensTableName]: SlackAuthTokensTable;
+        [SlackChannelsTableName]: SlackChannelsTable;
+        [AnalyticsChartViewsTableName]: AnalyticsChartViews;
+        [AnalyticsDashboardViewsTableName]: AnalyticsDashboardViews;
+        [AnalyticsAppViewsTableName]: AnalyticsAppViews;
+        [PinnedListTableName]: PinnedListTable;
+        [PinnedChartTableName]: PinnedChartTable;
+        [PinnedDashboardTableName]: PinnedDashboardTable;
+        [PinnedSpaceTableName]: PinnedSpaceTable;
+        [PinnedAppTableName]: PinnedAppTable;
+        [SchedulerTableName]: SchedulerTable;
+        [SchedulerSlackTargetTableName]: SchedulerSlackTargetTable;
+        [SchedulerEmailTargetTableName]: SchedulerEmailTargetTable;
+        [SchedulerMsTeamsTargetTableName]: SchedulerMsTeamsTargetTable;
+        [SchedulerGoogleChatTargetTableName]: SchedulerGoogleChatTargetTable;
+        [EmailOneTimePasscodesTableName]: EmailOneTimePasscodeTable;
+        [SchedulerLogTableName]: SchedulerLogTable;
+        [OrganizationAllowedEmailDomainsTableName]: OrganizationAllowedEmailDomainsTable;
+        [OrganizationAllowedEmailDomainProjectsTableName]: OrganizationAllowedEmailDomainProjectsTable;
+        [OrganizationSettingsTableName]: OrganizationSettingsTable;
+        [OrganizationSsoConfigurationsTableName]: OrganizationSsoConfigurationsTable;
+        [OrganizationDomainVerificationsTableName]: OrganizationDomainVerificationsTable;
+        [OrganizationEmailDomainsTableName]: OrganizationEmailDomainsTable;
+        [ValidationTableName]: ValidationTable;
+        [GroupTableName]: GroupTable;
+        [GroupMembershipTableName]: GroupMembershipTable;
+        [SshKeyPairTableName]: SshKeyPairTable;
+        [UserAttributesTable]: UserAttributeTable;
+        [OrganizationMemberUserAttributesTable]: OrganizationMemberUserAttributeTable;
+        [GroupUserAttributesTable]: GroupUserAttributeTable;
+        [SavedChartCustomDimensionsTableName]: SavedChartCustomDimensionsTable;
+        [SavedChartCustomSqlDimensionsTableName]: SavedChartCustomSqlDimensionsTable;
+        [DownloadFileTableName]: DownloadFileTable;
+        [PersistentDownloadFileTableName]: PersistentDownloadFileTable;
+        [DownloadAuditTableName]: DownloadAuditTable;
+        [GithubAppInstallationTableName]: GithubAppInstallationTable;
+        [GitlabAppInstallationTableName]: GitlabAppInstallationTable;
+        [GitUserCredentialsTableName]: GitUserCredentialsTable;
+        [UserOAuthGrantsTableName]: UserOAuthGrantsTable;
+        [PullRequestsTableName]: PullRequestsTable;
+        [DashboardTileCommentsTableName]: DashboardTileCommentsTable;
+        [AiThreadTableName]: AiThreadTable;
+        [AiThreadShareTableName]: AiThreadShareTable;
+        [AiSlackThreadTableName]: AiSlackThreadTable;
+        [AiWebAppThreadTableName]: AiWebAppThreadTable;
+        [AiPromptTableName]: AiPromptTable;
+        [AiPromptInterruptTableName]: AiPromptInterruptTable;
+        [AiPromptSteerTableName]: AiPromptSteerTable;
+        [AiPromptContextTableName]: AiPromptContextTable;
+        [AiThreadCompactionTableName]: AiThreadCompactionTable;
+        [AiArtifactsTableName]: AiArtifactsTable;
+        [AiArtifactVersionsTableName]: AiArtifactVersionsTable;
+        [AiSlackPromptTableName]: AiSlackPromptTable;
+        [AiWebAppPromptTableName]: AiWebAppPromptTable;
+        [AiWritebackThreadTableName]: AiWritebackThreadTable;
+        [AgentOnboardingRunsTableName]: AgentOnboardingRunsTable;
+        [ProjectCiStatusTableName]: ProjectCiStatusTable;
+        [AiAgentTableName]: AiAgentTable;
+        [AiAgentDocumentTableName]: AiAgentDocumentTable;
+        [AiAgentDocumentAccessTableName]: AiAgentDocumentAccessTable;
+        [AiAgentReviewClassifierRunTableName]: AiAgentReviewClassifierRunTable;
+        [AiAgentTurnSignalTableName]: AiAgentTurnSignalTable;
+        [AiAgentReviewItemTableName]: AiAgentReviewItemTable;
+        [AiAgentReviewRemediationTableName]: AiAgentReviewRemediationTable;
+        [AiAgentReviewRemediationEventsTableName]: AiAgentReviewRemediationEventsTable;
+        [AiAgentGroupAccessTableName]: AiAgentGroupAccessTable;
+        [AiAgentIntegrationTableName]: AiAgentIntegrationTable;
+        [AiAgentSlackIntegrationTableName]: AiAgentSlackIntegrationTable;
+        [AiAgentInstructionVersionsTableName]: AiAgentInstructionVersionsTable;
+        [AiMcpServerTableName]: AiMcpServerTable;
+        [AiMcpServerCredentialTableName]: AiMcpServerCredentialTable;
+        [AiAgentMcpServerTableName]: AiAgentMcpServerTable;
+        [AiAgentUserPreferencesTableName]: AiAgentUserPreferencesTable;
+        [HomepagesTableName]: ProjectHomepagesTable;
+        [HomepageAssignmentsTableName]: HomepageAssignmentsTable;
+        [AnnouncementsTableName]: AnnouncementsTable;
+        [AiAgentReasoningTableName]: AiAgentReasoningTable;
+        [AiAgentToolCallTableName]: AiAgentToolCallTable;
+        [AiAgentToolCallErrorTableName]: AiAgentToolCallErrorTable;
+        [AiAgentToolResultTableName]: AiAgentToolResultTable;
+        [McpToolCallTableName]: McpToolCallTable;
+        [McpClientInfoTableName]: McpClientInfoTable;
+        [AiSqlApprovalTableName]: AiSqlApprovalTable;
+        [DashboardTabsTableName]: DashboardTabsTable;
+        [NotificationsTableName]: NotificationsTable;
+        [AiReviewNotificationLogTableName]: AiReviewNotificationLogTable;
+        [AiReviewNotificationSettingsTableName]: AiReviewNotificationSettingsTable;
+        [DashboardSummariesTableName]: DashboardSummariesTable;
+        [CatalogTableName]: CatalogTable;
+        [SlackChannelProjectMappingsTableName]: SlackChannelProjectMappingsTable;
+        [WarehouseAvailableTablesTableName]: WarehouseAvailableTablesTable;
+        [WarehouseConnectCodeTableName]: WarehouseConnectCodeTable;
+        [TagsTableName]: TagsTable;
+        [CatalogTagsTableName]: CatalogTagsTable;
+        [ServiceAccountsTableName]: ServiceAccountTable;
+        [MetricsTreeEdgesTableName]: MetricsTreeEdgesTable;
+        [MetricsTreeLocksTableName]: MetricsTreeLocksTable;
+        [MetricsTreesTableName]: MetricsTreesTable;
+        [MetricsTreeNodesTableName]: MetricsTreeNodesTable;
+        [SpotlightTableConfigTableName]: SpotlightTableConfigTable;
+        [OrganizationColorPaletteTableName]: OrganizationColorPaletteTable;
+        [OrganizationDesignsTableName]: OrganizationDesignsTable;
+        [OrganizationDesignFilesTableName]: OrganizationDesignFilesTable;
+        [OrganizationWarehouseCredentialsTableName]: OrganizationWarehouseCredentialsTable;
+        [QueryHistoryTableName]: QueryHistoryTable;
+        [PreAggregateDefinitionsTableName]: PreAggregateDefinitionsTable;
+        [PreAggregateDailyStatsTableName]: PreAggregateDailyStatsTable;
+        [PreAggregateMaterializationsTableName]: PreAggregateMaterializationsTable;
+        [ProjectParametersTableName]: ProjectParametersTable;
+        [RolesTableName]: RoleTable;
+        [ScopedRolesTableName]: ScopedRoleTable;
+        [AiEvalTableName]: AiEvalTable;
+        [AiEvalPromptTableName]: AiEvalPromptTable;
+        [AiEvalRunTableName]: AiEvalRunTable;
+        [AiEvalRunResultTableName]: AiEvalRunResultTable;
+        [AiEvalRunResultAssessmentTableName]: AiEvalRunResultAssessmentTable;
+        [ManagedAgentSettingsTableName]: ManagedAgentSettingsTable;
+        [ManagedAgentActionsTableName]: ManagedAgentActionsTable;
+        [ManagedAgentRunsTableName]: ManagedAgentRunsTable;
+        [UserFavoritesTableName]: UserFavoritesTable;
+        [ContentVerificationTableName]: ContentVerificationTable;
+        [AppsTableName]: AppsTable;
+        [AppVersionsTableName]: AppVersionsTable;
+        [AiRouterTableName]: AiRouterTable;
+        [AiRouterDecisionTableName]: AiRouterDecisionTable;
+        [ExternalConnectionsTableName]: ExternalConnectionsTable;
+        [ExternalConnectionSecretsTableName]: ExternalConnectionSecretsTable;
+        [AppExternalConnectionsTableName]: AppExternalConnectionsTable;
+        [ExternalConnectionRateCountersTableName]: ExternalConnectionRateCountersTable;
+        [ExternalConnectionSamplesTableName]: ExternalConnectionSamplesTable;
+        [SchedulerAiAugmentationTableName]: SchedulerAiAugmentationTable;
+    }
+}

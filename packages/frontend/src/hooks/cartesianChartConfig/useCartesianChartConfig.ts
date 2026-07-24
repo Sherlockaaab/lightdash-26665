@@ -1,0 +1,1484 @@
+import {
+    assertUnreachable,
+    CartesianSeriesType,
+    getSeriesId,
+    hashFieldReference,
+    isCompleteEchartsConfig,
+    isCompleteLayout,
+    isNumericItem,
+    StackType,
+    XAxisSort,
+    XAxisSortType,
+    type CartesianChart,
+    type CompleteCartesianChartLayout,
+    type ConditionalFormattingConfig,
+    type EchartsGrid,
+    type EchartsLegend,
+    type ItemsMap,
+    type MarkLineData,
+    type MetricQuery,
+    type PivotReference,
+    type RowLimit,
+    type Series,
+    type SeriesMetadata,
+    type TableCalculationMetadata,
+    type TooltipSortBy,
+    type XAxis,
+} from '@lightdash/common';
+import { produce } from 'immer';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+    getMarkLineAxis,
+    type ReferenceLineField,
+} from '../../components/common/ReferenceLine';
+import type { InfiniteQueryResults } from '../useQueryResults';
+import {
+    getExpectedSeriesMap,
+    isPivotSeriesOrderDeterminedByQuery,
+    mergeExistingAndExpectedSeries,
+    sortDimensions,
+} from './utils';
+
+export const EMPTY_X_AXIS = 'empty_x_axis';
+
+export type CartesianTypeOptions = {
+    type: CartesianSeriesType;
+    flipAxes: boolean;
+    hasAreaStyle: boolean;
+};
+
+type Args = {
+    initialChartConfig: CartesianChart | undefined;
+    pivotKeys: string[] | undefined;
+    resultsData:
+        | (InfiniteQueryResults & {
+              metricQuery?: MetricQuery;
+              fields?: ItemsMap;
+              resolvedTimezone?: string;
+          })
+        | undefined;
+    columnOrder: string[];
+    itemsMap: ItemsMap | undefined;
+    stacking: boolean | StackType | undefined;
+    cartesianType: CartesianTypeOptions | undefined;
+    colorPalette: string[];
+    tableCalculationsMetadata?: TableCalculationMetadata[];
+};
+
+const getReferenceLineKey = ({ fieldId, fieldRef, data }: ReferenceLineField) =>
+    [
+        fieldRef ? hashFieldReference(fieldRef) : undefined,
+        fieldId,
+        data.uuid,
+        data.value,
+        data.name,
+        data.type,
+        data.dynamicValue,
+        data.xAxis,
+        data.yAxis,
+        data.label?.formatter,
+        data.label?.position,
+        data.lineStyle?.color,
+    ]
+        .map((value) => value ?? '')
+        .join('|');
+
+const getReferenceFieldId = (referenceLine: ReferenceLineField) =>
+    referenceLine.fieldRef?.field ?? referenceLine.fieldId;
+
+const getReferenceKey = (reference: PivotReference) =>
+    hashFieldReference(reference);
+
+const getReferenceLineSeriesKey = (referenceLine: ReferenceLineField) =>
+    referenceLine.fieldRef
+        ? getReferenceKey(referenceLine.fieldRef)
+        : undefined;
+
+const doesReferenceMatchSeries = (
+    referenceLine: ReferenceLineField,
+    serie: Series,
+) => {
+    const referenceKey = getReferenceLineSeriesKey(referenceLine);
+    if (!serie.encode) return false;
+
+    if (referenceKey) {
+        return (
+            referenceKey === getReferenceKey(serie.encode.xRef) ||
+            referenceKey === getReferenceKey(serie.encode.yRef)
+        );
+    }
+
+    const fieldId = referenceLine.fieldId;
+    if (fieldId === undefined) return false;
+    return (
+        fieldId === serie.encode.xRef.field ||
+        fieldId === serie.encode.yRef.field
+    );
+};
+
+const dedupeReferenceLines = (referenceLines: ReferenceLineField[]) => {
+    const seen = new Set<string>();
+
+    return referenceLines.filter((referenceLine) => {
+        const key = getReferenceLineKey(referenceLine);
+        if (seen.has(key)) return false;
+
+        seen.add(key);
+        return true;
+    });
+};
+
+const applyReferenceLines = (
+    series: Series[],
+    dirtyLayout: Partial<Partial<CompleteCartesianChartLayout>> | undefined,
+    referenceLines: ReferenceLineField[],
+): Series[] => {
+    // Track which reference lines have been applied to visible series
+    let appliedReferenceLines: string[] = [];
+    const uniqueReferenceLines = dedupeReferenceLines(referenceLines);
+
+    return series.map((serie) => {
+        // If series is filtered out or hidden, ensure it has no markLine
+        // but DON'T mark the reference line as applied so another visible series can pick it up
+        if (serie.isFilteredOut || serie.hidden) {
+            return { ...serie, markLine: undefined };
+        }
+
+        const referenceLinesForSerie = uniqueReferenceLines.filter(
+            (referenceLine) => {
+                const appliedKey =
+                    getReferenceLineSeriesKey(referenceLine) ??
+                    getReferenceFieldId(referenceLine);
+                if (appliedKey === undefined) return false;
+                if (appliedReferenceLines.includes(appliedKey)) return false;
+                return doesReferenceMatchSeries(referenceLine, serie);
+            },
+        );
+
+        if (referenceLinesForSerie.length === 0)
+            return { ...serie, markLine: undefined };
+
+        const markLineData: MarkLineData[] = referenceLinesForSerie.map(
+            (line) => {
+                const fieldId = getReferenceFieldId(line);
+                if (fieldId === undefined) return line.data;
+                appliedReferenceLines.push(
+                    getReferenceLineSeriesKey(line) ?? fieldId,
+                );
+                const value = line.data.xAxis || line.data.yAxis;
+                if (value === undefined) return line.data;
+
+                const axis = getMarkLineAxis(
+                    dirtyLayout?.xField,
+                    dirtyLayout?.flipAxes || false,
+                    fieldId,
+                );
+
+                return {
+                    ...line.data,
+                    xAxis: undefined,
+                    yAxis: undefined,
+                    [axis]: value,
+                };
+            },
+        );
+
+        return {
+            ...serie,
+            markLine: {
+                symbol: 'none',
+                lineStyle: {
+                    color: '#000',
+                    width: 3,
+                    type: 'solid',
+                },
+                data: markLineData,
+            },
+        };
+    });
+};
+
+function getXAxisSortConfig(
+    sort: XAxisSort,
+): Pick<XAxis, 'inverse' | 'sortType'> {
+    switch (sort) {
+        case XAxisSort.DEFAULT:
+            return {
+                inverse: false,
+                sortType: XAxisSortType.DEFAULT,
+            };
+        case XAxisSort.DEFAULT_REVERSED:
+            return {
+                inverse: true,
+                sortType: XAxisSortType.DEFAULT,
+            };
+        case XAxisSort.ASCENDING:
+            return {
+                inverse: false,
+                sortType: XAxisSortType.CATEGORY,
+            };
+        case XAxisSort.DESCENDING:
+            return {
+                inverse: true,
+                sortType: XAxisSortType.CATEGORY,
+            };
+        case XAxisSort.BAR_TOTALS_ASCENDING:
+            return {
+                inverse: false,
+                sortType: XAxisSortType.BAR_TOTALS,
+            };
+        case XAxisSort.BAR_TOTALS_DESCENDING:
+            return {
+                inverse: true,
+                sortType: XAxisSortType.BAR_TOTALS,
+            };
+        default:
+            return assertUnreachable(sort, `Invalid sort ${sort}`);
+    }
+}
+
+export const EMPTY_CARTESIAN_CHART_CONFIG: CartesianChart = {
+    layout: {},
+    eChartsConfig: {
+        showAxisTicks: false, // New charts default to hiding tick lines
+    },
+};
+
+const useCartesianChartConfig = ({
+    initialChartConfig,
+    pivotKeys,
+    resultsData,
+    columnOrder,
+    itemsMap,
+    stacking,
+    cartesianType,
+    tableCalculationsMetadata,
+}: Args) => {
+    const [columnLimit, setColumnLimit] = useState<number | undefined>(
+        initialChartConfig?.columnLimit,
+    );
+
+    const [dirtyLayout, setDirtyLayout] = useState<
+        Partial<CartesianChart['layout']> | undefined
+    >(initialChartConfig?.layout);
+    const [dirtyMetadata, setDirtyMetadata] = useState<
+        CartesianChart['metadata'] | undefined
+    >(initialChartConfig?.metadata);
+    const [conditionalFormattings, setConditionalFormattings] = useState<
+        ConditionalFormattingConfig[]
+    >(initialChartConfig?.conditionalFormattings ?? []);
+
+    const [dirtyEchartsConfig, setDirtyEchartsConfig] = useState<
+        Partial<CartesianChart['eChartsConfig']> | undefined
+    >(
+        initialChartConfig?.eChartsConfig
+            ? {
+                  ...EMPTY_CARTESIAN_CHART_CONFIG.eChartsConfig,
+                  ...initialChartConfig.eChartsConfig,
+              }
+            : initialChartConfig?.eChartsConfig,
+    );
+
+    const isInitiallyStacked = useMemo(() => {
+        // First check the layout's stack property (persisted setting)
+        const layoutStack = initialChartConfig?.layout?.stack;
+        if (layoutStack !== undefined) {
+            return layoutStack !== StackType.NONE && layoutStack !== false;
+        }
+        // Fall back to checking if any series has stack property
+        return (dirtyEchartsConfig?.series || []).some(
+            (series: Series) => series.stack !== undefined,
+        );
+    }, [dirtyEchartsConfig?.series, initialChartConfig?.layout?.stack]);
+
+    const [isStacked, setIsStacked] = useState<boolean>(isInitiallyStacked);
+
+    const [rowLimit, setRowLimit] = useState<RowLimit | undefined>(
+        initialChartConfig?.rowLimit,
+    );
+
+    const setLegend = useCallback((legend: EchartsLegend) => {
+        const removePropertiesWithAuto = Object.entries(
+            legend,
+        ).reduce<EchartsLegend>((acc, [key, value]) => {
+            if (value === 'auto') return acc;
+            return { ...acc, [key]: value };
+        }, {});
+
+        setDirtyEchartsConfig((prevState) => {
+            return {
+                ...prevState,
+                legend: removePropertiesWithAuto,
+            };
+        });
+    }, []);
+
+    const setGrid = useCallback((grid: EchartsGrid) => {
+        setDirtyEchartsConfig((prevState) => {
+            return {
+                ...prevState,
+                grid,
+            };
+        });
+    }, []);
+
+    const setXAxisName = useCallback((name: string) => {
+        setDirtyEchartsConfig((prevState) => {
+            const [firstAxis, ...axes] = prevState?.xAxis || [];
+            return {
+                ...prevState,
+                xAxis: [{ ...firstAxis, name }, ...axes],
+            };
+        });
+    }, []);
+
+    const setYAxisName = useCallback((index: number, name: string) => {
+        setDirtyEchartsConfig((prevState) => {
+            return {
+                ...prevState,
+                yAxis: [
+                    prevState?.yAxis?.[0] || {},
+                    prevState?.yAxis?.[1] || {},
+                ].map((axis, axisIndex) =>
+                    axisIndex === index ? { ...axis, name } : axis,
+                ),
+            };
+        });
+    }, []);
+
+    const setYMinValue = useCallback(
+        (index: number, value: string | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    yAxis: [
+                        prevState?.yAxis?.[0] || {},
+                        prevState?.yAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index ? { ...axis, min: value } : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setYMaxValue = useCallback(
+        (index: number, value: string | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    yAxis: [
+                        prevState?.yAxis?.[0] || {},
+                        prevState?.yAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index ? { ...axis, max: value } : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setYMinInterval = useCallback(
+        (index: number, value: number | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    yAxis: [
+                        prevState?.yAxis?.[0] || {},
+                        prevState?.yAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index
+                            ? { ...axis, minInterval: value }
+                            : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setXMinValue = useCallback(
+        (index: number, value: string | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    xAxis: [
+                        prevState?.xAxis?.[0] || {},
+                        prevState?.xAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index ? { ...axis, min: value } : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setXMinInterval = useCallback(
+        (index: number, value: number | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    xAxis: [
+                        prevState?.xAxis?.[0] || {},
+                        prevState?.xAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index
+                            ? { ...axis, minInterval: value }
+                            : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setXMinOffsetValue = useCallback(
+        (index: number, value: string | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    xAxis: [
+                        prevState?.xAxis?.[0] || {},
+                        prevState?.xAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index
+                            ? { ...axis, minOffset: value }
+                            : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setXMaxValue = useCallback(
+        (index: number, value: string | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    xAxis: [
+                        prevState?.xAxis?.[0] || {},
+                        prevState?.xAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index ? { ...axis, max: value } : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setXMaxOffsetValue = useCallback(
+        (index: number, value: string | undefined) => {
+            setDirtyEchartsConfig((prevState) => {
+                return {
+                    ...prevState,
+                    xAxis: [
+                        prevState?.xAxis?.[0] || {},
+                        prevState?.xAxis?.[1] || {},
+                    ].map((axis, axisIndex) =>
+                        axisIndex === index
+                            ? { ...axis, maxOffset: value }
+                            : axis,
+                    ),
+                };
+            });
+        },
+        [],
+    );
+
+    const setXField = useCallback((xField: string | undefined) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            xField,
+        }));
+    }, []);
+
+    const setShowGridX = useCallback((show: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            showGridX: show,
+        }));
+    }, []);
+    const setShowGridY = useCallback((show: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            showGridY: show,
+        }));
+    }, []);
+    const setShowXAxis = useCallback((hide: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            showXAxis: hide,
+        }));
+    }, []);
+    const setShowYAxis = useCallback((hide: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            showYAxis: hide,
+        }));
+    }, []);
+    const setShowLeftYAxis = useCallback((show: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            showLeftYAxis: show,
+        }));
+    }, []);
+    const setShowRightYAxis = useCallback((show: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            showRightYAxis: show,
+        }));
+    }, []);
+    const setShowAxisTicks = useCallback((show: boolean) => {
+        setDirtyEchartsConfig((prev) => ({
+            ...prev,
+            showAxisTicks: show,
+        }));
+    }, []);
+
+    const setConnectNulls = useCallback((connect: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            connectNulls: connect,
+        }));
+    }, []);
+
+    const setColorByCategory = useCallback((enabled: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            colorByCategory: enabled,
+        }));
+    }, []);
+
+    const setCategoryColorOverride = useCallback(
+        (categoryValue: string, color: string) => {
+            setDirtyLayout((prev) => ({
+                ...prev,
+                categoryColorOverrides: {
+                    ...prev?.categoryColorOverrides,
+                    [categoryValue]: color,
+                },
+            }));
+        },
+        [],
+    );
+
+    const setAllCategoryColorOverrides = useCallback(
+        (overrides: Record<string, string>) => {
+            setDirtyLayout((prev) => ({
+                ...prev,
+                categoryColorOverrides: overrides,
+            }));
+        },
+        [],
+    );
+
+    const onSetConditionalFormattings = useCallback(
+        (configs: ConditionalFormattingConfig[]) => {
+            setConditionalFormattings(configs);
+
+            if (configs.length > 0) {
+                setDirtyLayout((prev) => ({
+                    ...prev,
+                    colorByCategory: undefined,
+                }));
+            }
+        },
+        [],
+    );
+
+    const setAxisLabelFontSize = useCallback((fontSize: number | undefined) => {
+        setDirtyEchartsConfig((prev) => ({
+            ...prev,
+            axisLabelFontSize: fontSize,
+        }));
+    }, []);
+
+    const setAxisTitleFontSize = useCallback((fontSize: number | undefined) => {
+        setDirtyEchartsConfig((prev) => ({
+            ...prev,
+            axisTitleFontSize: fontSize,
+        }));
+    }, []);
+
+    const setXAxisSort = useCallback((sort: XAxisSort) => {
+        setDirtyEchartsConfig((prevState) => {
+            const [firstAxis, ...axes] = prevState?.xAxis || [];
+            const { inverse, sortType } = getXAxisSortConfig(sort);
+            return {
+                ...prevState,
+                xAxis: [{ ...firstAxis, inverse, sortType }, ...axes],
+            };
+        });
+    }, []);
+    const setXAxisLabelRotation = useCallback((rotation: number) => {
+        setDirtyEchartsConfig((prevState) => {
+            const [firstAxis, ...axes] = prevState?.xAxis || [];
+            return {
+                ...prevState,
+                xAxis: [{ ...firstAxis, rotate: rotation }, ...axes],
+            };
+        });
+    }, []);
+    const setScrollableChart = useCallback((enableDataZoom: boolean) => {
+        setDirtyEchartsConfig((prevState) => {
+            const [firstAxis, ...axes] = prevState?.xAxis || [];
+            return {
+                ...prevState,
+                xAxis: [{ ...firstAxis, enableDataZoom }, ...axes],
+            };
+        });
+    }, []);
+    const setDataZoomAnchor = useCallback((dataZoomAnchor: 'start' | 'end') => {
+        setDirtyEchartsConfig((prevState) => {
+            const [firstAxis, ...axes] = prevState?.xAxis || [];
+            return {
+                ...prevState,
+                xAxis: [{ ...firstAxis, dataZoomAnchor }, ...axes],
+            };
+        });
+    }, []);
+    const setDataZoomItemCount = useCallback((dataZoomItemCount: number) => {
+        setDirtyEchartsConfig((prevState) => {
+            const [firstAxis, ...axes] = prevState?.xAxis || [];
+            return {
+                ...prevState,
+                xAxis: [{ ...firstAxis, dataZoomItemCount }, ...axes],
+            };
+        });
+    }, []);
+    const addSingleSeries = useCallback((yField: string) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            yField: [...(prev?.yField || []), yField],
+            // Color by category only works for single-series; clear when adding another
+            ...((prev?.yField?.length ?? 0) >= 1 && {
+                colorByCategory: undefined,
+                categoryColorOverrides: undefined,
+            }),
+        }));
+        setConditionalFormattings((prev) => (prev.length > 0 ? [] : prev));
+    }, []);
+
+    const removeSingleSeries = useCallback((index: number) => {
+        setDirtyEchartsConfig((prev) => {
+            /**
+             * Clean up any color data assigned to this series, to prevent confusing
+             * behaviors around reordering and deleting/re-adding series.
+             */
+            if (prev?.series && prev.series[index]) {
+                const newSeries = [...prev.series];
+                newSeries[index] = {
+                    ...newSeries[index],
+                    color: undefined,
+                };
+
+                return {
+                    ...prev,
+                    series: newSeries,
+                };
+            }
+
+            return prev;
+        });
+        setDirtyLayout((prev) => ({
+            ...prev,
+            yField: prev?.yField
+                ? [
+                      ...prev.yField.slice(0, index),
+                      ...prev.yField.slice(index + 1),
+                  ]
+                : [],
+        }));
+    }, []);
+
+    const updateYField = useCallback((index: number, fieldId: string) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            yField: prev?.yField?.map((field, i) => {
+                return i === index ? fieldId : field;
+            }),
+        }));
+    }, []);
+
+    const setType = useCallback(
+        (type: Series['type'], flipAxes: boolean, hasAreaStyle: boolean) => {
+            setDirtyLayout((prev) => ({
+                ...prev,
+                flipAxes,
+            }));
+            setDirtyEchartsConfig(
+                (prevState) =>
+                    prevState && {
+                        ...prevState,
+                        series: prevState?.series?.map((series) => ({
+                            ...series,
+                            type,
+                            areaStyle: hasAreaStyle ? {} : undefined,
+                        })),
+                        xAxis: prevState?.xAxis?.map((axis) => ({
+                            ...axis,
+                            // If the chart is not a bar chart, and the xAxis is sorted by bar totals, set the sort type to default ( bar totals are not applied to non-bar charts )
+                            sortType:
+                                type !== CartesianSeriesType.BAR &&
+                                axis.sortType === XAxisSortType.BAR_TOTALS
+                                    ? XAxisSortType.DEFAULT
+                                    : axis.sortType,
+                        })),
+                    },
+            );
+        },
+        [],
+    );
+
+    useEffect(() => {
+        if (cartesianType !== undefined) {
+            setType(
+                cartesianType.type,
+                cartesianType.flipAxes,
+                cartesianType.hasAreaStyle,
+            );
+        }
+    }, [cartesianType, setType]);
+
+    const setFlipAxis = useCallback((flipAxes: boolean) => {
+        setDirtyLayout((prev) => ({
+            ...prev,
+            flipAxes,
+        }));
+    }, []);
+
+    const updateAllGroupedSeries = useCallback(
+        (fieldKey: string, updateSeries: Partial<Series>) =>
+            setDirtyEchartsConfig(
+                produce((draft) => {
+                    if (!draft) return;
+
+                    draft.series = draft.series?.map((series) =>
+                        series.encode.yRef.field === fieldKey
+                            ? { ...series, ...updateSeries }
+                            : series,
+                    );
+                }),
+            ),
+        [],
+    );
+
+    const updateSingleSeries = useCallback((updatedSeries: Series) => {
+        setDirtyEchartsConfig((prev) => {
+            return {
+                ...prev,
+                series: (prev?.series || []).map((currentSeries) =>
+                    getSeriesId(currentSeries) === getSeriesId(updatedSeries)
+                        ? { ...currentSeries, ...updatedSeries }
+                        : currentSeries,
+                ),
+            };
+        });
+    }, []);
+
+    const getSingleSeries = useCallback(
+        (series: Series) =>
+            dirtyEchartsConfig?.series?.find(
+                (s) => getSeriesId(s) === getSeriesId(series),
+            ),
+        [dirtyEchartsConfig?.series],
+    );
+
+    const updateSeries = useCallback((series: Series[]) => {
+        setDirtyEchartsConfig((prev) => {
+            if (prev) {
+                return {
+                    ...prev,
+                    series,
+                };
+            }
+            return prev;
+        });
+    }, []);
+
+    const setStacking = useCallback(
+        (stack: boolean | StackType) => {
+            const yFields = dirtyLayout?.yField || [];
+            const isPivoted = pivotKeys && pivotKeys.length > 0;
+
+            // Convert StackType to boolean for isStacked state
+            const stackBoolean =
+                stack === StackType.NORMAL ||
+                stack === StackType.PERCENT ||
+                stack === true;
+
+            setIsStacked(stackBoolean);
+
+            // Store the stack type in the layout
+            setDirtyLayout((prev) => ({
+                ...prev,
+                stack:
+                    stack === true
+                        ? StackType.NORMAL
+                        : stack === false
+                          ? StackType.NONE
+                          : stack,
+            }));
+
+            setDirtyEchartsConfig(
+                produce((draft) => {
+                    if (!draft) return;
+                    draft.series = draft.series?.map((series) => {
+                        const { field } = series.encode.yRef;
+                        if (yFields.includes(field)) {
+                            return {
+                                ...series,
+                                stack: stackBoolean
+                                    ? isPivoted
+                                        ? field
+                                        : 'stack-all-series'
+                                    : undefined,
+                            };
+                        }
+                        return series;
+                    });
+                }),
+            );
+        },
+        [dirtyLayout?.yField, pivotKeys],
+    );
+
+    useEffect(() => {
+        // If the xField is a table calculation and its type is a number, do not stack
+        // This is computed on first load and also when the table calculation is updated in edit mode
+        if (stacking === false) return;
+        const tableCalculation =
+            resultsData?.metricQuery?.tableCalculations?.find(
+                (tc) => tc.name === dirtyLayout?.xField,
+            );
+        if (tableCalculation) {
+            const isNumber = isNumericItem(tableCalculation);
+            if (isNumber) setStacking(false);
+        }
+    }, [
+        dirtyLayout?.xField,
+        resultsData?.metricQuery?.tableCalculations,
+        stacking,
+        setStacking,
+    ]);
+
+    useEffect(() => {
+        if (stacking !== undefined) {
+            setStacking(stacking);
+        }
+    }, [stacking, setStacking]);
+
+    const sortedDimensions = useMemo(() => {
+        return sortDimensions(
+            resultsData?.metricQuery?.dimensions || [],
+            itemsMap,
+            columnOrder,
+        );
+    }, [resultsData?.metricQuery?.dimensions, itemsMap, columnOrder]);
+
+    const [availableFields, availableDimensions, availableMetrics] =
+        useMemo(() => {
+            const metrics = resultsData?.metricQuery?.metrics || [];
+            const tableCalculations =
+                resultsData?.metricQuery?.tableCalculations.map(
+                    ({ name }) => name,
+                ) || [];
+
+            return [
+                [...sortedDimensions, ...metrics, ...tableCalculations],
+                [...sortedDimensions],
+                metrics,
+            ];
+        }, [resultsData, sortedDimensions]);
+
+    /**
+     * Is valid when the field is a table calculation in the metadata with the current name
+     */
+    const isFieldValidTableCalculation = useCallback(
+        (fieldName: string) => {
+            return Boolean(
+                tableCalculationsMetadata?.some((tc) => tc.name === fieldName),
+            );
+        },
+        [tableCalculationsMetadata],
+    );
+
+    /**
+     * Returns the index of the table calculation metadata with the old name
+     */
+    const getOldTableCalculationMetadataIndex = useCallback(
+        (fieldName: string) => {
+            return (
+                tableCalculationsMetadata?.findIndex(
+                    (tc) => tc.oldName === fieldName,
+                ) ?? -1
+            );
+        },
+        [tableCalculationsMetadata],
+    );
+
+    /**
+     * When table calculations update, their name changes, so we need to update the selected fields
+     * If the xField is a table calculation with the old name in the metadata, return the current name otherwise return xField
+     */
+    const getXField = useCallback(
+        (xField?: string) => {
+            if (!tableCalculationsMetadata || !xField) return xField;
+
+            const xFieldTcIndex = getOldTableCalculationMetadataIndex(xField);
+
+            return xFieldTcIndex !== -1
+                ? tableCalculationsMetadata[xFieldTcIndex].name
+                : xField;
+        },
+        [getOldTableCalculationMetadataIndex, tableCalculationsMetadata],
+    );
+
+    /**
+     * When table calculations update, their name changes, so we need to update the selected fields
+     * If any yField is a table calculation with the old name in the metadata, return the current name otherwise return yField
+     */
+    const getYFields = useCallback(
+        (yFields?: string[]) => {
+            if (!tableCalculationsMetadata || !yFields) return yFields;
+
+            return yFields.map((yField) => {
+                const yFieldTcIndex =
+                    getOldTableCalculationMetadataIndex(yField);
+
+                return yFieldTcIndex !== -1
+                    ? tableCalculationsMetadata[yFieldTcIndex].name
+                    : yField;
+            });
+        },
+        [getOldTableCalculationMetadataIndex, tableCalculationsMetadata],
+    );
+
+    // Set fallout layout values
+    // https://www.notion.so/lightdash/Default-chart-configurations-5d3001af990d4b6fa990dba4564540f6
+    useEffect(() => {
+        if (availableFields.length > 0) {
+            setDirtyLayout((prev) => {
+                /**
+                 * Get the fields with the current table calculation names when they are a table calculation with the old name
+                 * otherwise keep the fields as they are
+                 */
+                const xField = getXField(prev?.xField);
+                const yFields = getYFields(prev?.yField);
+
+                const isCurrentXFieldValid: boolean =
+                    xField === EMPTY_X_AXIS ||
+                    (!!xField &&
+                        (availableFields.includes(xField) ||
+                            isFieldValidTableCalculation(xField)));
+
+                const currentValidYFields = yFields
+                    ? yFields.filter(
+                          (y) =>
+                              availableFields.includes(y) ||
+                              isFieldValidTableCalculation(y),
+                      )
+                    : [];
+
+                const isCurrentYFieldsValid: boolean =
+                    currentValidYFields.length > 0;
+
+                // current configuration is still valid
+                if (isCurrentXFieldValid && isCurrentYFieldsValid) {
+                    return {
+                        ...prev,
+                        xField,
+                        yField: currentValidYFields,
+                    };
+                }
+
+                // try to fix partially invalid configuration
+                if (
+                    (isCurrentXFieldValid && !isCurrentYFieldsValid) ||
+                    (!isCurrentXFieldValid && isCurrentYFieldsValid)
+                ) {
+                    const usedFields: string[] = [];
+
+                    if (isCurrentXFieldValid && xField) {
+                        usedFields.push(xField);
+                    }
+
+                    if (isCurrentYFieldsValid) {
+                        usedFields.push(...currentValidYFields);
+                    }
+
+                    const fallbackXField = availableFields.filter(
+                        (f) => !usedFields.includes(f),
+                    )[0];
+
+                    if (!isCurrentXFieldValid && fallbackXField) {
+                        return {
+                            ...prev,
+                            xField: fallbackXField,
+                            yField: currentValidYFields,
+                        };
+                    }
+
+                    const fallbackYFields = [
+                        ...availableMetrics,
+                        ...availableDimensions,
+                    ].filter((f) => !usedFields.includes(f))[0];
+
+                    if (!isCurrentYFieldsValid && fallbackYFields) {
+                        return {
+                            ...prev,
+                            xField,
+                            yField: [fallbackYFields],
+                        };
+                    }
+                }
+
+                let newXField: string | undefined = undefined;
+                let newYFields: string[] = [];
+
+                // one metric , one dimension
+                if (
+                    availableMetrics.length === 1 &&
+                    availableDimensions.length === 1
+                ) {
+                    newXField = availableDimensions[0];
+                    newYFields = [availableMetrics[0]];
+                }
+
+                // one metric, two dimensions
+                else if (
+                    availableMetrics.length === 1 &&
+                    availableDimensions.length === 2
+                ) {
+                    newXField = availableDimensions[0];
+                    newYFields = [availableMetrics[0]];
+                }
+
+                // 1+ metrics, one dimension
+                else if (
+                    availableMetrics.length > 1 &&
+                    availableDimensions.length === 1
+                ) {
+                    //Max 4 metrics in Y-axis
+                    newXField = availableDimensions[0];
+                    newYFields = availableMetrics.slice(0, 4);
+                }
+
+                // 2+ dimensions and 1+ metrics
+                else if (
+                    availableMetrics.length >= 1 &&
+                    availableDimensions.length >= 2
+                ) {
+                    //Max 4 metrics in Y-axis
+                    newXField = availableDimensions[0];
+                    newYFields = availableMetrics.slice(0, 4);
+                }
+
+                // 2+ metrics with no dimensions
+                else if (
+                    availableMetrics.length >= 2 &&
+                    availableDimensions.length === 0
+                ) {
+                    newXField = availableMetrics[0];
+                    newYFields = [availableMetrics[1]];
+                }
+
+                // 2+ dimensions with no metrics
+                else if (
+                    availableMetrics.length === 0 &&
+                    availableDimensions.length >= 2
+                ) {
+                    newXField = availableDimensions[0];
+                    newYFields = [availableDimensions[1]];
+                }
+
+                // Don't update if we don't have a valid configuration
+                // This prevents infinite loops when insufficient fields are selected
+                if (!newXField || newYFields.length === 0) {
+                    return prev;
+                }
+
+                return {
+                    ...prev,
+                    xField: newXField,
+                    yField: newYFields,
+                };
+            });
+        }
+    }, [
+        availableDimensions,
+        availableFields,
+        availableMetrics,
+        pivotKeys,
+        getXField,
+        getYFields,
+        isFieldValidTableCalculation,
+        itemsMap,
+    ]);
+
+    const selectedReferenceLines: ReferenceLineField[] = useMemo(() => {
+        if (dirtyEchartsConfig?.series === undefined) return [];
+        return dedupeReferenceLines(
+            dirtyEchartsConfig.series.reduce<ReferenceLineField[]>(
+                (acc, serie) => {
+                    const data = serie.markLine?.data;
+                    if (data !== undefined) {
+                        const referenceLine = data.map((markData) => {
+                            const axis =
+                                markData.xAxis !== undefined
+                                    ? dirtyLayout?.flipAxes
+                                        ? serie.encode.yRef
+                                        : serie.encode.xRef
+                                    : dirtyLayout?.flipAxes
+                                      ? serie.encode.xRef
+                                      : serie.encode.yRef;
+                            return {
+                                fieldId: axis.field,
+                                fieldRef:
+                                    markData.dynamicValue === 'average' ||
+                                    markData.type === 'average'
+                                        ? axis
+                                        : undefined,
+                                data: {
+                                    label: serie.markLine?.label,
+                                    lineStyle: serie.markLine?.lineStyle,
+                                    ...markData,
+                                },
+                            };
+                        });
+
+                        return [...acc, ...referenceLine];
+                    }
+                    return acc;
+                },
+                [],
+            ),
+        );
+    }, [dirtyEchartsConfig?.series, dirtyLayout?.flipAxes]);
+
+    const [referenceLines, setReferenceLines] = useState<ReferenceLineField[]>(
+        selectedReferenceLines,
+    );
+
+    const [tooltip, setTooltip] = useState<string | undefined>(
+        dirtyEchartsConfig?.tooltip,
+    );
+
+    const [tooltipSort, setTooltipSort] = useState<TooltipSortBy | undefined>(
+        dirtyEchartsConfig?.tooltipSort,
+    );
+
+    // Track series hidden states to trigger reference line redistribution
+    const seriesHiddenStatesKey = useMemo(() => {
+        const hiddenStates =
+            dirtyEchartsConfig?.series?.map((s) => ({
+                id: getSeriesId(s),
+                hidden: !!s.hidden,
+            })) || [];
+        // Use JSON.stringify for stable comparison
+        return JSON.stringify(hiddenStates);
+    }, [dirtyEchartsConfig?.series]);
+
+    // Generate expected series
+    useEffect(() => {
+        if (isCompleteLayout(dirtyLayout) && resultsData?.hasFetchedAllRows) {
+            setDirtyEchartsConfig((prev) => {
+                const defaultCartesianType =
+                    prev?.series?.[0]?.type || CartesianSeriesType.BAR;
+                const defaultAreaStyle =
+                    defaultCartesianType === CartesianSeriesType.LINE
+                        ? prev?.series?.[0]?.areaStyle
+                        : undefined;
+                const defaultSmooth = prev?.series?.[0]?.smooth;
+                const defaultLabel = prev?.series?.[0]?.label;
+                const defaultStackLabel = prev?.series?.[0]?.stackLabel;
+
+                const defaultShowSymbol = prev?.series?.[0]?.showSymbol;
+                const expectedSeriesMap = getExpectedSeriesMap({
+                    defaultSmooth,
+                    defaultShowSymbol,
+                    defaultAreaStyle,
+                    defaultCartesianType,
+                    isStacked,
+                    pivotKeys,
+                    resultsData,
+                    xField: dirtyLayout.xField,
+                    yFields: dirtyLayout.yField,
+                    defaultLabel,
+                    defaultStackLabel,
+                    itemsMap,
+                    columnLimit,
+                });
+                const sortedByPivot = isPivotSeriesOrderDeterminedByQuery(
+                    pivotKeys,
+                    dirtyLayout.yField,
+                    resultsData?.metricQuery?.sorts,
+                );
+
+                const newSeries = mergeExistingAndExpectedSeries({
+                    expectedSeriesMap,
+                    existingSeries: prev?.series || [],
+                    sortedByPivot,
+                });
+
+                const seriesWithReferenceLines = applyReferenceLines(
+                    newSeries,
+                    dirtyLayout,
+                    referenceLines,
+                );
+
+                return {
+                    ...prev,
+                    series: seriesWithReferenceLines.map((serie) => ({
+                        ...serie,
+                        // NOTE: Addresses old chart configs where yAxisIndex was not set
+                        ...(!serie.yAxisIndex && {
+                            yAxisIndex: 0,
+                        }),
+                    })),
+                };
+            });
+        }
+    }, [
+        dirtyLayout,
+        pivotKeys,
+        resultsData,
+        availableDimensions,
+        isStacked,
+        referenceLines,
+        itemsMap,
+        seriesHiddenStatesKey, // Re-run when series hidden states change
+        columnLimit,
+    ]);
+
+    const { dirtyChartType } = useMemo(() => {
+        const firstSeriesType =
+            dirtyEchartsConfig?.series?.[0]?.type || CartesianSeriesType.BAR;
+        const firstSeriesAreaStyle = dirtyEchartsConfig?.series?.[0]?.areaStyle;
+        return {
+            dirtyChartType:
+                firstSeriesType === CartesianSeriesType.LINE &&
+                firstSeriesAreaStyle
+                    ? CartesianSeriesType.AREA
+                    : firstSeriesType,
+        };
+    }, [dirtyEchartsConfig]);
+
+    const hasCustomColorsStacking = useMemo(
+        () =>
+            dirtyEchartsConfig?.series?.some((series) =>
+                Boolean(series.stack),
+            ) ||
+            (dirtyLayout?.stack !== undefined &&
+                dirtyLayout.stack !== StackType.NONE),
+        [dirtyEchartsConfig?.series, dirtyLayout?.stack],
+    );
+
+    // Conditional formatting: all-bar charts without pivots, regardless of
+    // metric count or stacking. Mixed bar/line charts are excluded since
+    // formatting only renders on bars.
+    const isConditionalFormattingEligible = useMemo(
+        () =>
+            dirtyChartType === CartesianSeriesType.BAR &&
+            (dirtyEchartsConfig?.series ?? []).every(
+                (series) => series.type === CartesianSeriesType.BAR,
+            ) &&
+            !pivotKeys?.length,
+        [dirtyChartType, dirtyEchartsConfig?.series, pivotKeys],
+    );
+
+    // Color by category: only single-metric non-stacked bar charts
+    const isColorByCategoryEligible = useMemo(
+        () =>
+            isConditionalFormattingEligible &&
+            !hasCustomColorsStacking &&
+            (dirtyLayout?.yField?.length ?? 0) <= 1,
+        [
+            isConditionalFormattingEligible,
+            hasCustomColorsStacking,
+            dirtyLayout?.yField,
+        ],
+    );
+
+    useEffect(() => {
+        if (isColorByCategoryEligible) return;
+
+        if (
+            !dirtyLayout?.colorByCategory &&
+            !dirtyLayout?.categoryColorOverrides
+        ) {
+            return;
+        }
+
+        setDirtyLayout((prev) => ({
+            ...prev,
+            colorByCategory: undefined,
+            categoryColorOverrides: undefined,
+        }));
+    }, [
+        isColorByCategoryEligible,
+        dirtyLayout?.colorByCategory,
+        dirtyLayout?.categoryColorOverrides,
+    ]);
+
+    useEffect(() => {
+        if (isConditionalFormattingEligible) return;
+
+        setConditionalFormattings((prev) => (prev.length === 0 ? prev : []));
+    }, [isConditionalFormattingEligible]);
+
+    // Repair configs whose target no longer exists on the chart (e.g. the
+    // metric was swapped or removed) by pointing them at the first metric.
+    useEffect(() => {
+        if (!isConditionalFormattingEligible) return;
+
+        const yFields = dirtyLayout?.yField ?? [];
+        const firstYField = yFields[0];
+        if (!firstYField) return;
+
+        setConditionalFormattings((prev) => {
+            const repairedConfigs = prev.map((config) =>
+                config.target?.fieldId &&
+                yFields.includes(config.target.fieldId)
+                    ? config
+                    : {
+                          ...config,
+                          target: { fieldId: firstYField },
+                      },
+            );
+
+            const withSingleTarget = hasCustomColorsStacking
+                ? repairedConfigs.map((config, index) =>
+                      index === 0 ||
+                      config.target?.fieldId ===
+                          repairedConfigs[0].target?.fieldId
+                          ? config
+                          : {
+                                ...config,
+                                target: repairedConfigs[0].target,
+                            },
+                  )
+                : repairedConfigs;
+
+            const hasChanges = withSingleTarget.some(
+                (config, index) =>
+                    config.target?.fieldId !== prev[index].target?.fieldId,
+            );
+
+            return hasChanges ? withSingleTarget : prev;
+        });
+    }, [
+        isConditionalFormattingEligible,
+        hasCustomColorsStacking,
+        dirtyLayout?.yField,
+    ]);
+
+    const validConfig: CartesianChart = useMemo(() => {
+        // Always use the dirtyLayout and dirtyEchartsConfig when possible, fallback to the empty config if not complete.
+        return {
+            layout: isCompleteLayout(dirtyLayout)
+                ? dirtyLayout
+                : EMPTY_CARTESIAN_CHART_CONFIG.layout,
+            eChartsConfig: isCompleteEchartsConfig(dirtyEchartsConfig)
+                ? {
+                      ...dirtyEchartsConfig,
+                      series: dirtyEchartsConfig.series.filter(
+                          (serie) => !serie.isFilteredOut,
+                      ),
+                      tooltip,
+                      tooltipSort,
+                  }
+                : EMPTY_CARTESIAN_CHART_CONFIG.eChartsConfig,
+            conditionalFormattings,
+            metadata: dirtyMetadata,
+            rowLimit,
+            columnLimit,
+        };
+    }, [
+        dirtyLayout,
+        dirtyEchartsConfig,
+        conditionalFormattings,
+        dirtyMetadata,
+        tooltip,
+        tooltipSort,
+        rowLimit,
+        columnLimit,
+    ]);
+
+    const updateMetadata = useCallback(
+        (metadata: Record<string, SeriesMetadata>) => {
+            setDirtyMetadata(metadata);
+        },
+        [],
+    );
+
+    return {
+        validConfig,
+        dirtyChartType,
+        dirtyLayout,
+        dirtyEchartsConfig,
+        dirtyMetadata,
+        setXField,
+        setType,
+        setXAxisName,
+        setYAxisName,
+        setStacking,
+        isStacked,
+        addSingleSeries,
+        updateSingleSeries,
+        getSingleSeries,
+        removeSingleSeries,
+        updateAllGroupedSeries,
+        updateYField,
+        setFlipAxis,
+        setYMinValue,
+        setYMaxValue,
+        setYMinInterval,
+        setXMinValue,
+        setXMinInterval,
+        setXMinOffsetValue,
+        setXMaxValue,
+        setXMaxOffsetValue,
+        setLegend,
+        setGrid,
+        setShowGridX,
+        setShowGridY,
+        setShowXAxis,
+        setShowYAxis,
+        setShowLeftYAxis,
+        setShowRightYAxis,
+        setShowAxisTicks,
+        setConnectNulls,
+        setColorByCategory,
+        setCategoryColorOverride,
+        setAllCategoryColorOverrides,
+        conditionalFormattings,
+        onSetConditionalFormattings,
+        setAxisLabelFontSize,
+        setAxisTitleFontSize,
+        setXAxisSort,
+        setXAxisLabelRotation,
+        setScrollableChart,
+        setDataZoomAnchor,
+        setDataZoomItemCount,
+        updateSeries,
+        referenceLines,
+        setReferenceLines,
+        tooltip,
+        setTooltip,
+        tooltipSort,
+        setTooltipSort,
+        updateMetadata,
+        rowLimit,
+        setRowLimit,
+        columnLimit,
+        setColumnLimit,
+    };
+};
+
+export default useCartesianChartConfig;

@@ -1,0 +1,48 @@
+import { type AnyType } from '../../types/any';
+import { type ItemsMap } from '../../types/field';
+import { type ParametersValuesMap } from '../../types/parameters';
+import { formatItemValue } from '../../utils/formatting';
+import { type PivotValuesColumn } from '../types';
+
+export const getFormattedValue = (
+    value: AnyType,
+    key: string,
+    itemsMap: ItemsMap,
+    convertToUTC: boolean = true,
+    pivotValuesColumnsMap?: Record<string, PivotValuesColumn>,
+    parameters?: ParametersValuesMap,
+    timezone?: string,
+    displayTimezone?: string,
+): string => {
+    const pivotValuesColumn = pivotValuesColumnsMap?.[key];
+    const item = itemsMap[pivotValuesColumn?.referenceField ?? key];
+    return formatItemValue(
+        item,
+        value,
+        convertToUTC,
+        parameters,
+        timezone,
+        displayTimezone,
+    );
+};
+
+export const valueFormatter =
+    (
+        yFieldId: string,
+        itemsMap: ItemsMap,
+        pivotValuesColumnsMap?: Record<string, PivotValuesColumn>,
+        parameters?: ParametersValuesMap,
+        timezone?: string,
+        displayTimezone?: string,
+    ) =>
+    (rawValue: AnyType) =>
+        getFormattedValue(
+            rawValue,
+            yFieldId,
+            itemsMap,
+            undefined,
+            pivotValuesColumnsMap,
+            parameters,
+            timezone,
+            displayTimezone,
+        );

@@ -1,0 +1,734 @@
+import { type TokenUsage } from '@langchain/core/language_models/base';
+import {
+    CommercialFeatureFlags,
+    DashboardDAO,
+    DashboardSummary,
+    FeatureFlags,
+    ForbiddenError,
+    GenerateChartMetadataRequest,
+    GenerateCustomDimensionRequest,
+    GeneratedChartMetadata,
+    GeneratedCustomDimension,
+    GeneratedFormulaTableCalculation,
+    GeneratedTableCalculation,
+    GeneratedTooltip,
+    GenerateFormulaTableCalculationRequest,
+    GenerateTableCalculationRequest,
+    GenerateTooltipRequest,
+    getErrorMessage,
+    getItemId,
+    isDashboardChartTileType,
+    isField,
+    ItemsMap,
+    QueryExecutionContext,
+    SessionUser,
+    TableCalculationType,
+    UnexpectedServerError,
+} from '@lightdash/common';
+import { generateText } from 'ai';
+import { LightdashAnalytics } from '../../../analytics/LightdashAnalytics';
+import { fromSession } from '../../../auth/account';
+import { LightdashConfig } from '../../../config/parseConfig';
+import { DashboardModel } from '../../../models/DashboardModel/DashboardModel';
+import { SavedChartModel } from '../../../models/SavedChartModel';
+import { AsyncQueryService } from '../../../services/AsyncQueryService/AsyncQueryService';
+import { FeatureFlagService } from '../../../services/FeatureFlag/FeatureFlagService';
+import { ProjectService } from '../../../services/ProjectService/ProjectService';
+import {
+    ConvertSqlToFormulaGenerated,
+    CustomVizGenerated,
+    DashboardSummaryCreated,
+    DashboardSummaryViewed,
+    GenerateChartMetadataGenerated,
+    GenerateCustomDimensionGenerated,
+    GenerateFormulaTableCalculationGenerated,
+    GenerateTableCalculationGenerated,
+    GenerateTooltipGenerated,
+} from '../../analytics';
+import OpenAi from '../../clients/OpenAi';
+import { DashboardSummaryModel } from '../../models/DashboardSummaryModel';
+import { generateChartMetadata as generateChartMetadataFromContext } from '../ai/agents/chartMetadataGenerator';
+import { generateCustomDimension as generateCustomDimensionFromContext } from '../ai/agents/customDimensionGenerator';
+import {
+    generateFormulaTableCalculation as generateFormulaTableCalculationFromContext,
+    sanitizeCustomFormat as sanitizeFormulaCustomFormat,
+} from '../ai/agents/formulaTableCalculationGenerator';
+import {
+    generateTableCalculation as generateTableCalculationFromContext,
+    sanitizeCustomFormat,
+} from '../ai/agents/tableCalculationGenerator';
+import { generateTooltip as generateTooltipFromContext } from '../ai/agents/tooltipGenerator';
+import { getModel, pickAmbientAnthropicPreset } from '../ai/models';
+import { getAnthropicModel } from '../ai/models/anthropic-claude';
+import { OrgAiCopilotConfigResolver } from '../ai/OrgAiCopilotConfigResolver';
+import { AiCallAttribution } from '../ai/utils/aiCallTelemetry';
+import { convertQueryResultsToCsv } from '../ai/utils/convertQueryResultsToCsv';
+import { fieldDesc, formatSummaryArray } from './utils/prepareData';
+import {
+    DEFAULT_CHART_SUMMARY_PROMPT,
+    DEFAULT_CUSTOM_VIZ_PROMPT,
+    DEFAULT_DASHBOARD_SUMMARY_PROMPT,
+} from './utils/prompts';
+import { getTotalTokenUsage } from './utils/tokens';
+
+type ChartPromptData = {
+    name: string;
+    description?: string;
+    data: string;
+    columns: string[];
+    fields: ItemsMap;
+};
+
+type Dependencies = {
+    analytics: LightdashAnalytics;
+    dashboardModel: DashboardModel;
+    dashboardSummaryModel: DashboardSummaryModel;
+    savedChartModel: SavedChartModel;
+    projectService: ProjectService;
+    asyncQueryService: AsyncQueryService;
+    openAi: OpenAi;
+    lightdashConfig: LightdashConfig;
+    featureFlagService: FeatureFlagService;
+    orgAiCopilotConfigResolver: OrgAiCopilotConfigResolver;
+};
+
+export class AiService {
+    private readonly lightdashConfig: LightdashConfig;
+
+    private readonly analytics: LightdashAnalytics;
+
+    private readonly dashboardModel: DashboardModel;
+
+    private readonly dashboardSummaryModel: DashboardSummaryModel;
+
+    private readonly savedChartModel: SavedChartModel;
+
+    private readonly projectService: ProjectService;
+
+    private readonly asyncQueryService: AsyncQueryService;
+
+    private readonly openAi: OpenAi;
+
+    private readonly featureFlagService: FeatureFlagService;
+
+    private readonly orgAiCopilotConfigResolver: OrgAiCopilotConfigResolver;
+
+    constructor(dependencies: Dependencies) {
+        this.analytics = dependencies.analytics;
+        this.dashboardModel = dependencies.dashboardModel;
+        this.dashboardSummaryModel = dependencies.dashboardSummaryModel;
+        this.savedChartModel = dependencies.savedChartModel;
+        this.projectService = dependencies.projectService;
+        this.asyncQueryService = dependencies.asyncQueryService;
+        this.openAi = dependencies.openAi;
+        this.lightdashConfig = dependencies.lightdashConfig;
+        this.featureFlagService = dependencies.featureFlagService;
+        this.orgAiCopilotConfigResolver =
+            dependencies.orgAiCopilotConfigResolver;
+    }
+
+    /**
+     * Gets a language model for ambient AI tasks.
+     * 1. Checks anthropic shared key
+     * 2. Falls back to AI Copilot if the feature flag is enabled for the user,
+     *    using their configured model.
+     *
+     * @returns The full AiModel with model, callOptions, and providerOptions
+     */
+    private async getAmbientAiModel(
+        user: SessionUser,
+        telemetry?: { projectUuid?: string | null },
+    ) {
+        const attribution: AiCallAttribution = {
+            organizationUuid: user.organizationUuid ?? null,
+            userUuid: user.userUuid,
+            projectUuid: telemetry?.projectUuid ?? null,
+        };
+
+        const copilotConfig =
+            await this.orgAiCopilotConfigResolver.getCopilotConfig(
+                user.organizationUuid ?? null,
+            );
+
+        const anthropicConfig = copilotConfig.providers.anthropic;
+
+        if (anthropicConfig?.apiKey) {
+            // Prefer the fast model, but a BYO key may not have access to it
+            // (e.g. a key that only unlocks claude-opus-4-8). Fall back to a
+            // model the key can actually serve rather than failing at runtime.
+            const accessibleModelIds =
+                await this.orgAiCopilotConfigResolver.getAccessibleModelIds(
+                    'anthropic',
+                    anthropicConfig.apiKey,
+                );
+            const preset = pickAmbientAnthropicPreset(accessibleModelIds);
+            if (!preset) {
+                throw new ForbiddenError(
+                    "Ambient AI is unavailable: your Anthropic API key can't access a supported model.",
+                );
+            }
+            return {
+                ...getAnthropicModel(anthropicConfig, preset, {
+                    enableReasoning: false,
+                }),
+                telemetry: attribution,
+            };
+        }
+
+        const aiCopilotFlag = await this.featureFlagService.get({
+            user,
+            featureFlagId: CommercialFeatureFlags.AiCopilot,
+        });
+
+        if (!aiCopilotFlag.enabled) {
+            throw new ForbiddenError('Ambient AI is not available');
+        }
+
+        return {
+            ...getModel(copilotConfig, {
+                enableReasoning: false,
+                useFastModel: true,
+            }),
+            telemetry: attribution,
+        };
+    }
+
+    private async throwOnFeatureDisabled(user: SessionUser) {
+        const { enabled } = await this.featureFlagService.get({
+            user,
+            featureFlagId: FeatureFlags.AiDashboardSummary,
+        });
+
+        if (!enabled) {
+            throw new Error('AI Dashboard summary feature not enabled!');
+        }
+    }
+
+    private async getDashboardChartsResults(
+        user: SessionUser,
+        dashboard: DashboardDAO,
+    ): Promise<ChartPromptData[]> {
+        const chartTiles = dashboard.tiles.reduce<
+            { chartUuid: string; tileUuid: string }[]
+        >((acc, tile) => {
+            if (
+                isDashboardChartTileType(tile) &&
+                tile.properties.savedChartUuid
+            ) {
+                return [
+                    ...acc,
+                    {
+                        chartUuid: tile.properties.savedChartUuid,
+                        tileUuid: tile.uuid,
+                    },
+                ];
+            }
+            return acc;
+        }, []);
+
+        const chartResultPromises = chartTiles.map(
+            async ({ chartUuid, tileUuid }) => {
+                const queryResults =
+                    await this.asyncQueryService.executeDashboardChartQueryAndGetResults(
+                        {
+                            account: fromSession(user),
+                            projectUuid: dashboard.projectUuid,
+                            chartUuid,
+                            tileUuid,
+                            dashboardUuid: dashboard.uuid,
+                            dashboardFilters: dashboard.filters,
+                            dashboardSorts: [],
+                            context: QueryExecutionContext.AI,
+                        },
+                    );
+
+                const { name, description } =
+                    await this.savedChartModel.getSummary(chartUuid);
+
+                const { rows, fields } = queryResults;
+                const columns = rows[0] ? Object.keys(rows[0]) : [];
+                const data = convertQueryResultsToCsv(queryResults);
+
+                return {
+                    name,
+                    description,
+                    data,
+                    columns,
+                    fields,
+                };
+            },
+        );
+
+        return Promise.all(chartResultPromises);
+    }
+
+    async createChartSummary(chartData: ChartPromptData) {
+        const fieldInsights = chartData.columns
+            .map((col) => fieldDesc(col, chartData.fields[col]))
+            .join('\n');
+
+        return this.openAi.run(DEFAULT_CHART_SUMMARY_PROMPT, {
+            chart_data: chartData.data,
+            field_insights: fieldInsights,
+            chart_name: chartData.name,
+            chart_description: chartData.description ?? '',
+        });
+    }
+
+    async generateCustomViz({
+        user,
+        projectUuid,
+        prompt,
+        itemsMap,
+        sampleResults,
+        currentVizConfig,
+    }: {
+        user: SessionUser;
+        projectUuid: string;
+        prompt: string;
+        itemsMap: ItemsMap;
+        sampleResults: {
+            [k: string]: unknown;
+        }[];
+        currentVizConfig: string;
+    }) {
+        const aiCustomVizFlag = await this.featureFlagService.get({
+            user,
+            featureFlagId: FeatureFlags.AiCustomViz,
+        });
+
+        if (!aiCustomVizFlag.enabled) {
+            throw new Error('AI Custom viz feature not enabled!');
+        }
+        let openAiResponse: {
+            result: string;
+            tokenUsage: TokenUsage | undefined;
+        };
+
+        const fields = Object.values(itemsMap).map((item) => ({
+            id: getItemId(item),
+            name: item.name,
+            type: item.type,
+            fieldType: isField(item) ? item.fieldType : undefined,
+        }));
+
+        const startTime = new Date().getTime();
+
+        try {
+            openAiResponse = await this.openAi.run(DEFAULT_CUSTOM_VIZ_PROMPT, {
+                user_prompt: prompt,
+                fields: JSON.stringify(fields),
+                sample_data: JSON.stringify(sampleResults),
+                current_viz_config: currentVizConfig,
+            });
+        } catch (e) {
+            const errorCode =
+                e instanceof Error && 'code' in e ? e.code : getErrorMessage(e);
+            throw new Error(`Failed to generate vega config - ${errorCode}`);
+        }
+
+        const { result: vegaConfigResult, tokenUsage } = openAiResponse;
+
+        const timeOpenAi = new Date().getTime() - startTime;
+
+        const totalTokenUsages = [tokenUsage].filter(
+            (t): t is TokenUsage => t !== undefined,
+        );
+
+        const totalTokens = getTotalTokenUsage(totalTokenUsages);
+
+        if (this.openAi.model === undefined) {
+            throw new UnexpectedServerError('OpenAi model is not initialized');
+        }
+
+        this.analytics.track<CustomVizGenerated>({
+            userId: user.userUuid,
+            event: 'ai.custom_viz.generated',
+            properties: {
+                openAIModelName: this.openAi.model.modelName,
+                organizationId: user.organizationUuid!,
+                projectId: projectUuid,
+                prompt,
+                responseSize: vegaConfigResult.length,
+                tokenUsage: totalTokens,
+                timeOpenAi,
+            },
+        });
+
+        return vegaConfigResult;
+    }
+
+    async createDashboardSummary(
+        user: SessionUser,
+        projectUuid: string,
+        dashboardUuid: string,
+        opts: Pick<DashboardSummary, 'context' | 'tone' | 'audiences'>,
+    ) {
+        await this.throwOnFeatureDisabled(user);
+        const startTime = new Date().getTime();
+        const dashboard = await this.dashboardModel.getByIdOrSlug(
+            dashboardUuid,
+            { projectUuid },
+        );
+        const dashboardCharts = await this.getDashboardChartsResults(
+            user,
+            dashboard,
+        );
+        const timeGetCharts = new Date().getTime() - startTime;
+
+        const chartSummaries = dashboardCharts.map(async (chartData) => {
+            const { result, tokenUsage } =
+                await this.createChartSummary(chartData);
+
+            return {
+                chartName: chartData.name,
+                tokenUsage,
+                summary: result,
+            };
+        });
+
+        let chartSummaryResults;
+
+        try {
+            chartSummaryResults = await Promise.all(chartSummaries);
+        } catch (e) {
+            const errorCode =
+                e instanceof Error && 'code' in e ? e.code : getErrorMessage(e);
+            throw new Error(`Failed to generate summary - ${errorCode}`);
+        }
+
+        let dashboardSummaryResult;
+        const formattedSummaries = formatSummaryArray(chartSummaryResults);
+        const { context, tone, audiences } = opts;
+
+        try {
+            // TODO: use ambient AI model
+            dashboardSummaryResult = await this.openAi.run(
+                DEFAULT_DASHBOARD_SUMMARY_PROMPT,
+                {
+                    chart_summaries: formattedSummaries,
+                    context: context ?? '',
+                    audiences: audiences.join(', '),
+                    tone,
+                },
+            );
+        } catch (e) {
+            const errorCode =
+                e instanceof Error && 'code' in e ? e.code : getErrorMessage(e);
+            throw new Error(`Failed to generate summary - ${errorCode}`);
+        }
+
+        const {
+            result: dashboardSummaryText,
+            tokenUsage: dashboardSummaryTokenUsage,
+        } = dashboardSummaryResult;
+
+        const timeOpenAi = new Date().getTime() - startTime - timeGetCharts;
+
+        const dashboardSummary = await this.dashboardSummaryModel.save(
+            dashboard.uuid,
+            dashboard.dashboardVersionId,
+            dashboardSummaryText,
+            tone,
+            audiences,
+            context,
+        );
+
+        const chartSummariesTokenUsage = chartSummaryResults.map(
+            (cs) => cs.tokenUsage,
+        );
+
+        const totalTokenUsages = [
+            dashboardSummaryTokenUsage,
+            ...chartSummariesTokenUsage,
+        ].filter((t): t is TokenUsage => t !== undefined);
+
+        const totalTokens = getTotalTokenUsage(totalTokenUsages);
+
+        if (this.openAi.model === undefined) {
+            throw new UnexpectedServerError('OpenAi model is not initialized');
+        }
+        this.analytics.track<DashboardSummaryCreated>({
+            userId: user.userUuid,
+            event: 'ai.dashboard_summary.executed',
+            properties: {
+                openAIModelName: this.openAi.model.modelName,
+                organizationId: user.organizationUuid!,
+                projectId: projectUuid,
+                dashboardId: dashboardUuid,
+                dashboardSummaryUuid: dashboardSummary.dashboardSummaryUuid,
+                context,
+                responseSize: dashboardSummaryText.length,
+                tokenUsage: totalTokens,
+                timeGetCharts,
+                timeOpenAi,
+                timeTotal: timeOpenAi + timeGetCharts,
+            },
+        });
+
+        return dashboardSummary;
+    }
+
+    // TODO: user permissions
+    async getDashboardSummary(
+        user: SessionUser,
+        projectUuid: string,
+        dashboardUuidOrSlug: string,
+    ) {
+        await this.throwOnFeatureDisabled(user);
+
+        const dashboard = await this.dashboardModel.getByIdOrSlug(
+            dashboardUuidOrSlug,
+            { projectUuid },
+        );
+        const dashboardSummary =
+            await this.dashboardSummaryModel.getByDashboardUuid(dashboard.uuid);
+
+        this.analytics.track<DashboardSummaryViewed>({
+            userId: user.userUuid,
+            event: 'ai.dashboard_summary.viewed',
+            properties: {
+                organizationId: user.organizationUuid!,
+                projectId: projectUuid,
+                dashboardId: dashboard.uuid,
+                dashboardSummaryUuid: dashboardSummary.dashboardSummaryUuid,
+            },
+        });
+
+        return dashboardSummary;
+    }
+
+    async generateChartMetadata(
+        user: SessionUser,
+        projectUuid: string,
+        payload: GenerateChartMetadataRequest,
+    ): Promise<GeneratedChartMetadata> {
+        const modelOptions = await this.getAmbientAiModel(user, {
+            projectUuid,
+        });
+
+        const result = await generateChartMetadataFromContext(modelOptions, {
+            tableName: payload.tableName,
+            chartType: payload.chartType,
+            dimensions: payload.dimensions,
+            metrics: payload.metrics,
+            filters: payload.filters,
+            fieldsContext: payload.fieldsContext,
+            chartConfigJson: payload.chartConfigJson,
+        });
+
+        this.analytics.track<GenerateChartMetadataGenerated>({
+            userId: user.userUuid,
+            event: 'ai.chart_metadata.generated',
+            properties: {
+                organizationId: user.organizationUuid!,
+                projectId: projectUuid,
+                chartType: payload.chartType,
+            },
+        });
+
+        return result;
+    }
+
+    async generateTableCalculation(
+        user: SessionUser,
+        projectUuid: string,
+        payload: GenerateTableCalculationRequest,
+    ): Promise<GeneratedTableCalculation> {
+        const modelOptions = await this.getAmbientAiModel(user, {
+            projectUuid,
+        });
+        const project = await this.projectService.getProject(
+            projectUuid,
+            fromSession(user),
+        );
+        const warehouseType = project.warehouseConnection?.type;
+
+        if (!warehouseType) {
+            throw new ForbiddenError('Warehouse type is not available');
+        }
+
+        const result = await generateTableCalculationFromContext(modelOptions, {
+            prompt: payload.prompt,
+            tableName: payload.tableName,
+            warehouseType,
+            fieldsContext: payload.fieldsContext,
+            existingTableCalculations: payload.existingTableCalculations,
+            currentSql: payload.currentSql,
+        });
+
+        this.analytics.track<GenerateTableCalculationGenerated>({
+            userId: user.userUuid,
+            event: 'ai.table_calculation.generated',
+            properties: {
+                organizationId: user.organizationUuid!,
+                projectId: projectUuid,
+                userId: user.userUuid,
+            },
+        });
+
+        return {
+            sql: result.sql,
+            displayName: result.displayName,
+            type: result.type as TableCalculationType,
+            format: sanitizeCustomFormat(result.format ?? undefined),
+        };
+    }
+
+    async generateCustomDimension(
+        user: SessionUser,
+        projectUuid: string,
+        payload: GenerateCustomDimensionRequest,
+    ): Promise<GeneratedCustomDimension> {
+        const modelOptions = await this.getAmbientAiModel(user, {
+            projectUuid,
+        });
+        const project = await this.projectService.getProject(
+            projectUuid,
+            fromSession(user),
+        );
+        const warehouseType = project.warehouseConnection?.type;
+
+        if (!warehouseType) {
+            throw new ForbiddenError('Warehouse type is not available');
+        }
+
+        const result = await generateCustomDimensionFromContext(modelOptions, {
+            ...payload,
+            warehouseType,
+        });
+
+        this.analytics.track<GenerateCustomDimensionGenerated>({
+            userId: user.userUuid,
+            event: 'ai.custom_dimension.generated',
+            properties: {
+                organizationId: user.organizationUuid!,
+                projectId: projectUuid,
+                userId: user.userUuid,
+            },
+        });
+
+        return result;
+    }
+
+    async generateFormulaTableCalculation(
+        user: SessionUser,
+        projectUuid: string,
+        payload: GenerateFormulaTableCalculationRequest,
+    ): Promise<GeneratedFormulaTableCalculation> {
+        const modelOptions = await this.getAmbientAiModel(user, {
+            projectUuid,
+        });
+
+        const result = await generateFormulaTableCalculationFromContext(
+            modelOptions,
+            payload,
+        );
+
+        if (payload.mode === 'convert-sql') {
+            this.analytics.track<ConvertSqlToFormulaGenerated>({
+                userId: user.userUuid,
+                event: 'ai.formula_table_calculation.converted_from_sql',
+                properties: {
+                    organizationId: user.organizationUuid!,
+                    projectId: projectUuid,
+                    userId: user.userUuid,
+                },
+            });
+        } else {
+            this.analytics.track<GenerateFormulaTableCalculationGenerated>({
+                userId: user.userUuid,
+                event: 'ai.formula_table_calculation.generated',
+                properties: {
+                    organizationId: user.organizationUuid!,
+                    projectId: projectUuid,
+                    userId: user.userUuid,
+                },
+            });
+        }
+
+        return {
+            formula: result.formula,
+            displayName: result.displayName,
+            type: result.type as TableCalculationType,
+            format: sanitizeFormulaCustomFormat(result.format ?? undefined),
+        };
+    }
+
+    async generateTooltip(
+        user: SessionUser,
+        projectUuid: string,
+        payload: GenerateTooltipRequest,
+    ): Promise<GeneratedTooltip> {
+        const modelOptions = await this.getAmbientAiModel(user, {
+            projectUuid,
+        });
+
+        const result = await generateTooltipFromContext(modelOptions, {
+            prompt: payload.prompt,
+            fieldsContext: payload.fieldsContext,
+            currentHtml: payload.currentHtml,
+        });
+
+        this.analytics.track<GenerateTooltipGenerated>({
+            userId: user.userUuid,
+            event: 'ai.tooltip.generated',
+            properties: {
+                organizationId: user.organizationUuid!,
+                projectId: projectUuid,
+                userId: user.userUuid,
+            },
+        });
+
+        return {
+            html: result.html,
+        };
+    }
+
+    /**
+     * Single-shot summary of a scheduled delivery's already-rendered content
+     * using the ambient fast model. The content is the data the delivery sends
+     * (filters and parameters already applied upstream), so the model never
+     * re-queries the warehouse.
+     */
+    async generateDeliverySummary(
+        user: SessionUser,
+        {
+            prompt,
+            content,
+            projectUuid,
+        }: {
+            prompt: string;
+            content: string;
+            projectUuid: string;
+        },
+    ): Promise<string> {
+        const modelOptions = await this.getAmbientAiModel(user, {
+            projectUuid,
+        });
+
+        const result = await generateText({
+            model: modelOptions.model,
+            ...modelOptions.callOptions,
+            providerOptions: modelOptions.providerOptions,
+            messages: [
+                {
+                    role: 'system',
+                    content: `You write concise summaries of scheduled analytics deliveries.
+Given the delivery's data and the user's instructions, return a short plain-text
+report suitable for an email or Slack message. Only use the data provided —
+never invent figures. Do not repeat the raw table.`,
+                },
+                {
+                    role: 'user',
+                    content: [
+                        `Instructions:\n${prompt}`,
+                        `Delivery data:\n${content}`,
+                    ].join('\n\n'),
+                },
+            ],
+        });
+
+        return result.text.trim();
+    }
+}

@@ -1,0 +1,629 @@
+import { subject } from '@casl/ability';
+import {
+    ApiContentActionBody,
+    ApiContentBulkActionBody,
+    assertUnreachable,
+    BulkActionable,
+    ChartSourceType,
+    ContentActionMove,
+    ContentType,
+    DeletedContentFilters,
+    DeletedContentItem,
+    DeletedContentWithDescendants,
+    ForbiddenError,
+    KnexPaginateArgs,
+    KnexPaginatedData,
+    NotFoundError,
+    ParameterError,
+    SessionUser,
+    SpaceContentBase,
+    SummaryContent,
+} from '@lightdash/common';
+import { Knex } from 'knex';
+import { intersection } from 'lodash';
+import { LightdashAnalytics } from '../../analytics/LightdashAnalytics';
+import type { AppGenerateService } from '../../ee/services/AppGenerateService/AppGenerateService';
+import { ContentModel } from '../../models/ContentModel/ContentModel';
+import {
+    ContentArgs,
+    ContentFilters,
+} from '../../models/ContentModel/ContentModelTypes';
+import { ProjectModel } from '../../models/ProjectModel/ProjectModel';
+import { SpaceModel } from '../../models/SpaceModel';
+import { wrapSentryTransaction } from '../../utils';
+import { BaseService } from '../BaseService';
+import { DashboardService } from '../DashboardService/DashboardService';
+import { SavedChartService } from '../SavedChartsService/SavedChartService';
+import { SavedSqlService } from '../SavedSqlService/SavedSqlService';
+import type { SpacePermissionService } from '../SpaceService/SpacePermissionService';
+import { SpaceService } from '../SpaceService/SpaceService';
+
+type ContentServiceArguments = {
+    analytics: LightdashAnalytics;
+    projectModel: ProjectModel;
+    contentModel: ContentModel;
+    spaceModel: SpaceModel;
+    spaceService: SpaceService;
+    dashboardService: DashboardService;
+    savedChartService: SavedChartService;
+    savedSqlService: SavedSqlService;
+    spacePermissionService: SpacePermissionService;
+    appMoveService: BulkActionable<Knex> | undefined;
+    appGenerateService: AppGenerateService | undefined;
+};
+
+export class ContentService extends BaseService {
+    analytics: LightdashAnalytics;
+
+    projectModel: ProjectModel;
+
+    contentModel: ContentModel;
+
+    spaceModel: SpaceModel;
+
+    spaceService: SpaceService;
+
+    dashboardService: DashboardService;
+
+    savedChartService: SavedChartService;
+
+    savedSqlService: SavedSqlService;
+
+    spacePermissionService: SpacePermissionService;
+
+    appMoveService: BulkActionable<Knex> | undefined;
+
+    appGenerateService: AppGenerateService | undefined;
+
+    constructor(args: ContentServiceArguments) {
+        super();
+        this.analytics = args.analytics;
+        this.projectModel = args.projectModel;
+        this.contentModel = args.contentModel;
+
+        this.spaceModel = args.spaceModel;
+
+        this.spaceService = args.spaceService;
+        this.dashboardService = args.dashboardService;
+        this.savedChartService = args.savedChartService;
+        this.savedSqlService = args.savedSqlService;
+        this.spacePermissionService = args.spacePermissionService;
+        this.appMoveService = args.appMoveService;
+        this.appGenerateService = args.appGenerateService;
+    }
+
+    private getAppMoveService(): BulkActionable<Knex> {
+        if (!this.appMoveService) {
+            throw new ParameterError('Data apps are not available');
+        }
+        return this.appMoveService;
+    }
+
+    private getAppGenerateService(): AppGenerateService {
+        if (!this.appGenerateService) {
+            throw new ParameterError('Data apps are not available');
+        }
+        return this.appGenerateService;
+    }
+
+    async find(
+        user: SessionUser,
+        filters: ContentFilters,
+        queryArgs: ContentArgs,
+        paginateArgs: KnexPaginateArgs,
+    ): Promise<KnexPaginatedData<SummaryContent[]>> {
+        const { organizationUuid } = user;
+        if (organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+        const auditedAbility = this.createAuditedAbility(user);
+        const projectUuids = (
+            await wrapSentryTransaction(
+                'ContentService.find.getAllByOrganizationUuid',
+                { organizationUuid },
+                async () =>
+                    this.projectModel.getAllByOrganizationUuid(
+                        organizationUuid,
+                    ),
+            )
+        )
+            .filter((project) =>
+                auditedAbility.can(
+                    'view',
+                    subject('Project', {
+                        organizationUuid,
+                        projectUuid: project.projectUuid,
+                        metadata: {
+                            projectUuid: project.projectUuid,
+                            projectName: project.name,
+                        },
+                    }),
+                ),
+            )
+            .map((p) => p.projectUuid);
+        const allowedProjectUuids = filters.projectUuids
+            ? intersection(filters.projectUuids, projectUuids)
+            : projectUuids; // todo: move this filter to project model query
+
+        const spaces = await this.spaceModel.find({
+            projectUuids: allowedProjectUuids,
+            spaceUuids: filters.spaceUuids,
+        });
+        const spaceUuids = spaces.map((p) => p.uuid);
+
+        const allowedSpaceUuids =
+            await this.spacePermissionService.getAccessibleSpaceUuids(
+                'view',
+                user,
+                spaceUuids,
+            );
+
+        const isInsideSpace =
+            !!filters.spaceUuids && filters.spaceUuids.length > 0;
+
+        // Personal (space-less) data apps are surfaced only in the top-level
+        // "All data apps" browse (opt-in, not space-scoped). The caller always
+        // sees their own; project admins also see everyone's in that project.
+        const includePersonalDataApps =
+            filters.includePersonalDataApps === true &&
+            !isInsideSpace &&
+            (!filters.contentTypes ||
+                filters.contentTypes.includes(ContentType.DATA_APP));
+        const dataApps = includePersonalDataApps
+            ? {
+                  personalForUserUuid: user.userUuid,
+                  personalAdminProjectUuids: allowedProjectUuids.filter(
+                      (projectUuid) =>
+                          auditedAbility.can(
+                              'manage',
+                              subject('DataApp', {
+                                  organizationUuid,
+                                  projectUuid,
+                              }),
+                          ),
+                  ),
+              }
+            : undefined;
+
+        // When viewing contents of a space, fetch its child spaces
+        // and filter by access control so inaccessible children
+        // are excluded before pagination.
+        let accessibleChildSpaceUuids: string[] | undefined;
+        if (isInsideSpace) {
+            const childSpaceUuids =
+                await this.spaceModel.getChildSpaceUuidsForParents(
+                    allowedSpaceUuids,
+                );
+            accessibleChildSpaceUuids =
+                childSpaceUuids.length > 0
+                    ? await this.spacePermissionService.getAccessibleSpaceUuids(
+                          'view',
+                          user,
+                          childSpaceUuids,
+                      )
+                    : [];
+        }
+
+        const results = await this.contentModel.findSummaryContents(
+            {
+                ...filters,
+                projectUuids: allowedProjectUuids,
+                spaceUuids: allowedSpaceUuids,
+                space: {
+                    rootSpaces: !isInsideSpace,
+                    accessibleChildSpaceUuids,
+                },
+                dataApps,
+            },
+            queryArgs,
+            paginateArgs,
+        );
+
+        // Enrich SpaceContentBase items with access data → SpaceContent
+        const spaceItems = results.data.filter(
+            (item): item is SpaceContentBase =>
+                item.contentType === ContentType.SPACE,
+        );
+
+        let directAccessMap: Record<string, string[]> = {};
+        if (spaceItems.length > 0) {
+            directAccessMap =
+                await this.spacePermissionService.getDirectAccessUserUuids(
+                    spaceItems.map((s) => s.uuid),
+                );
+        }
+
+        return {
+            ...results,
+            data: results.data.map((item): SummaryContent => {
+                if (item.contentType !== ContentType.SPACE) {
+                    return item;
+                }
+                return {
+                    ...item,
+                    access: directAccessMap[item.uuid] ?? [],
+                };
+            }),
+        };
+    }
+
+    async bulkMove(
+        user: SessionUser,
+        projectUuid: string,
+        content: ApiContentBulkActionBody<ContentActionMove>['content'],
+        targetSpaceUuid: string | null,
+    ) {
+        if (user.organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+
+        const { organizationUuid, name: projectName } =
+            await this.projectModel.getSummary(projectUuid);
+        const auditedAbility = this.createAuditedAbility(user);
+        if (
+            auditedAbility.cannot(
+                'view',
+                subject('Project', {
+                    organizationUuid,
+                    projectUuid,
+                    metadata: { projectUuid, projectName },
+                }),
+            )
+        ) {
+            throw new ForbiddenError();
+        }
+
+        const database = this.contentModel.getDatabase();
+
+        await database.transaction(async (tx) => {
+            const updates = content.map((c) => {
+                const moveToSpaceArgs = {
+                    projectUuid,
+                    itemUuid: c.uuid,
+                    targetSpaceUuid,
+                };
+
+                const moveToSpaceOptions = {
+                    tx,
+                    checkForAccess: true,
+                    trackEvent: false,
+                };
+
+                switch (c.contentType) {
+                    case ContentType.CHART:
+                        switch (c.source) {
+                            case ChartSourceType.DBT_EXPLORE:
+                                return this.savedChartService.moveToSpace(
+                                    user,
+                                    moveToSpaceArgs,
+                                    moveToSpaceOptions,
+                                );
+                            case ChartSourceType.SQL:
+                                return this.savedSqlService.moveToSpace(
+                                    user,
+                                    moveToSpaceArgs,
+                                    moveToSpaceOptions,
+                                );
+                            default:
+                                return assertUnreachable(
+                                    c.source,
+                                    `Unknown chart source in bulk move: ${c.source}`,
+                                );
+                        }
+
+                    case ContentType.DASHBOARD:
+                        return this.dashboardService.moveToSpace(
+                            user,
+                            moveToSpaceArgs,
+                            moveToSpaceOptions,
+                        );
+                    case ContentType.SPACE:
+                        return this.spaceService.moveToSpace(
+                            user,
+                            moveToSpaceArgs,
+                            moveToSpaceOptions,
+                        );
+                    case ContentType.DATA_APP:
+                        return this.getAppMoveService().moveToSpace(
+                            user,
+                            moveToSpaceArgs,
+                            moveToSpaceOptions,
+                        );
+                    default:
+                        return assertUnreachable(c, 'Unknown content type');
+                }
+            });
+
+            await Promise.all(updates);
+        });
+
+        this.analytics.track({
+            event: 'content.bulk_move',
+            userId: user.userUuid,
+            properties: {
+                projectId: projectUuid,
+                targetSpaceId: targetSpaceUuid,
+                contentCount: content.length,
+            },
+        });
+    }
+
+    async move(
+        user: SessionUser,
+        projectUuid: string,
+        item: ApiContentActionBody<ContentActionMove>['item'],
+        targetSpaceUuid: string | null,
+    ) {
+        if (user.organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+
+        const { organizationUuid, name: projectName } =
+            await this.projectModel.getSummary(projectUuid);
+        const auditedAbility = this.createAuditedAbility(user);
+        if (
+            auditedAbility.cannot(
+                'view',
+                subject('Project', {
+                    organizationUuid,
+                    projectUuid,
+                    metadata: { projectUuid, projectName },
+                }),
+            )
+        ) {
+            throw new ForbiddenError();
+        }
+
+        const moveToSpaceArgs = {
+            projectUuid,
+            itemUuid: item.uuid,
+            targetSpaceUuid,
+        };
+
+        const moveToSpaceOptions = {
+            checkForAccess: true,
+            trackEvent: true,
+        };
+
+        switch (item.contentType) {
+            case ContentType.CHART:
+                switch (item.source) {
+                    case ChartSourceType.DBT_EXPLORE:
+                        return this.savedChartService.moveToSpace(
+                            user,
+                            moveToSpaceArgs,
+                            moveToSpaceOptions,
+                        );
+                    case ChartSourceType.SQL:
+                        return this.savedSqlService.moveToSpace(
+                            user,
+                            moveToSpaceArgs,
+                            moveToSpaceOptions,
+                        );
+                    default:
+                        return assertUnreachable(
+                            item.source,
+                            `Unknown chart source in bulk move: ${item.source}`,
+                        );
+                }
+
+            case ContentType.DASHBOARD:
+                return this.dashboardService.moveToSpace(
+                    user,
+                    moveToSpaceArgs,
+                    moveToSpaceOptions,
+                );
+            case ContentType.SPACE:
+                return this.spaceService.moveToSpace(
+                    user,
+                    moveToSpaceArgs,
+                    moveToSpaceOptions,
+                );
+            case ContentType.DATA_APP:
+                return this.getAppMoveService().moveToSpace(
+                    user,
+                    moveToSpaceArgs,
+                    moveToSpaceOptions,
+                );
+            default:
+                return assertUnreachable(item, 'Unknown content type');
+        }
+    }
+
+    /**
+     * Find deleted content in a project using the ContentModel UNION approach.
+     */
+    async findDeleted(
+        user: SessionUser,
+        filters: DeletedContentFilters,
+        paginateArgs?: KnexPaginateArgs,
+    ): Promise<KnexPaginatedData<DeletedContentWithDescendants[]>> {
+        const { organizationUuid } = user;
+        if (organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+
+        const [projectUuid] = filters.projectUuids;
+        if (!projectUuid) {
+            throw new NotFoundError('Project UUID is required');
+        }
+
+        const { name: projectName } =
+            await this.projectModel.getSummary(projectUuid);
+        const auditedAbility = this.createAuditedAbility(user);
+
+        // Check project access (audited gate)
+        if (
+            auditedAbility.cannot(
+                'view',
+                subject('Project', {
+                    organizationUuid,
+                    projectUuid,
+                    metadata: { projectUuid, projectName },
+                }),
+            )
+        ) {
+            throw new ForbiddenError();
+        }
+
+        // Non-admins can only see their own deleted content
+        // (data-scoping decision, not a permission gate — intentionally unaudited)
+        // eslint-disable-next-line no-direct-ability-check
+        const isAdmin = user.ability.can(
+            'manage',
+            subject('DeletedContent', { organizationUuid, projectUuid }),
+        );
+        const deletedByUserUuids = isAdmin
+            ? filters.deletedByUserUuids
+            : [user.userUuid];
+
+        const contentTypes = filters.contentTypes ?? [
+            ContentType.CHART,
+            ContentType.DASHBOARD,
+            ContentType.SPACE,
+            ContentType.DATA_APP,
+        ];
+
+        return this.contentModel.findDeletedContents(
+            {
+                projectUuids: [projectUuid],
+                contentTypes,
+                search: filters.search,
+                deletedByUserUuids,
+            },
+            paginateArgs,
+        );
+    }
+
+    /**
+     * Restore deleted content
+     */
+    async restoreContent(
+        user: SessionUser,
+        projectUuid: string,
+        item: DeletedContentItem,
+    ): Promise<void> {
+        if (user.organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+
+        const { organizationUuid, name: projectName } =
+            await this.projectModel.getSummary(projectUuid);
+        const auditedAbility = this.createAuditedAbility(user);
+        if (
+            auditedAbility.cannot(
+                'view',
+                subject('Project', {
+                    organizationUuid,
+                    projectUuid,
+                    metadata: { projectUuid, projectName },
+                }),
+            )
+        ) {
+            throw new ForbiddenError();
+        }
+
+        switch (item.contentType) {
+            case ContentType.CHART:
+                switch (item.source) {
+                    case ChartSourceType.DBT_EXPLORE:
+                        return this.savedChartService.restore(user, item.uuid, {
+                            projectUuid,
+                        });
+                    case ChartSourceType.SQL:
+                        return this.savedSqlService.restore(user, item.uuid, {
+                            projectUuid,
+                        });
+                    default:
+                        return assertUnreachable(
+                            item.source,
+                            `Unknown chart source: ${item.source}`,
+                        );
+                }
+            case ContentType.DASHBOARD:
+                return this.dashboardService.restore(user, item.uuid, {
+                    projectUuid,
+                });
+            case ContentType.SPACE:
+                return this.spaceService.restore(user, item.uuid, {
+                    projectUuid,
+                });
+            case ContentType.DATA_APP:
+                return this.getAppGenerateService().restoreApp(
+                    user,
+                    projectUuid,
+                    item.uuid,
+                );
+            default:
+                return assertUnreachable(item, 'Unknown content type');
+        }
+    }
+
+    /**
+     * Permanently delete content
+     */
+    async permanentlyDeleteContent(
+        user: SessionUser,
+        projectUuid: string,
+        item: DeletedContentItem,
+    ): Promise<void> {
+        if (user.organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+
+        const { organizationUuid, name: projectName } =
+            await this.projectModel.getSummary(projectUuid);
+        const auditedAbility = this.createAuditedAbility(user);
+        if (
+            auditedAbility.cannot(
+                'view',
+                subject('Project', {
+                    organizationUuid,
+                    projectUuid,
+                    metadata: { projectUuid, projectName },
+                }),
+            )
+        ) {
+            throw new ForbiddenError();
+        }
+
+        switch (item.contentType) {
+            case ContentType.CHART:
+                switch (item.source) {
+                    case ChartSourceType.DBT_EXPLORE:
+                        return this.savedChartService.permanentDelete(
+                            user,
+                            item.uuid,
+                            { projectUuid },
+                        );
+                    case ChartSourceType.SQL:
+                        return this.savedSqlService.permanentDelete(
+                            user,
+                            item.uuid,
+                            { projectUuid },
+                        );
+                    default:
+                        return assertUnreachable(
+                            item.source,
+                            `Unknown chart source: ${item.source}`,
+                        );
+                }
+            case ContentType.DASHBOARD:
+                return this.dashboardService.permanentDelete(user, item.uuid, {
+                    projectUuid,
+                });
+            case ContentType.SPACE:
+                return this.spaceService.permanentDelete(user, item.uuid, {
+                    projectUuid,
+                });
+            case ContentType.DATA_APP:
+                return this.getAppGenerateService().permanentDeleteApp(
+                    user,
+                    projectUuid,
+                    item.uuid,
+                );
+            default:
+                return assertUnreachable(item, 'Unknown content type');
+        }
+    }
+}

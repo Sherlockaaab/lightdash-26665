@@ -1,0 +1,1990 @@
+import { Ability } from '@casl/ability';
+import {
+    AiAgentReviewRemediation,
+    JobStatusType,
+    OrganizationMemberRole,
+    PullRequestProvider,
+    type AiAgentReviewItemSummary,
+    type PossibleAbilities,
+    type SessionUser,
+} from '@lightdash/common';
+import { getPullRequestComments } from '../../clients/github/Github';
+import {
+    AiAgentAdminService,
+    getAiAgentReviewItemWritebackEligibility,
+} from './AiAgentAdminService';
+
+vi.mock('../../clients/github/Github', () => ({
+    getInstallationToken: vi.fn(),
+    getPullRequest: vi.fn(),
+    getPullRequestComments: vi.fn(),
+}));
+
+const NOW = new Date('2026-06-08T10:00:00.000Z');
+const ORGANIZATION_UUID = '00000000-0000-0000-0000-000000000001';
+const PROJECT_UUID = '00000000-0000-0000-0000-000000000002';
+const AGENT_UUID = '00000000-0000-0000-0000-000000000003';
+const USER_UUID = '00000000-0000-0000-0000-000000000004';
+const REMEDIATION_UUID = '00000000-0000-0000-0000-000000000005';
+const THREAD_UUID = '00000000-0000-0000-0000-000000000006';
+const PROMPT_UUID = '00000000-0000-0000-0000-000000000007';
+const PREVIEW_PROJECT_UUID = '00000000-0000-0000-0000-000000000008';
+const PREVIEW_AGENT_UUID = '00000000-0000-0000-0000-000000000009';
+const OTHER_PROJECT_UUID = '00000000-0000-0000-0000-000000000099';
+const PREVIEW_THREAD_UUID = '00000000-0000-0000-0000-000000000010';
+const COMPILE_JOB_UUID = '00000000-0000-0000-0000-000000000011';
+const WORK_THREAD_UUID = '00000000-0000-0000-0000-000000000012';
+const SITE_URL = 'https://app.lightdash.cloud';
+const PR_URL = 'https://github.com/acme/dbt/pull/42';
+
+const makeReviewItem = (
+    overrides: Partial<AiAgentReviewItemSummary> = {},
+): AiAgentReviewItemSummary => ({
+    uuid: 'fingerprint-1',
+    fingerprint: 'fingerprint-1',
+    source: 'ai_finding',
+    organizationUuid: 'org-1',
+    projectUuid: 'project-1',
+    agentUuid: 'agent-1',
+    title: 'Missing metric',
+    description: 'The agent could not answer because a metric was missing.',
+    primaryRootCause: 'semantic_layer',
+    priority: 'none',
+    targetRefs: [],
+    status: 'open',
+    dismissedReason: null,
+    ownerType: 'semantic_layer_owner',
+    assignedToUserUuid: null,
+    firstSeenAt: NOW,
+    lastSeenAt: NOW,
+    findingCount: 1,
+    statusUpdatedAt: NOW,
+    statusUpdatedByUserUuid: null,
+    linkedIssueUrl: null,
+    linkedPrUrl: null,
+    prState: null,
+    prWritebackStatus: null,
+    prWritebackMessage: null,
+    boardPosition: null,
+    createdByUserUuid: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    writebackEligible: false,
+    writebackEligibility: {
+        eligible: false,
+        reason: 'reviews_disabled',
+        provider: null,
+        strategy: null,
+    },
+    remediation: null,
+    latestFinding: null,
+    ...overrides,
+});
+
+const makeRemediation = (
+    overrides: Partial<AiAgentReviewRemediation> = {},
+): AiAgentReviewRemediation => ({
+    uuid: REMEDIATION_UUID,
+    fingerprint: 'fingerprint-1',
+    organizationUuid: ORGANIZATION_UUID,
+    sourceFindingUuid: 'finding-1',
+    sourcePromptUuid: PROMPT_UUID,
+    sourceThreadUuid: THREAD_UUID,
+    sourceProjectUuid: PROJECT_UUID,
+    sourceAgentUuid: AGENT_UUID,
+    workThreadUuid: WORK_THREAD_UUID,
+    pullRequestUuid: 'pull-request-1',
+    linkedPrUrl: 'https://github.com/acme/dbt/pull/42',
+    previewProjectUuid: null,
+    previewAgentUuid: null,
+    previewThreadUuid: null,
+    status: 'pr_open',
+    errorMessage: null,
+    retryPrompt: 'Show revenue',
+    createdByUserUuid: USER_UUID,
+    resolvedByUserUuid: null,
+    resolvedAt: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+});
+
+const makeAdminUser = (): SessionUser => ({
+    userUuid: USER_UUID,
+    email: 'admin@example.com',
+    firstName: 'Admin',
+    lastName: 'User',
+    organizationUuid: ORGANIZATION_UUID,
+    organizationName: 'Acme',
+    organizationCreatedAt: NOW,
+    userId: 1,
+    role: OrganizationMemberRole.ADMIN,
+    isTrackingAnonymized: false,
+    isMarketingOptedIn: false,
+    avatarUrl: null,
+    avatarGradient: null,
+    isSetupComplete: true,
+    isActive: true,
+    createdAt: NOW,
+    updatedAt: NOW,
+    timezone: null,
+    ability: new Ability<PossibleAbilities>([
+        { action: 'manage', subject: 'Organization' },
+        {
+            action: 'manage',
+            subject: 'AiAgent',
+            conditions: { organizationUuid: ORGANIZATION_UUID },
+        },
+        {
+            action: 'manage',
+            subject: 'OrganizationAiAgent',
+            conditions: { organizationUuid: ORGANIZATION_UUID },
+        },
+    ]),
+    abilityRules: [],
+});
+
+const makeDeveloperUser = (): SessionUser => ({
+    ...makeAdminUser(),
+    role: OrganizationMemberRole.DEVELOPER,
+    ability: new Ability<PossibleAbilities>([
+        {
+            action: 'manage',
+            subject: 'AiAgent',
+            conditions: { organizationUuid: ORGANIZATION_UUID },
+        },
+        {
+            action: 'manage',
+            subject: 'OrganizationAiAgent',
+            conditions: { organizationUuid: ORGANIZATION_UUID },
+        },
+    ]),
+});
+
+// Project-scoped AI admin: org member, no org-level OrganizationAiAgent, only
+// project-level manage:AiAgent on PROJECT_UUID. Should see only that project's
+// resources. (manage implies view in CASL.)
+const makeProjectUser = (): SessionUser => ({
+    ...makeAdminUser(),
+    role: OrganizationMemberRole.MEMBER,
+    ability: new Ability<PossibleAbilities>([
+        {
+            action: 'manage',
+            subject: 'AiAgent',
+            conditions: {
+                organizationUuid: ORGANIZATION_UUID,
+                projectUuid: PROJECT_UUID,
+            },
+        },
+    ]),
+});
+
+// Org interactive_viewer-like principal: holds org-wide VIEW of AiAgent and
+// OrganizationAiAgent but no MANAGE anywhere. Must NOT receive org-wide admin
+// reads (regression guard against the view-gated widening).
+const makeOrgViewerUser = (): SessionUser => ({
+    ...makeAdminUser(),
+    role: OrganizationMemberRole.MEMBER,
+    ability: new Ability<PossibleAbilities>([
+        {
+            action: 'view',
+            subject: 'AiAgent',
+            conditions: { organizationUuid: ORGANIZATION_UUID },
+        },
+        {
+            action: 'view',
+            subject: 'OrganizationAiAgent',
+            conditions: { organizationUuid: ORGANIZATION_UUID },
+        },
+    ]),
+});
+
+const makeService = ({
+    aiAgentModel = {},
+    aiAgentReviewClassifierModel = {},
+    aiAgentReviewClassifierService = {},
+    aiAgentReviewNotificationModel = {},
+    featureFlagService = {},
+    aiOrganizationSettingsService = {},
+    projectModel = {},
+    projectService = {},
+    schedulerClient = {},
+    githubAppInstallationsModel = {},
+    gitlabAppInstallationsModel = {},
+    aiAgentService = {},
+    pullRequestsModel = {},
+    writebackPreviewService = {},
+    jobModel = {},
+    userModel = {},
+    aiAgentReviewNotificationService = {},
+}: {
+    aiAgentModel?: Record<string, unknown>;
+    aiAgentReviewClassifierModel?: Record<string, unknown>;
+    aiAgentReviewClassifierService?: Record<string, unknown>;
+    aiAgentReviewNotificationModel?: Record<string, unknown>;
+    featureFlagService?: Record<string, unknown>;
+    aiOrganizationSettingsService?: Record<string, unknown>;
+    projectModel?: Record<string, unknown>;
+    projectService?: Record<string, unknown>;
+    schedulerClient?: Record<string, unknown>;
+    githubAppInstallationsModel?: Record<string, unknown>;
+    gitlabAppInstallationsModel?: Record<string, unknown>;
+    aiAgentService?: Record<string, unknown>;
+    pullRequestsModel?: Record<string, unknown>;
+    writebackPreviewService?: Record<string, unknown>;
+    jobModel?: Record<string, unknown>;
+    userModel?: Record<string, unknown>;
+    aiAgentReviewNotificationService?: Record<string, unknown>;
+} = {}) =>
+    new AiAgentAdminService({
+        analytics: { track: vi.fn() },
+        aiAgentModel: {
+            createWebAppThreadWithPrompt: vi.fn().mockResolvedValue({
+                threadUuid: PREVIEW_THREAD_UUID,
+                promptUuid: 'prompt-uuid-1',
+            }),
+            updateThreadTitle: vi.fn().mockResolvedValue(undefined),
+            ...aiAgentModel,
+        },
+        aiAgentReviewClassifierModel: {
+            getReviewRemediation: vi.fn().mockResolvedValue(makeRemediation()),
+            getReviewItem: vi
+                .fn()
+                .mockResolvedValue(makeReviewItem({ title: 'Review revenue' })),
+            setReviewRemediationPreviewThread: vi
+                .fn()
+                .mockResolvedValue(undefined),
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+            getPromotedFingerprintScope: vi.fn().mockResolvedValue({
+                projectUuid: PROJECT_UUID,
+                agentUuid: AGENT_UUID,
+            }),
+            getReviewItemScope: vi.fn().mockResolvedValue({
+                projectUuid: PROJECT_UUID,
+                agentUuid: AGENT_UUID,
+            }),
+            updateReviewItemWritebackProgress: vi
+                .fn()
+                .mockResolvedValue(undefined),
+            setReviewItemPrLink: vi.fn().mockResolvedValue(undefined),
+            setReviewRemediationPullRequest: vi
+                .fn()
+                .mockResolvedValue(undefined),
+            setReviewItemWritebackStatus: vi.fn().mockResolvedValue(undefined),
+            createRemediationEvent: vi.fn().mockResolvedValue(undefined),
+            listRemediationEvents: vi.fn().mockResolvedValue([]),
+            createReviewItemEvent: vi.fn().mockResolvedValue(undefined),
+            listReviewItemEvents: vi.fn().mockResolvedValue([]),
+            upsertReviewItemState: vi.fn().mockResolvedValue(undefined),
+            ensureReviewItemRow: vi.fn().mockResolvedValue(undefined),
+            getThreadWritebackPullRequests: vi
+                .fn()
+                .mockResolvedValue(
+                    new Map([
+                        [WORK_THREAD_UUID, [{ prUrl: PR_URL, createdAt: NOW }]],
+                    ]),
+                ),
+            findReviewRemediationByWorkThread: vi.fn().mockResolvedValue(null),
+            ...aiAgentReviewClassifierModel,
+        },
+        aiAgentReviewNotificationModel: {
+            getSettings: vi.fn().mockResolvedValue({
+                organizationUuid: ORGANIZATION_UUID,
+                enabled: false,
+                slackChannelId: null,
+            }),
+            upsertSettings: vi.fn().mockResolvedValue({
+                organizationUuid: ORGANIZATION_UUID,
+                enabled: true,
+                slackChannelId: 'C123',
+            }),
+            ...aiAgentReviewNotificationModel,
+        },
+        aiAgentReviewClassifierService: {
+            captureJudgeReplayInput: vi.fn().mockResolvedValue(null),
+            ...aiAgentReviewClassifierService,
+        },
+        featureFlagService: {
+            get: vi.fn().mockResolvedValue({ enabled: true }),
+            ...featureFlagService,
+        },
+        aiOrganizationSettingsService: {
+            isAiAgentReviewsEnabled: vi.fn().mockResolvedValue(true),
+            ...aiOrganizationSettingsService,
+        },
+        projectModel: {
+            get: vi.fn().mockRejectedValue(new Error('Project not found')),
+            getPreviewAiAgentUuid: vi
+                .fn()
+                .mockResolvedValue(PREVIEW_AGENT_UUID),
+            findExploresFromCache: vi.fn().mockResolvedValue({}),
+            getAllByOrganizationUuid: vi.fn().mockResolvedValue([]),
+            ...projectModel,
+        },
+        aiAgentService: {
+            generateAgentThreadResponse: vi
+                .fn()
+                .mockResolvedValue('Opened a pull request.'),
+            ...aiAgentService,
+        },
+        projectService: {
+            scheduleCompileProject: vi
+                .fn()
+                .mockResolvedValue({ jobUuid: COMPILE_JOB_UUID }),
+            ...projectService,
+        },
+        projectContextService: {},
+        pullRequestsModel: {
+            findByProjectAndUrl: vi
+                .fn()
+                .mockResolvedValue({ pullRequestUuid: 'pull-request-1' }),
+            ...pullRequestsModel,
+        },
+        writebackPreviewService: {
+            createPreviewForPullRequest: vi.fn().mockResolvedValue({
+                previewProjectUuid: PREVIEW_PROJECT_UUID,
+                previewUrl: `${SITE_URL}/projects/${PREVIEW_PROJECT_UUID}/home`,
+                compileJobUuid: COMPILE_JOB_UUID,
+            }),
+            ...writebackPreviewService,
+        },
+        jobModel: {
+            get: vi.fn().mockResolvedValue({ jobStatus: JobStatusType.DONE }),
+            ...jobModel,
+        },
+        githubAppInstallationsModel: {
+            getInstallationId: vi.fn().mockResolvedValue('installation-1'),
+            findInstallationId: vi.fn().mockResolvedValue(undefined),
+            ...githubAppInstallationsModel,
+        },
+        gitlabAppInstallationsModel: {
+            findInstallationId: vi.fn().mockResolvedValue(undefined),
+            ...gitlabAppInstallationsModel,
+        },
+        schedulerClient: {
+            aiAgentReviewRemediationPreview: vi
+                .fn()
+                .mockResolvedValue(undefined),
+            aiAgentReviewRemediationCompile: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+            aiAgentReviewRemediationRun: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+            ...schedulerClient,
+        },
+        userModel: {
+            findSessionUserByUUID: vi.fn().mockResolvedValue(makeAdminUser()),
+            getUserDetailsByUuid: vi
+                .fn()
+                .mockResolvedValue({ organizationUuid: ORGANIZATION_UUID }),
+            ...userModel,
+        },
+        aiAgentReviewNotificationService: {
+            notifyAssigned: vi.fn().mockResolvedValue(undefined),
+            ...aiAgentReviewNotificationService,
+        },
+        lightdashConfig: {
+            siteUrl: SITE_URL,
+            appRuntime: { e2bApiKey: 'e2b-api-key' },
+            aiWriteback: { anthropicApiKey: 'anthropic-api-key' },
+        },
+    } as unknown as ConstructorParameters<typeof AiAgentAdminService>[0]);
+
+describe('AiAgentAdminService.getPromptActivity', () => {
+    it('delegates to the model with bounded days', async () => {
+        const findAdminPromptActivity = vi.fn().mockResolvedValue([
+            { date: '2026-06-01', promptCount: 2 },
+            { date: '2026-06-02', promptCount: 0 },
+        ]);
+        const service = makeService({
+            aiAgentModel: { findAdminPromptActivity },
+        });
+
+        await expect(
+            service.getPromptActivity(makeAdminUser(), PROJECT_UUID, 100),
+        ).resolves.toEqual([
+            { date: '2026-06-01', promptCount: 2 },
+            { date: '2026-06-02', promptCount: 0 },
+        ]);
+
+        expect(findAdminPromptActivity).toHaveBeenCalledWith({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            days: 30,
+        });
+    });
+
+    it('rejects non-admin users', async () => {
+        const findAdminPromptActivity = vi.fn();
+        const service = makeService({
+            aiAgentModel: { findAdminPromptActivity },
+        });
+        const user = {
+            ...makeAdminUser(),
+            ability: new Ability<PossibleAbilities>([]),
+        };
+
+        await expect(
+            service.getPromptActivity(user, PROJECT_UUID, 14),
+        ).rejects.toThrow(
+            'Insufficient permissions to access AI agent features',
+        );
+        expect(findAdminPromptActivity).not.toHaveBeenCalled();
+    });
+});
+
+describe('AiAgentAdminService review access', () => {
+    it('allows developers with manage:AiAgent to access reviews', async () => {
+        const listReviewSignals = vi.fn().mockResolvedValue([]);
+        const service = makeService({
+            aiAgentReviewClassifierModel: { listReviewSignals },
+        });
+
+        await expect(
+            service.listReviewSignals(makeDeveloperUser()),
+        ).resolves.toEqual([]);
+        expect(listReviewSignals).toHaveBeenCalledWith({
+            organizationUuid: ORGANIZATION_UUID,
+        });
+    });
+
+    it('forbids users without manage:AiAgent from reviews', async () => {
+        const listReviewSignals = vi.fn();
+        const service = makeService({
+            aiAgentReviewClassifierModel: { listReviewSignals },
+        });
+        const user = {
+            ...makeAdminUser(),
+            role: OrganizationMemberRole.DEVELOPER,
+            ability: new Ability<PossibleAbilities>([]),
+        };
+
+        await expect(service.listReviewSignals(user)).rejects.toThrow(
+            'Insufficient permissions to access AI agent reviews',
+        );
+        expect(listReviewSignals).not.toHaveBeenCalled();
+    });
+});
+
+describe('AiAgentAdminService.captureReviewReplayInputs', () => {
+    it('rejects when the feature flag is disabled', async () => {
+        const service = makeService({
+            featureFlagService: {
+                get: vi.fn().mockResolvedValue({ enabled: false }),
+            },
+        });
+
+        await expect(
+            service.captureReviewReplayInputs(makeAdminUser(), {
+                signalUuids: ['signal-1'],
+            }),
+        ).rejects.toThrow('Review replay capture is not enabled');
+    });
+
+    it('rejects non org admins', async () => {
+        const service = makeService();
+
+        await expect(
+            service.captureReviewReplayInputs(makeDeveloperUser(), {
+                signalUuids: ['signal-1'],
+            }),
+        ).rejects.toThrow();
+    });
+
+    it('rejects batches over 20 signals', async () => {
+        const service = makeService();
+
+        await expect(
+            service.captureReviewReplayInputs(makeAdminUser(), {
+                signalUuids: Array.from({ length: 21 }, (_, i) => `s-${i}`),
+            }),
+        ).rejects.toThrow('at most 20 signals');
+    });
+
+    it('returns a per-entry error for malformed uuids without querying them', async () => {
+        const findTurnSignalSubjects = vi.fn().mockResolvedValue([]);
+        const service = makeService({
+            aiAgentReviewClassifierModel: { findTurnSignalSubjects },
+        });
+
+        const results = await service.captureReviewReplayInputs(
+            makeAdminUser(),
+            { signalUuids: ['not-a-uuid'] },
+        );
+
+        expect(findTurnSignalSubjects).not.toHaveBeenCalled();
+        expect(results).toEqual([
+            {
+                signalUuid: 'not-a-uuid',
+                promptUuid: null,
+                threadUuid: null,
+                captureError: 'invalid signal uuid',
+                input: null,
+            },
+        ]);
+    });
+
+    it('resolves signals to prompts and returns captured inputs', async () => {
+        const replayInput = { candidate: {}, evidencePacket: {} };
+        const captureJudgeReplayInput = vi.fn().mockResolvedValue(replayInput);
+        const findTurnSignalSubjects = vi.fn().mockResolvedValue([
+            {
+                signalUuid: '11111111-1111-4111-8111-111111111111',
+                promptUuid: 'prompt-1',
+                threadUuid: 'thread-1',
+            },
+        ]);
+        const service = makeService({
+            aiAgentReviewClassifierModel: { findTurnSignalSubjects },
+            aiAgentReviewClassifierService: { captureJudgeReplayInput },
+        });
+
+        const results = await service.captureReviewReplayInputs(
+            makeAdminUser(),
+            {
+                signalUuids: [
+                    '11111111-1111-4111-8111-111111111111',
+                    '22222222-2222-4222-8222-222222222222',
+                ],
+            },
+        );
+
+        expect(findTurnSignalSubjects).toHaveBeenCalledWith({
+            organizationUuid: ORGANIZATION_UUID,
+            signalUuids: [
+                '11111111-1111-4111-8111-111111111111',
+                '22222222-2222-4222-8222-222222222222',
+            ],
+        });
+        expect(captureJudgeReplayInput).toHaveBeenCalledWith({
+            organizationUuid: ORGANIZATION_UUID,
+            promptUuid: 'prompt-1',
+        });
+        expect(results).toEqual([
+            {
+                signalUuid: '11111111-1111-4111-8111-111111111111',
+                promptUuid: 'prompt-1',
+                threadUuid: 'thread-1',
+                captureError: null,
+                input: replayInput,
+            },
+            {
+                signalUuid: '22222222-2222-4222-8222-222222222222',
+                promptUuid: null,
+                threadUuid: null,
+                captureError: 'signal not found',
+                input: null,
+            },
+        ]);
+    });
+});
+
+describe('AiAgentAdminService.updateReviewItemAssignee', () => {
+    it('notifies the assignee after the model write succeeds', async () => {
+        const notifyAssigned = vi.fn().mockResolvedValue(undefined);
+        const updateReviewItemAssignee = vi.fn().mockResolvedValue(undefined);
+        const service = makeService({
+            aiAgentReviewClassifierModel: {
+                updateReviewItemAssignee,
+                getReviewItem: vi.fn().mockResolvedValue(
+                    makeReviewItem({
+                        organizationUuid: ORGANIZATION_UUID,
+                        projectUuid: PROJECT_UUID,
+                    }),
+                ),
+            },
+            aiAgentReviewNotificationService: { notifyAssigned },
+        });
+
+        await service.updateReviewItemAssignee(
+            makeDeveloperUser(),
+            'fingerprint-1',
+            'user-2',
+        );
+
+        expect(notifyAssigned).toHaveBeenCalledWith({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            fingerprint: 'fingerprint-1',
+            assigneeUserUuid: 'user-2',
+            actorUserUuid: USER_UUID,
+        });
+    });
+});
+
+describe('AiAgentAdminService issue activity', () => {
+    it('records status_changed only when the status actually changes', async () => {
+        const createReviewItemEvent = vi.fn().mockResolvedValue(undefined);
+        const service = makeService({
+            aiAgentReviewClassifierModel: {
+                createReviewItemEvent,
+                getReviewItem: vi
+                    .fn()
+                    .mockResolvedValue(makeReviewItem({ status: 'open' })),
+            },
+        });
+
+        await service.updateReviewItemStatus(makeAdminUser(), 'fingerprint-1', {
+            status: 'in_progress',
+            dismissedReason: null,
+        });
+
+        expect(createReviewItemEvent).toHaveBeenCalledWith(
+            expect.objectContaining({
+                fingerprint: 'fingerprint-1',
+                event: expect.objectContaining({
+                    eventType: 'status_changed',
+                }),
+                createdByUserUuid: USER_UUID,
+            }),
+        );
+    });
+
+    it('does not record status_changed when the status is unchanged', async () => {
+        const createReviewItemEvent = vi.fn().mockResolvedValue(undefined);
+        const service = makeService({
+            aiAgentReviewClassifierModel: {
+                createReviewItemEvent,
+                getReviewItem: vi
+                    .fn()
+                    .mockResolvedValue(makeReviewItem({ status: 'open' })),
+            },
+        });
+
+        await service.updateReviewItemStatus(makeAdminUser(), 'fingerprint-1', {
+            status: 'open',
+            dismissedReason: null,
+        });
+
+        expect(createReviewItemEvent).not.toHaveBeenCalledWith(
+            expect.objectContaining({
+                event: expect.objectContaining({
+                    eventType: 'status_changed',
+                }),
+            }),
+        );
+    });
+
+    it('records assignee_changed when the assignee changes', async () => {
+        const createReviewItemEvent = vi.fn().mockResolvedValue(undefined);
+        const service = makeService({
+            aiAgentReviewClassifierModel: {
+                createReviewItemEvent,
+                updateReviewItemAssignee: vi.fn().mockResolvedValue(undefined),
+                getReviewItem: vi
+                    .fn()
+                    .mockResolvedValue(
+                        makeReviewItem({ assignedToUserUuid: null }),
+                    ),
+            },
+        });
+
+        await service.updateReviewItemAssignee(
+            makeAdminUser(),
+            'fingerprint-1',
+            'user-2',
+        );
+
+        expect(createReviewItemEvent).toHaveBeenCalledWith(
+            expect.objectContaining({
+                fingerprint: 'fingerprint-1',
+                event: expect.objectContaining({
+                    eventType: 'assignee_changed',
+                }),
+                createdByUserUuid: USER_UUID,
+            }),
+        );
+    });
+
+    it('merges issue + remediation events sorted by occurredAt', async () => {
+        const service = makeService({
+            aiAgentReviewClassifierModel: {
+                getReviewItem: vi
+                    .fn()
+                    .mockResolvedValue(
+                        makeReviewItem({ remediation: makeRemediation() }),
+                    ),
+                listReviewItemEvents: vi.fn().mockResolvedValue([
+                    {
+                        uuid: 'i1',
+                        fingerprint: 'fingerprint-1',
+                        occurredAt: new Date('2026-06-24T09:00:00Z'),
+                        createdByUserUuid: 'u1',
+                        eventType: 'created',
+                        payload: { rootCause: 'semantic_layer' },
+                    },
+                ]),
+                listRemediationEvents: vi.fn().mockResolvedValue([
+                    {
+                        uuid: 'r1',
+                        remediationUuid: REMEDIATION_UUID,
+                        occurredAt: new Date('2026-06-24T10:00:00Z'),
+                        createdByUserUuid: null,
+                        eventType: 'pr_opened',
+                        payload: { prUrl: 'x', prNumber: 1 },
+                    },
+                ]),
+            },
+        });
+
+        const activity = await service.getReviewItemActivity(
+            makeAdminUser(),
+            'fingerprint-1',
+        );
+
+        expect(activity.events.map((e) => [e.kind, e.eventType])).toEqual([
+            ['issue', 'created'],
+            ['remediation', 'pr_opened'],
+        ]);
+    });
+
+    it('returns issue events even with no remediation', async () => {
+        const service = makeService({
+            aiAgentReviewClassifierModel: {
+                getReviewItem: vi
+                    .fn()
+                    .mockResolvedValue(makeReviewItem({ remediation: null })),
+                listReviewItemEvents: vi.fn().mockResolvedValue([
+                    {
+                        uuid: 'i1',
+                        fingerprint: 'fingerprint-1',
+                        occurredAt: new Date('2026-06-24T09:00:00Z'),
+                        createdByUserUuid: 'u1',
+                        eventType: 'status_changed',
+                        payload: {
+                            from: 'open',
+                            to: 'resolved',
+                            dismissedReason: null,
+                        },
+                    },
+                ]),
+            },
+        });
+
+        const activity = await service.getReviewItemActivity(
+            makeAdminUser(),
+            'fingerprint-1',
+        );
+
+        expect(activity.events).toHaveLength(1);
+        expect(activity.events[0].kind).toBe('issue');
+        expect(activity.liveState).toBeNull();
+    });
+});
+
+describe('AiAgentAdminService review notification settings', () => {
+    it('allows developers to read settings', async () => {
+        const getSettings = vi.fn().mockResolvedValue({
+            organizationUuid: ORGANIZATION_UUID,
+            enabled: true,
+            slackChannelId: 'C123',
+        });
+        const service = makeService({
+            aiAgentReviewNotificationModel: { getSettings },
+        });
+
+        await expect(
+            service.getReviewNotificationSettings(makeDeveloperUser()),
+        ).resolves.toEqual({
+            organizationUuid: ORGANIZATION_UUID,
+            enabled: true,
+            slackChannelId: 'C123',
+        });
+        expect(getSettings).toHaveBeenCalledWith(ORGANIZATION_UUID);
+    });
+
+    it('forbids developers from updating settings', async () => {
+        const upsertSettings = vi.fn();
+        const service = makeService({
+            aiAgentReviewNotificationModel: { upsertSettings },
+        });
+
+        await expect(
+            service.updateReviewNotificationSettings(makeDeveloperUser(), {
+                enabled: true,
+                slackChannelId: 'C123',
+            }),
+        ).rejects.toThrow(
+            'Insufficient permissions to access organization-wide AI agent data',
+        );
+        expect(upsertSettings).not.toHaveBeenCalled();
+    });
+});
+
+describe('getAiAgentReviewItemWritebackEligibility', () => {
+    it('allows semantic layer writeback on GitHub when configured', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem(),
+                reviewsEnabled: true,
+                projectContextEnabled: false,
+                projectAccess: {
+                    provider: PullRequestProvider.GITHUB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: true,
+                sourceThreadHasWritebackPr: false,
+            }),
+        ).toEqual({
+            eligible: true,
+            provider: PullRequestProvider.GITHUB,
+            strategy: 'semantic_layer',
+            reason: null,
+        });
+    });
+
+    it('allows semantic layer writeback on GitLab when configured', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem(),
+                reviewsEnabled: true,
+                projectContextEnabled: false,
+                projectAccess: {
+                    provider: PullRequestProvider.GITLAB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: true,
+                sourceThreadHasWritebackPr: false,
+            }),
+        ).toEqual({
+            eligible: true,
+            provider: PullRequestProvider.GITLAB,
+            strategy: 'semantic_layer',
+            reason: null,
+        });
+    });
+
+    it('allows manual project context writeback without a generated finding entry', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem({
+                    source: 'manual',
+                    latestFinding: null,
+                    findingCount: 0,
+                    primaryRootCause: 'project_context',
+                }),
+                reviewsEnabled: true,
+                projectContextEnabled: true,
+                projectAccess: {
+                    provider: PullRequestProvider.GITHUB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: false,
+                sourceThreadHasWritebackPr: false,
+            }),
+        ).toEqual({
+            eligible: true,
+            provider: PullRequestProvider.GITHUB,
+            strategy: 'project_context',
+            reason: null,
+        });
+    });
+
+    it('blocks writeback when no agent is linked', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem({ agentUuid: null }),
+                reviewsEnabled: true,
+                projectContextEnabled: false,
+                projectAccess: {
+                    provider: PullRequestProvider.GITHUB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: true,
+                sourceThreadHasWritebackPr: false,
+            }),
+        ).toEqual({
+            eligible: false,
+            provider: null,
+            strategy: 'semantic_layer',
+            reason: 'missing_agent',
+        });
+    });
+
+    it('blocks project context writeback for GitLab projects', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem({
+                    primaryRootCause: 'project_context',
+                    latestFinding: {
+                        uuid: 'finding-1',
+                        promptUuid: 'prompt-1',
+                        threadUuid: 'thread-1',
+                        projectUuid: 'project-1',
+                        agentUuid: 'agent-1',
+                        subcategories: [],
+                        fixTargets: ['project_context_rule'],
+                        targetRefs: [],
+                        evidenceExcerpts: [],
+                        recommendation: null,
+                        projectContextEntry: {
+                            op: 'create',
+                            id: null,
+                            kind: 'context',
+                            content: 'Use orders for revenue questions.',
+                            terms: ['revenue'],
+                            objects: [{ type: 'explore', name: 'orders' }],
+                        },
+                        createdAt: NOW,
+                    },
+                }),
+                reviewsEnabled: true,
+                projectContextEnabled: true,
+                projectAccess: {
+                    provider: PullRequestProvider.GITLAB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: false,
+                sourceThreadHasWritebackPr: false,
+            }),
+        ).toEqual({
+            eligible: false,
+            provider: PullRequestProvider.GITLAB,
+            strategy: 'project_context',
+            reason: 'unsupported_source_control',
+        });
+    });
+
+    it('returns a reason when semantic writeback config is missing', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem(),
+                reviewsEnabled: true,
+                projectContextEnabled: false,
+                projectAccess: {
+                    provider: PullRequestProvider.GITHUB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: false,
+                sourceThreadHasWritebackPr: false,
+            }),
+        ).toEqual({
+            eligible: false,
+            provider: PullRequestProvider.GITHUB,
+            strategy: 'semantic_layer',
+            reason: 'missing_writeback_config',
+        });
+    });
+
+    it('blocks writeback when an active remediation exists', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem({
+                    remediation: {
+                        uuid: 'remediation-1',
+                        fingerprint: 'fingerprint-1',
+                        organizationUuid: 'org-1',
+                        sourceFindingUuid: 'finding-1',
+                        sourcePromptUuid: 'prompt-1',
+                        sourceThreadUuid: 'thread-1',
+                        sourceProjectUuid: 'project-1',
+                        sourceAgentUuid: 'agent-1',
+                        workThreadUuid: null,
+                        pullRequestUuid: null,
+                        linkedPrUrl: null,
+                        previewProjectUuid: null,
+                        previewAgentUuid: null,
+                        previewThreadUuid: null,
+                        status: 'pr_open',
+                        errorMessage: null,
+                        retryPrompt: 'Show revenue',
+                        createdByUserUuid: null,
+                        resolvedByUserUuid: null,
+                        resolvedAt: null,
+                        createdAt: NOW,
+                        updatedAt: NOW,
+                    },
+                }),
+                reviewsEnabled: true,
+                projectContextEnabled: false,
+                projectAccess: {
+                    provider: PullRequestProvider.GITHUB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: true,
+                sourceThreadHasWritebackPr: false,
+            }),
+        ).toEqual({
+            eligible: false,
+            provider: null,
+            strategy: null,
+            reason: 'writeback_in_progress',
+        });
+    });
+
+    it('blocks writeback when the source thread already opened a PR', () => {
+        expect(
+            getAiAgentReviewItemWritebackEligibility({
+                item: makeReviewItem(),
+                reviewsEnabled: true,
+                projectContextEnabled: false,
+                projectAccess: {
+                    provider: PullRequestProvider.GITHUB,
+                    hasGitAppInstallation: true,
+                },
+                hasSemanticWritebackConfig: true,
+                sourceThreadHasWritebackPr: true,
+            }),
+        ).toEqual({
+            eligible: false,
+            provider: null,
+            strategy: null,
+            reason: 'source_thread_writeback_exists',
+        });
+    });
+});
+
+describe('AiAgentAdminService.updateReviewItemStatus', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('resolves the linked remediation when the review item is resolved', async () => {
+        const resolvedReviewItem = makeReviewItem({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            agentUuid: AGENT_UUID,
+            status: 'resolved',
+            remediation: makeRemediation({ status: 'pr_open' }),
+        });
+        const aiAgentReviewClassifierModel = {
+            getPromotedFingerprintScope: vi.fn().mockResolvedValue({
+                projectUuid: PROJECT_UUID,
+                agentUuid: AGENT_UUID,
+            }),
+            getReviewItemScope: vi.fn().mockResolvedValue({
+                projectUuid: PROJECT_UUID,
+                agentUuid: AGENT_UUID,
+            }),
+            getReviewItem: vi
+                .fn()
+                .mockResolvedValueOnce(
+                    makeReviewItem({
+                        organizationUuid: ORGANIZATION_UUID,
+                        projectUuid: PROJECT_UUID,
+                        agentUuid: AGENT_UUID,
+                        status: 'open',
+                    }),
+                )
+                .mockResolvedValue(resolvedReviewItem),
+            upsertReviewItemState: vi.fn().mockResolvedValue(undefined),
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({ aiAgentReviewClassifierModel });
+
+        await service.updateReviewItemStatus(makeAdminUser(), 'fingerprint-1', {
+            status: 'resolved',
+            dismissedReason: null,
+        });
+
+        expect(
+            aiAgentReviewClassifierModel.updateReviewRemediationStatus,
+        ).toHaveBeenCalledWith({
+            remediationUuid: REMEDIATION_UUID,
+            organizationUuid: ORGANIZATION_UUID,
+            status: 'resolved',
+            resolvedByUserUuid: USER_UUID,
+        });
+    });
+});
+
+describe('AiAgentAdminService.pollReviewRemediationPreview', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('creates a seeded preview work thread and links it to the remediation', async () => {
+        const aiAgentModel = {
+            createWebAppThreadWithPrompt: vi.fn().mockResolvedValue({
+                threadUuid: PREVIEW_THREAD_UUID,
+                promptUuid: 'prompt-uuid-1',
+            }),
+            updateThreadTitle: vi.fn().mockResolvedValue(undefined),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationRun: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+        };
+        const aiAgentReviewClassifierModel = {
+            getReviewRemediation: vi.fn().mockResolvedValue(makeRemediation()),
+            getReviewItem: vi
+                .fn()
+                .mockResolvedValue(makeReviewItem({ title: 'Review revenue' })),
+            setReviewRemediationPreviewThread: vi
+                .fn()
+                .mockResolvedValue(undefined),
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const projectModel = {
+            getPreviewAiAgentUuid: vi
+                .fn()
+                .mockResolvedValue(PREVIEW_AGENT_UUID),
+        };
+        const service = makeService({
+            aiAgentModel,
+            aiAgentReviewClassifierModel,
+            projectModel,
+            schedulerClient,
+        });
+        (getPullRequestComments as import('vitest').Mock).mockResolvedValue([
+            `Preview ready: ${SITE_URL}/projects/${PREVIEW_PROJECT_UUID}/tables`,
+        ]);
+
+        await service.pollReviewRemediationPreview({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            userUuid: USER_UUID,
+            fingerprint: 'fingerprint-1',
+            remediationUuid: REMEDIATION_UUID,
+            prUrl: 'https://github.com/acme/dbt/pull/42',
+            startedAt: Date.now(),
+        });
+
+        expect(projectModel.getPreviewAiAgentUuid).toHaveBeenCalledWith({
+            projectUuid: PROJECT_UUID,
+            previewProjectUuid: PREVIEW_PROJECT_UUID,
+            aiAgentUuid: AGENT_UUID,
+        });
+        expect(aiAgentModel.createWebAppThreadWithPrompt).toHaveBeenCalledWith({
+            thread: {
+                organizationUuid: ORGANIZATION_UUID,
+                projectUuid: PREVIEW_PROJECT_UUID,
+                userUuid: USER_UUID,
+                createdFrom: 'web_app',
+                agentUuid: PREVIEW_AGENT_UUID,
+            },
+            prompt: {
+                createdByUserUuid: USER_UUID,
+                prompt: expect.stringContaining(
+                    "Re-run the user's original question",
+                ),
+                context: [
+                    {
+                        type: 'thread',
+                        threadUuid: THREAD_UUID,
+                        promptUuid: PROMPT_UUID,
+                    },
+                ],
+            },
+        });
+        expect(aiAgentModel.updateThreadTitle).toHaveBeenCalledWith({
+            threadUuid: PREVIEW_THREAD_UUID,
+            title: 'Review fix: Review revenue',
+        });
+        expect(
+            aiAgentReviewClassifierModel.setReviewRemediationPreviewThread,
+        ).toHaveBeenCalledWith({
+            remediationUuid: REMEDIATION_UUID,
+            organizationUuid: ORGANIZATION_UUID,
+            previewProjectUuid: PREVIEW_PROJECT_UUID,
+            previewAgentUuid: PREVIEW_AGENT_UUID,
+            previewThreadUuid: PREVIEW_THREAD_UUID,
+        });
+        expect(
+            schedulerClient.aiAgentReviewRemediationRun,
+        ).toHaveBeenCalledWith({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PREVIEW_PROJECT_UUID,
+            userUuid: USER_UUID,
+            fingerprint: 'fingerprint-1',
+            remediationUuid: REMEDIATION_UUID,
+            agentUuid: PREVIEW_AGENT_UUID,
+            threadUuid: PREVIEW_THREAD_UUID,
+        });
+    });
+
+    it('falls back to the flagged prompt text when the verification prompt fails to seed', async () => {
+        const aiAgentModel = {
+            createWebAppThreadWithPrompt: vi
+                .fn()
+                .mockRejectedValueOnce(new Error('context insert failed'))
+                .mockResolvedValue({
+                    threadUuid: PREVIEW_THREAD_UUID,
+                    promptUuid: 'prompt-uuid-1',
+                }),
+            updateThreadTitle: vi.fn().mockResolvedValue(undefined),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationRun: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+        };
+        const service = makeService({ aiAgentModel, schedulerClient });
+        (getPullRequestComments as import('vitest').Mock).mockResolvedValue([
+            `Preview ready: ${SITE_URL}/projects/${PREVIEW_PROJECT_UUID}/tables`,
+        ]);
+
+        await service.pollReviewRemediationPreview({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            userUuid: USER_UUID,
+            fingerprint: 'fingerprint-1',
+            remediationUuid: REMEDIATION_UUID,
+            prUrl: 'https://github.com/acme/dbt/pull/42',
+            startedAt: Date.now(),
+        });
+
+        expect(
+            aiAgentModel.createWebAppThreadWithPrompt,
+        ).toHaveBeenLastCalledWith({
+            thread: expect.objectContaining({
+                projectUuid: PREVIEW_PROJECT_UUID,
+            }),
+            prompt: {
+                createdByUserUuid: USER_UUID,
+                prompt: 'Show revenue',
+            },
+        });
+        expect(schedulerClient.aiAgentReviewRemediationRun).toHaveBeenCalled();
+    });
+
+    it('links no preview thread when seeding fails and there is no retry prompt', async () => {
+        const aiAgentModel = {
+            createWebAppThreadWithPrompt: vi
+                .fn()
+                .mockRejectedValue(new Error('context insert failed')),
+            updateThreadTitle: vi.fn().mockResolvedValue(undefined),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationRun: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+        };
+        const aiAgentReviewClassifierModel = {
+            getReviewRemediation: vi
+                .fn()
+                .mockResolvedValue(makeRemediation({ retryPrompt: null })),
+            getReviewItem: vi
+                .fn()
+                .mockResolvedValue(makeReviewItem({ title: 'Review revenue' })),
+            setReviewRemediationPreviewThread: vi
+                .fn()
+                .mockResolvedValue(undefined),
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            aiAgentModel,
+            aiAgentReviewClassifierModel,
+            schedulerClient,
+        });
+        (getPullRequestComments as import('vitest').Mock).mockResolvedValue([
+            `Preview ready: ${SITE_URL}/projects/${PREVIEW_PROJECT_UUID}/tables`,
+        ]);
+
+        await service.pollReviewRemediationPreview({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            userUuid: USER_UUID,
+            fingerprint: 'fingerprint-1',
+            remediationUuid: REMEDIATION_UUID,
+            prUrl: 'https://github.com/acme/dbt/pull/42',
+            startedAt: Date.now(),
+        });
+
+        expect(
+            aiAgentReviewClassifierModel.setReviewRemediationPreviewThread,
+        ).not.toHaveBeenCalled();
+        expect(aiAgentModel.createWebAppThreadWithPrompt).toHaveBeenCalledTimes(
+            1,
+        );
+        expect(
+            schedulerClient.aiAgentReviewRemediationRun,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('marks remediation failed when no preview URL is published in time', async () => {
+        const aiAgentReviewClassifierModel = {
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationPreview: vi
+                .fn()
+                .mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            aiAgentReviewClassifierModel,
+            schedulerClient,
+        });
+
+        await service.pollReviewRemediationPreview({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            userUuid: USER_UUID,
+            fingerprint: 'fingerprint-1',
+            remediationUuid: REMEDIATION_UUID,
+            prUrl: 'https://github.com/acme/dbt/pull/42',
+            startedAt: Date.now() - 11 * 60_000,
+        });
+
+        expect(
+            aiAgentReviewClassifierModel.updateReviewRemediationStatus,
+        ).toHaveBeenCalledWith({
+            remediationUuid: REMEDIATION_UUID,
+            organizationUuid: ORGANIZATION_UUID,
+            status: 'failed',
+            errorMessage: 'Preview URL was not published in time',
+        });
+        expect(
+            schedulerClient.aiAgentReviewRemediationPreview,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('instructs the verification agent to stay on governed explores', async () => {
+        const aiAgentModel = {
+            createWebAppThreadWithPrompt: vi.fn().mockResolvedValue({
+                threadUuid: PREVIEW_THREAD_UUID,
+                promptUuid: 'prompt-uuid-1',
+            }),
+            updateThreadTitle: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({ aiAgentModel });
+        (getPullRequestComments as import('vitest').Mock).mockResolvedValue([
+            `Preview ready: ${SITE_URL}/projects/${PREVIEW_PROJECT_UUID}/tables`,
+        ]);
+
+        await service.pollReviewRemediationPreview({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PROJECT_UUID,
+            userUuid: USER_UUID,
+            fingerprint: 'fingerprint-1',
+            remediationUuid: REMEDIATION_UUID,
+            prUrl: PR_URL,
+            startedAt: Date.now(),
+        });
+
+        expect(aiAgentModel.createWebAppThreadWithPrompt).toHaveBeenCalledWith(
+            expect.objectContaining({
+                prompt: expect.objectContaining({
+                    prompt: expect.stringContaining(
+                        'do not fall back to raw SQL',
+                    ),
+                }),
+            }),
+        );
+    });
+});
+
+describe('AiAgentAdminService.getReviewItemActivity', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    const makeEvent = (eventType: string, payload = {}) => ({
+        uuid: `event-${eventType}`,
+        remediationUuid: REMEDIATION_UUID,
+        eventType,
+        occurredAt: NOW,
+        payload,
+        createdByUserUuid: null,
+    });
+
+    it('returns a writeback live state with the live progress message', async () => {
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi.fn().mockResolvedValue(
+                makeReviewItem({
+                    prWritebackMessage: 'Reading payments.yml',
+                    remediation: makeRemediation({ status: 'running' }),
+                }),
+            ),
+            listRemediationEvents: vi
+                .fn()
+                .mockResolvedValue([makeEvent('finding_opened')]),
+        };
+        const service = makeService({ aiAgentReviewClassifierModel });
+
+        const activity = await service.getReviewItemActivity(
+            makeAdminUser(),
+            'fingerprint-1',
+        );
+
+        expect(activity.liveState).toBe('writeback');
+        expect(activity.liveMessage).toBe('Reading payments.yml');
+    });
+
+    it('returns events with a compiling live state before the preview compiles', async () => {
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi.fn().mockResolvedValue(
+                makeReviewItem({
+                    remediation: makeRemediation({ status: 'pr_open' }),
+                }),
+            ),
+            listRemediationEvents: vi
+                .fn()
+                .mockResolvedValue([
+                    makeEvent('finding_opened'),
+                    makeEvent('pr_opened'),
+                ]),
+        };
+        const service = makeService({ aiAgentReviewClassifierModel });
+
+        const activity = await service.getReviewItemActivity(
+            makeAdminUser(),
+            'fingerprint-1',
+        );
+
+        expect(activity.events).toHaveLength(2);
+        expect(activity.liveState).toBe('compiling');
+    });
+
+    it('returns a verifying live state after the preview compiles', async () => {
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi.fn().mockResolvedValue(
+                makeReviewItem({
+                    remediation: makeRemediation({ status: 'preview_ready' }),
+                }),
+            ),
+            listRemediationEvents: vi
+                .fn()
+                .mockResolvedValue([
+                    makeEvent('finding_opened'),
+                    makeEvent('pr_opened'),
+                    makeEvent('preview_compiled'),
+                ]),
+        };
+        const service = makeService({ aiAgentReviewClassifierModel });
+
+        const activity = await service.getReviewItemActivity(
+            makeAdminUser(),
+            'fingerprint-1',
+        );
+
+        expect(activity.liveState).toBe('verifying');
+    });
+
+    it('returns no live state once verification completed or remediation is terminal', async () => {
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi.fn().mockResolvedValue(
+                makeReviewItem({
+                    remediation: makeRemediation({ status: 'resolved' }),
+                }),
+            ),
+            listRemediationEvents: vi
+                .fn()
+                .mockResolvedValue([
+                    makeEvent('pr_opened'),
+                    makeEvent('preview_compiled'),
+                    makeEvent('verification_completed'),
+                    makeEvent('resolved'),
+                ]),
+        };
+        const service = makeService({ aiAgentReviewClassifierModel });
+
+        const activity = await service.getReviewItemActivity(
+            makeAdminUser(),
+            'fingerprint-1',
+        );
+
+        expect(activity.liveState).toBeNull();
+    });
+
+    it('returns an empty feed when the item has no remediation', async () => {
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi
+                .fn()
+                .mockResolvedValue(makeReviewItem({ remediation: null })),
+            listRemediationEvents: vi.fn(),
+            listReviewItemEvents: vi.fn().mockResolvedValue([]),
+        };
+        const service = makeService({ aiAgentReviewClassifierModel });
+
+        const activity = await service.getReviewItemActivity(
+            makeAdminUser(),
+            'fingerprint-1',
+        );
+
+        expect(activity).toEqual({
+            events: [],
+            liveState: null,
+            liveMessage: null,
+            verdictStale: false,
+        });
+        expect(
+            aiAgentReviewClassifierModel.listReviewItemEvents,
+        ).toHaveBeenCalledWith({
+            organizationUuid: ORGANIZATION_UUID,
+            fingerprint: 'fingerprint-1',
+        });
+    });
+});
+
+describe('AiAgentAdminService project-scoped read access', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    const projectModel = {
+        getAllByOrganizationUuid: vi
+            .fn()
+            .mockResolvedValue([
+                { projectUuid: PROJECT_UUID },
+                { projectUuid: OTHER_PROJECT_UUID },
+            ]),
+    };
+
+    it('lets a project-scoped user read an item in a project they can access', async () => {
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi
+                .fn()
+                .mockResolvedValue(
+                    makeReviewItem({ projectUuid: PROJECT_UUID }),
+                ),
+            listRemediationEvents: vi.fn().mockResolvedValue([]),
+        };
+        const service = makeService({
+            aiAgentReviewClassifierModel,
+            projectModel,
+        });
+
+        // No remediation → empty feed, but the per-item project check passes.
+        const activity = await service.getReviewItemActivity(
+            makeProjectUser(),
+            'fingerprint-1',
+        );
+        expect(activity.events).toEqual([]);
+    });
+
+    it('forbids a project-scoped user from an item in another project', async () => {
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi
+                .fn()
+                .mockResolvedValue(
+                    makeReviewItem({ projectUuid: OTHER_PROJECT_UUID }),
+                ),
+        };
+        const service = makeService({
+            aiAgentReviewClassifierModel,
+            projectModel,
+        });
+
+        await expect(
+            service.getReviewItemActivity(makeProjectUser(), 'fingerprint-1'),
+        ).rejects.toThrow(
+            'Insufficient permissions to access this AI agent resource',
+        );
+    });
+
+    it('forbids a user with no AI access at all', async () => {
+        const service = makeService({ projectModel });
+        const user = {
+            ...makeAdminUser(),
+            ability: new Ability<PossibleAbilities>([]),
+        };
+
+        await expect(
+            service.getReviewItemActivity(user, 'fingerprint-1'),
+        ).rejects.toThrow(
+            'Insufficient permissions to access AI agent features',
+        );
+    });
+
+    it('forbids an org view-only principal (no widening to interactive_viewer)', async () => {
+        // Holds org-wide view:AiAgent + view:OrganizationAiAgent but no manage.
+        // resolveReadScope gates on manage, so this principal must be denied
+        // rather than handed {kind:'all'} cross-project admin reads.
+        const service = makeService({ projectModel });
+
+        await expect(
+            service.getReviewItemActivity(makeOrgViewerUser(), 'fingerprint-1'),
+        ).rejects.toThrow(
+            'Insufficient permissions to access AI agent features',
+        );
+        await expect(
+            service.getAllThreads(makeOrgViewerUser()),
+        ).rejects.toThrow(
+            'Insufficient permissions to access AI agent features',
+        );
+    });
+});
+
+describe('AiAgentAdminService.runReviewItemWritebackJob', () => {
+    const payload = {
+        fingerprint: 'fingerprint-1',
+        organizationUuid: ORGANIZATION_UUID,
+        projectUuid: PROJECT_UUID,
+        userUuid: USER_UUID,
+        remediationUuid: REMEDIATION_UUID,
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('enqueues a compile poll instead of seeding the verification thread inline', async () => {
+        const aiAgentModel = {
+            createWebAppThreadWithPrompt: vi.fn(),
+            updateThreadTitle: vi.fn(),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationCompile: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+            aiAgentReviewRemediationRun: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-2' }),
+        };
+        const service = makeService({ aiAgentModel, schedulerClient });
+
+        await service.runReviewItemWritebackJob(payload);
+
+        expect(
+            schedulerClient.aiAgentReviewRemediationCompile,
+        ).toHaveBeenCalledWith(
+            expect.objectContaining({
+                organizationUuid: ORGANIZATION_UUID,
+                projectUuid: PROJECT_UUID,
+                userUuid: USER_UUID,
+                fingerprint: 'fingerprint-1',
+                remediationUuid: REMEDIATION_UUID,
+                previewProjectUuid: PREVIEW_PROJECT_UUID,
+                compileJobUuid: COMPILE_JOB_UUID,
+                startedAt: expect.any(Number),
+            }),
+        );
+        expect(
+            aiAgentModel.createWebAppThreadWithPrompt,
+        ).not.toHaveBeenCalled();
+        expect(
+            schedulerClient.aiAgentReviewRemediationRun,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('runs the build-fix thread and records a pr_opened activity event', async () => {
+        const aiAgentReviewClassifierModel = {
+            createRemediationEvent: vi.fn().mockResolvedValue(undefined),
+        };
+        const aiAgentService = {
+            generateAgentThreadResponse: vi
+                .fn()
+                .mockResolvedValue('Opened a pull request.'),
+        };
+        const service = makeService({
+            aiAgentReviewClassifierModel,
+            aiAgentService,
+        });
+
+        await service.runReviewItemWritebackJob(payload);
+
+        // The build-fix thread (not the headless sandbox) opens the PR, pinning
+        // the editDbtProject tool on the opening turn.
+        expect(aiAgentService.generateAgentThreadResponse).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+                threadUuid: WORK_THREAD_UUID,
+                autoApproveSql: true,
+                toolHints: ['editDbtProject'],
+                forceToolHints: true,
+                suppressWritebackPreview: true,
+            }),
+        );
+        // writeback_completed is emitted by the shared editDbtProject seam, not
+        // the job; the job records pr_opened once it resolves the opened PR.
+        expect(
+            aiAgentReviewClassifierModel.createRemediationEvent,
+        ).toHaveBeenCalledWith(
+            expect.objectContaining({
+                event: {
+                    eventType: 'pr_opened',
+                    payload: { prUrl: PR_URL, prNumber: 42 },
+                },
+            }),
+        );
+    });
+
+    it('re-verifies a remediation in place on retest', async () => {
+        const schedulerClient = {
+            aiAgentReviewRemediationCompile: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+        };
+        const projectService = {
+            scheduleCompileProject: vi
+                .fn()
+                .mockResolvedValue({ jobUuid: COMPILE_JOB_UUID }),
+        };
+        const aiAgentReviewClassifierModel = {
+            getReviewItem: vi.fn().mockResolvedValue(
+                makeReviewItem({
+                    remediation: makeRemediation({
+                        previewProjectUuid: PREVIEW_PROJECT_UUID,
+                        previewThreadUuid: PREVIEW_THREAD_UUID,
+                    }),
+                }),
+            ),
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            schedulerClient,
+            projectService,
+            aiAgentReviewClassifierModel,
+        });
+
+        await service.retestReviewRemediation(makeAdminUser(), 'fingerprint-1');
+
+        // Recompiles the existing preview in place (no new clone) ...
+        expect(projectService.scheduleCompileProject).toHaveBeenCalledWith(
+            expect.anything(),
+            PREVIEW_PROJECT_UUID,
+            expect.anything(),
+            true,
+            true,
+        );
+        // ... then reuses the compile poll to re-run verification.
+        expect(
+            schedulerClient.aiAgentReviewRemediationCompile,
+        ).toHaveBeenCalledWith(
+            expect.objectContaining({
+                remediationUuid: REMEDIATION_UUID,
+                previewProjectUuid: PREVIEW_PROJECT_UUID,
+                compileJobUuid: COMPILE_JOB_UUID,
+            }),
+        );
+    });
+});
+
+describe('AiAgentAdminService.pollReviewRemediationCompile', () => {
+    const payload = {
+        organizationUuid: ORGANIZATION_UUID,
+        projectUuid: PROJECT_UUID,
+        userUuid: USER_UUID,
+        fingerprint: 'fingerprint-1',
+        remediationUuid: REMEDIATION_UUID,
+        previewProjectUuid: PREVIEW_PROJECT_UUID,
+        compileJobUuid: COMPILE_JOB_UUID,
+        startedAt: Date.now(),
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('seeds the verification thread once the compile job is done', async () => {
+        const jobModel = {
+            get: vi.fn().mockResolvedValue({ jobStatus: JobStatusType.DONE }),
+        };
+        const aiAgentModel = {
+            createWebAppThreadWithPrompt: vi.fn().mockResolvedValue({
+                threadUuid: PREVIEW_THREAD_UUID,
+                promptUuid: 'prompt-uuid-1',
+            }),
+            updateThreadTitle: vi.fn().mockResolvedValue(undefined),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationCompile: vi.fn(),
+            aiAgentReviewRemediationRun: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+        };
+        const aiAgentReviewClassifierModel = {
+            setReviewRemediationPreviewThread: vi
+                .fn()
+                .mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            jobModel,
+            aiAgentModel,
+            schedulerClient,
+            aiAgentReviewClassifierModel,
+        });
+
+        await service.pollReviewRemediationCompile(payload);
+
+        expect(jobModel.get).toHaveBeenCalledWith(COMPILE_JOB_UUID);
+        expect(aiAgentModel.createWebAppThreadWithPrompt).toHaveBeenCalledWith(
+            expect.objectContaining({
+                thread: expect.objectContaining({
+                    projectUuid: PREVIEW_PROJECT_UUID,
+                }),
+            }),
+        );
+        expect(
+            aiAgentReviewClassifierModel.setReviewRemediationPreviewThread,
+        ).toHaveBeenCalled();
+        expect(schedulerClient.aiAgentReviewRemediationRun).toHaveBeenCalled();
+        expect(
+            schedulerClient.aiAgentReviewRemediationCompile,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('records a preview_compiled activity event when the compile lands', async () => {
+        const jobModel = {
+            get: vi.fn().mockResolvedValue({ jobStatus: JobStatusType.DONE }),
+        };
+        const aiAgentReviewClassifierModel = {
+            createRemediationEvent: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            jobModel,
+            aiAgentReviewClassifierModel,
+        });
+
+        await service.pollReviewRemediationCompile(payload);
+
+        expect(
+            aiAgentReviewClassifierModel.createRemediationEvent,
+        ).toHaveBeenCalledWith({
+            remediationUuid: REMEDIATION_UUID,
+            organizationUuid: ORGANIZATION_UUID,
+            event: {
+                eventType: 'preview_compiled',
+                payload: { previewProjectUuid: PREVIEW_PROJECT_UUID },
+            },
+        });
+    });
+
+    it('re-enqueues itself while the compile job is still running', async () => {
+        const jobModel = {
+            get: vi
+                .fn()
+                .mockResolvedValue({ jobStatus: JobStatusType.RUNNING }),
+        };
+        const aiAgentModel = {
+            createWebAppThreadWithPrompt: vi.fn(),
+            updateThreadTitle: vi.fn(),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationCompile: vi
+                .fn()
+                .mockResolvedValue({ jobId: 'job-1' }),
+            aiAgentReviewRemediationRun: vi.fn(),
+        };
+        const service = makeService({
+            jobModel,
+            aiAgentModel,
+            schedulerClient,
+        });
+
+        await service.pollReviewRemediationCompile(payload);
+
+        expect(
+            schedulerClient.aiAgentReviewRemediationCompile,
+        ).toHaveBeenCalledWith(payload, expect.any(Date));
+        expect(
+            aiAgentModel.createWebAppThreadWithPrompt,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('fails the remediation when the compile job errors', async () => {
+        const jobModel = {
+            get: vi.fn().mockResolvedValue({ jobStatus: JobStatusType.ERROR }),
+        };
+        const schedulerClient = {
+            aiAgentReviewRemediationCompile: vi.fn(),
+            aiAgentReviewRemediationRun: vi.fn(),
+        };
+        const aiAgentReviewClassifierModel = {
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            jobModel,
+            schedulerClient,
+            aiAgentReviewClassifierModel,
+        });
+
+        await service.pollReviewRemediationCompile(payload);
+
+        expect(
+            aiAgentReviewClassifierModel.updateReviewRemediationStatus,
+        ).toHaveBeenCalledWith({
+            remediationUuid: REMEDIATION_UUID,
+            organizationUuid: ORGANIZATION_UUID,
+            status: 'failed',
+            errorMessage: 'Preview project failed to compile',
+        });
+        expect(
+            schedulerClient.aiAgentReviewRemediationCompile,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('fails the remediation when the compile does not finish in time', async () => {
+        const jobModel = { get: vi.fn() };
+        const schedulerClient = {
+            aiAgentReviewRemediationCompile: vi.fn(),
+            aiAgentReviewRemediationRun: vi.fn(),
+        };
+        const aiAgentReviewClassifierModel = {
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            jobModel,
+            schedulerClient,
+            aiAgentReviewClassifierModel,
+        });
+
+        await service.pollReviewRemediationCompile({
+            ...payload,
+            startedAt: Date.now() - 11 * 60_000,
+        });
+
+        expect(
+            aiAgentReviewClassifierModel.updateReviewRemediationStatus,
+        ).toHaveBeenCalledWith({
+            remediationUuid: REMEDIATION_UUID,
+            organizationUuid: ORGANIZATION_UUID,
+            status: 'failed',
+            errorMessage: 'Preview project did not compile in time',
+        });
+        expect(jobModel.get).not.toHaveBeenCalled();
+        expect(
+            schedulerClient.aiAgentReviewRemediationCompile,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('records a verification_completed event after the remediation run', async () => {
+        const aiAgentReviewClassifierModel = {
+            createRemediationEvent: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({ aiAgentReviewClassifierModel });
+
+        await service.recordReviewRemediationVerified({
+            organizationUuid: ORGANIZATION_UUID,
+            projectUuid: PREVIEW_PROJECT_UUID,
+            userUuid: USER_UUID,
+            fingerprint: 'fingerprint-1',
+            remediationUuid: REMEDIATION_UUID,
+            agentUuid: PREVIEW_AGENT_UUID,
+            threadUuid: PREVIEW_THREAD_UUID,
+        });
+
+        expect(
+            aiAgentReviewClassifierModel.createRemediationEvent,
+        ).toHaveBeenCalledWith({
+            remediationUuid: REMEDIATION_UUID,
+            organizationUuid: ORGANIZATION_UUID,
+            event: {
+                eventType: 'verification_completed',
+                payload: { previewThreadUuid: PREVIEW_THREAD_UUID },
+            },
+        });
+    });
+
+    it('does nothing when the remediation is no longer pr_open', async () => {
+        const jobModel = { get: vi.fn() };
+        const schedulerClient = {
+            aiAgentReviewRemediationCompile: vi.fn(),
+            aiAgentReviewRemediationRun: vi.fn(),
+        };
+        const aiAgentReviewClassifierModel = {
+            getReviewRemediation: vi
+                .fn()
+                .mockResolvedValue(makeRemediation({ status: 'resolved' })),
+            updateReviewRemediationStatus: vi.fn().mockResolvedValue(undefined),
+        };
+        const service = makeService({
+            jobModel,
+            schedulerClient,
+            aiAgentReviewClassifierModel,
+        });
+
+        await service.pollReviewRemediationCompile(payload);
+
+        expect(jobModel.get).not.toHaveBeenCalled();
+        expect(
+            aiAgentReviewClassifierModel.updateReviewRemediationStatus,
+        ).not.toHaveBeenCalled();
+        expect(
+            schedulerClient.aiAgentReviewRemediationCompile,
+        ).not.toHaveBeenCalled();
+    });
+});

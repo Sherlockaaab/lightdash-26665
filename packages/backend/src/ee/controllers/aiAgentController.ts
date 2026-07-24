@@ -1,0 +1,2048 @@
+import {
+    AgentAsCode,
+    AiAgentThreadFilters,
+    AiArtifactTSOACompat,
+    AiClonedThreadCreatedFrom,
+    ApiAgentAsCodeListResponse,
+    ApiAgentAsCodeUpsertResponse,
+    ApiAgentReadinessScoreResponse,
+    ApiAgentSuggestionsResponse,
+    ApiAiAgentArtifactResponseTSOACompat,
+    ApiAiAgentAvatarUploadResponse,
+    ApiAiAgentEvaluationResponse,
+    ApiAiAgentEvaluationRunResponse,
+    ApiAiAgentEvaluationRunResultsResponse,
+    ApiAiAgentEvaluationRunSummaryListResponse,
+    ApiAiAgentEvaluationSummaryListResponse,
+    ApiAiAgentExploreAccessSummaryResponse,
+    ApiAiAgentMcpServerToolListResponse,
+    ApiAiAgentModelOptionsResponse,
+    ApiAiAgentProjectThreadSummaryListResponse,
+    ApiAiAgentResponse,
+    ApiAiAgentSqlApprovalRequest,
+    ApiAiAgentSqlApprovalResponse,
+    ApiAiAgentSummaryResponse,
+    ApiAiAgentThreadCreateRequest,
+    ApiAiAgentThreadCreateResponse,
+    ApiAiAgentThreadGenerateResponse,
+    ApiAiAgentThreadGenerateTitleResponse,
+    ApiAiAgentThreadMessageCreateRequest,
+    ApiAiAgentThreadMessageCreateResponse,
+    ApiAiAgentThreadMessageInterruptResponse,
+    ApiAiAgentThreadMessageSteerResponse,
+    ApiAiAgentThreadMessageVizQueryResponse,
+    ApiAiAgentThreadPullRequestResponse,
+    ApiAiAgentThreadResponse,
+    ApiAiAgentThreadShareResponse,
+    ApiAiAgentThreadStreamRequest,
+    ApiAiAgentThreadSummaryListResponse,
+    ApiAiAgentThreadWorkstreamsResponse,
+    ApiAiAgentVerifiedArtifactsResponse,
+    ApiAiAgentVerifiedQuestionsResponse,
+    ApiAiMcpGithubAvailabilityResponse,
+    ApiAiMcpOAuthCredentialRequest,
+    ApiAiMcpServerListResponse,
+    ApiAiMcpServerResponse,
+    ApiAiMcpServerToolListResponse,
+    ApiAppendEvaluationRequest,
+    ApiAppendInstructionRequest,
+    ApiAppendInstructionResponse,
+    ApiCloneAiAgentThreadShareResponse,
+    ApiCloneThreadResponse,
+    ApiConnectGithubMcpServerBody,
+    ApiCreateAiAgent,
+    ApiCreateAiAgentResponse,
+    ApiCreateAiAgentThreadMessageSteer,
+    ApiCreateAiMcpServer,
+    ApiCreateEvaluationRequest,
+    ApiCreateEvaluationResponse,
+    ApiErrorPayload,
+    ApiGetUserAgentPreferencesResponse,
+    ApiStartAiMcpOAuthResponse,
+    ApiSuccessEmpty,
+    ApiUpdateAiAgent,
+    ApiUpdateAiAgentMcpServerToolsRequest,
+    ApiUpdateAiMcpServerCredentialBody,
+    ApiUpdateEvaluationRequest,
+    ApiUpdateUserAgentPreferences,
+    ApiUpdateUserAgentPreferencesResponse,
+    assertEmbeddedAuth,
+    assertRegisteredAccount,
+    KnexPaginateArgs,
+    ParameterError,
+} from '@lightdash/common';
+import * as Sentry from '@sentry/node';
+import {
+    Body,
+    Delete,
+    Get,
+    Middlewares,
+    OperationId,
+    Patch,
+    Path,
+    Post,
+    Query,
+    Request,
+    Response,
+    Route,
+    SuccessResponse,
+} from '@tsoa/runtime';
+import express from 'express';
+import { toSessionUser } from '../../auth/account';
+import {
+    allowApiKeyAuthentication,
+    isAuthenticated,
+    unauthorisedInDemo,
+} from '../../controllers/authentication';
+import { BaseController } from '../../controllers/baseController';
+import Logger from '../../logging/logger';
+import { type AiAgentCoderService } from '../services/AiAgentCoderService/AiAgentCoderService';
+import { type AiAgentService } from '../services/AiAgentService/AiAgentService';
+
+@Route('/api/v1/projects/{projectUuid}/aiAgents')
+@Response<ApiErrorPayload>('default', 'Error')
+export class AiAgentController extends BaseController {
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/')
+    @OperationId('listAgents')
+    async listAgents(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+    ): Promise<ApiAiAgentSummaryResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results: await this.getAiAgentService().listEmbedAgents(
+                    req.account,
+                    projectUuid,
+                ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().listAgents(
+                toSessionUser(req.account),
+                projectUuid,
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/preferences')
+    @OperationId('getUserAgentPreferences')
+    async getUserAgentPreferences(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+    ): Promise<ApiGetUserAgentPreferencesResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const userPreferences =
+            await this.getAiAgentService().getUserAgentPreferences(
+                toSessionUser(req.account),
+                projectUuid,
+            );
+        return {
+            status: 'ok',
+            results: userPreferences ?? undefined,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/preferences')
+    @OperationId('updateUserAgentPreferences')
+    async setUserDefaultAgent(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Body() body: ApiUpdateUserAgentPreferences,
+    ): Promise<ApiUpdateUserAgentPreferencesResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        await this.getAiAgentService().updateUserAgentPreferences(
+            toSessionUser(req.account),
+            projectUuid,
+            body,
+        );
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Delete('/preferences')
+    @OperationId('deleteUserAgentPreferences')
+    async deleteUserAgentPreferences(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        await this.getAiAgentService().deleteUserAgentPreferences(
+            toSessionUser(req.account),
+            projectUuid,
+        );
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/mcpServers')
+    @OperationId('listMcpServers')
+    async listMcpServers(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+    ): Promise<ApiAiMcpServerListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().listMcpServers(
+                toSessionUser(req.account),
+                projectUuid,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('201', 'Created')
+    @Post('/mcpServers')
+    @OperationId('createMcpServer')
+    async createMcpServer(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Body() body: ApiCreateAiMcpServer,
+    ): Promise<ApiAiMcpServerResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(201);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().createMcpServer(
+                toSessionUser(req.account),
+                projectUuid,
+                body,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/mcpServers/{mcpServerUuid}/credential')
+    @OperationId('updateMcpServerBearerCredential')
+    async updateMcpServerBearerCredential(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() mcpServerUuid: string,
+        @Body() body: ApiUpdateAiMcpServerCredentialBody,
+    ): Promise<ApiAiMcpServerResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentService().updateMcpServerBearerCredential(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    mcpServerUuid,
+                    body,
+                ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/mcpServers/github/availability')
+    @OperationId('getGithubMcpAvailability')
+    async getGithubMcpAvailability(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+    ): Promise<ApiAiMcpGithubAvailabilityResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().getGithubMcpAvailability(
+                toSessionUser(req.account),
+                projectUuid,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('201', 'Created')
+    @Post('/mcpServers/github/connect')
+    @OperationId('connectGithubMcpServer')
+    async connectGithubMcpServer(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Body() body: ApiConnectGithubMcpServerBody,
+    ): Promise<ApiAiMcpServerResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(201);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().connectGithubMcpServer(
+                toSessionUser(req.account),
+                projectUuid,
+                body.personalAccessToken,
+                body.credentialScope,
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/mcpServers/{mcpServerUuid}/tools')
+    @OperationId('listMcpServerTools')
+    async listMcpServerTools(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() mcpServerUuid: string,
+    ): Promise<ApiAiMcpServerToolListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().listMcpServerTools(
+                toSessionUser(req.account),
+                projectUuid,
+                mcpServerUuid,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/mcpServers/{mcpServerUuid}/tools/refresh')
+    @OperationId('refreshMcpServerTools')
+    async refreshMcpServerTools(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() mcpServerUuid: string,
+    ): Promise<ApiAiMcpServerToolListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().refreshMcpServerTools(
+                toSessionUser(req.account),
+                projectUuid,
+                mcpServerUuid,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/mcpServers/{mcpServerUuid}/oauth/start')
+    @OperationId('startMcpOAuthConnection')
+    async startMcpOAuthConnection(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() mcpServerUuid: string,
+        @Body() body?: ApiAiMcpOAuthCredentialRequest,
+    ): Promise<ApiStartAiMcpOAuthResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: {
+                authorizationUrl:
+                    await this.getAiAgentService().startMcpOAuthConnection(
+                        toSessionUser(req.account),
+                        projectUuid,
+                        mcpServerUuid,
+                        body,
+                    ),
+            },
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/mcpServers/{mcpServerUuid}/oauth/disconnect')
+    @OperationId('disconnectMcpOAuthConnection')
+    async disconnectMcpOAuthConnection(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() mcpServerUuid: string,
+        @Body() body?: ApiAiMcpOAuthCredentialRequest,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        await this.getAiAgentService().disconnectMcpOAuthConnection(
+            toSessionUser(req.account),
+            projectUuid,
+            mcpServerUuid,
+            body,
+        );
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/threads')
+    @OperationId('listProjectThreads')
+    async listProjectThreads(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Query() page?: KnexPaginateArgs['page'],
+        @Query() pageSize?: KnexPaginateArgs['pageSize'],
+        @Query() agentUuid?: AiAgentThreadFilters['agentUuid'],
+        @Query() createdFrom?: AiAgentThreadFilters['createdFrom'],
+        @Query() search?: AiAgentThreadFilters['search'],
+    ): Promise<ApiAiAgentProjectThreadSummaryListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const paginateArgs: KnexPaginateArgs | undefined =
+            page !== undefined && pageSize !== undefined
+                ? { page, pageSize }
+                : undefined;
+
+        const { data, pagination } =
+            await this.getAiAgentService().listProjectThreads(
+                toSessionUser(req.account),
+                projectUuid,
+                {
+                    filters: { agentUuid, createdFrom, search },
+                    paginateArgs,
+                },
+            );
+
+        return {
+            status: 'ok',
+            results: { data, pagination },
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}')
+    @OperationId('getAgent')
+    async getAgent(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiAiAgentResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results: await this.getAiAgentService().getEmbedAgentDetails(
+                    req.account,
+                    projectUuid,
+                    agentUuid,
+                ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        const agent = await this.getAiAgentService().getAgent(
+            toSessionUser(req.account),
+            agentUuid,
+            projectUuid,
+        );
+        return {
+            status: 'ok',
+            results: agent,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/mcpServers')
+    @OperationId('listAgentMcpServers')
+    async listAgentMcpServers(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiAiMcpServerListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().listAgentMcpServers(
+                toSessionUser(req.account),
+                projectUuid,
+                agentUuid,
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/mcpServers/{mcpServerUuid}/tools')
+    @OperationId('listAgentMcpServerTools')
+    async listAgentMcpServerTools(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() mcpServerUuid: string,
+    ): Promise<ApiAiAgentMcpServerToolListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().listAgentMcpServerTools(
+                toSessionUser(req.account),
+                projectUuid,
+                agentUuid,
+                mcpServerUuid,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch('/{agentUuid}/mcpServers/{mcpServerUuid}/tools')
+    @OperationId('updateAgentMcpServerTools')
+    async updateAgentMcpServerTools(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() mcpServerUuid: string,
+        @Body() body: ApiUpdateAiAgentMcpServerToolsRequest,
+    ): Promise<ApiAiAgentMcpServerToolListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().updateAgentMcpServerTools(
+                toSessionUser(req.account),
+                projectUuid,
+                agentUuid,
+                mcpServerUuid,
+                body,
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/models')
+    @OperationId('getModelOptions')
+    async getModelOptions(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiAiAgentModelOptionsResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results:
+                    await this.getAiAgentService().getEmbedAgentModelOptions(
+                        req.account,
+                        projectUuid,
+                        agentUuid,
+                    ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        const models = await this.getAiAgentService().getModelOptions(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+        );
+        return {
+            status: 'ok',
+            results: models,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/suggestions')
+    @OperationId('getAgentSuggestions')
+    async getAgentSuggestions(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Query() threadUuid?: string,
+        @Query() afterMessageUuid?: string,
+        @Query() enableSqlMode?: boolean,
+    ): Promise<ApiAgentSuggestionsResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            await this.getAiAgentService().getEmbedAgentDetails(
+                req.account,
+                projectUuid,
+                agentUuid,
+            );
+            return {
+                status: 'ok',
+                results: { chips: [] },
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        const results = await this.getAiAgentService().getAgentSuggestions(
+            toSessionUser(req.account),
+            {
+                projectUuid,
+                agentUuid,
+                threadUuid,
+                afterMessageUuid,
+                enableSqlMode,
+            },
+        );
+        return {
+            status: 'ok',
+            results,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/evaluateReadiness')
+    @OperationId('evaluateAgentReadiness')
+    async evaluateAgentReadiness(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiAgentReadinessScoreResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const readinessScore = await this.getAiAgentService().evaluateReadiness(
+            toSessionUser(req.account),
+            { agentUuid, projectUuid },
+        );
+
+        return {
+            status: 'ok',
+            results: readinessScore,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/verified-artifacts')
+    @OperationId('getVerifiedArtifacts')
+    async getVerifiedArtifacts(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Query() page?: KnexPaginateArgs['page'],
+        @Query() pageSize?: KnexPaginateArgs['pageSize'],
+    ): Promise<ApiAiAgentVerifiedArtifactsResponse> {
+        assertRegisteredAccount(req.account);
+        const paginateArgs: KnexPaginateArgs | undefined =
+            page !== undefined || pageSize !== undefined
+                ? {
+                      page: page ?? 1,
+                      pageSize: pageSize ?? 50,
+                  }
+                : {
+                      page: 1,
+                      pageSize: 50,
+                  };
+
+        const result = await this.getAiAgentService().getVerifiedArtifacts(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            paginateArgs,
+        );
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: result,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/verified-questions')
+    @OperationId('getVerifiedQuestions')
+    async getVerifiedQuestions(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiAiAgentVerifiedQuestionsResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results:
+                    await this.getAiAgentService().getEmbedVerifiedQuestions(
+                        req.account,
+                        projectUuid,
+                        agentUuid,
+                    ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().getVerifiedQuestions(
+                toSessionUser(req.account),
+                agentUuid,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('201', 'Created')
+    @Post('/')
+    @OperationId('createAgent')
+    async createAgent(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Body() body: ApiCreateAiAgent,
+    ): Promise<ApiCreateAiAgentResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(201);
+        const agent = await this.getAiAgentService().createAgent(
+            toSessionUser(req.account),
+            {
+                ...body,
+                projectUuid,
+            },
+        );
+        return {
+            status: 'ok',
+            results: agent,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch('/{agentUuid}')
+    @OperationId('updateAgent')
+    async updateAgent(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Body() body: ApiUpdateAiAgent,
+    ): Promise<ApiAiAgentResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        const agent = await this.getAiAgentService().updateAgent(
+            toSessionUser(req.account),
+            agentUuid,
+            { ...body, projectUuid },
+        );
+        return {
+            status: 'ok',
+            results: agent,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/avatar')
+    @OperationId('uploadAgentAvatar')
+    async uploadAgentAvatar(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiAiAgentAvatarUploadResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const mimeType = req.headers['content-type'];
+        if (!mimeType) {
+            throw new ParameterError('Content-Type header is required');
+        }
+
+        const contentLengthHeader = req.headers['content-length'];
+        if (!contentLengthHeader) {
+            throw new ParameterError('Content-Length header is required');
+        }
+
+        const contentLength = parseInt(contentLengthHeader, 10);
+        if (Number.isNaN(contentLength) || contentLength <= 0) {
+            throw new ParameterError(
+                'Content-Length must be a positive integer',
+            );
+        }
+
+        const agent = await this.getAiAgentService().uploadAgentAvatar(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            mimeType,
+            req,
+            contentLength,
+        );
+
+        return {
+            status: 'ok',
+            results: agent,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Delete('/{agentUuid}')
+    @OperationId('deleteAgent')
+    async deleteAgent(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        await this.getAiAgentService().deleteAgent(
+            toSessionUser(req.account),
+            agentUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/threads')
+    @OperationId('listAgentThreads')
+    async listAgentThreads(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Query() allUsers?: boolean,
+    ): Promise<ApiAiAgentThreadSummaryListResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results: await this.getAiAgentService().listEmbedAgentThreads(
+                    req.account,
+                    projectUuid,
+                    agentUuid,
+                ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().listAgentThreads(
+                toSessionUser(req.account),
+                agentUuid,
+                allUsers,
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/threads/{threadUuid}')
+    @OperationId('getAgentThread')
+    async getAgentThread(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+    ): Promise<ApiAiAgentThreadResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results: await this.getAiAgentService().getEmbedAgentThread(
+                    req.account,
+                    projectUuid,
+                    agentUuid,
+                    threadUuid,
+                ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().getAgentThread(
+                toSessionUser(req.account),
+                agentUuid,
+                threadUuid,
+            ),
+        };
+    }
+
+    /**
+     * Get the writeback pull request associated with a thread — the PR the
+     * agent opened in this thread, or the PR a verification thread verifies.
+     * @summary Get AI agent thread pull request
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/threads/{threadUuid}/pull-request')
+    @OperationId('getAgentThreadPullRequest')
+    async getAgentThreadPullRequest(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+    ): Promise<ApiAiAgentThreadPullRequestResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().getThreadPullRequest(
+                toSessionUser(req.account),
+                agentUuid,
+                threadUuid,
+            ),
+        };
+    }
+
+    /**
+     * List every pull request the coding agent has opened in this thread (its
+     * workstreams), each enriched with live PR state where available. A thread
+     * can drive several PRs across one or more repos.
+     * @summary List AI agent thread pull requests
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/threads/{threadUuid}/pull-requests')
+    @OperationId('listAgentThreadWorkstreams')
+    async listAgentThreadWorkstreams(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+    ): Promise<ApiAiAgentThreadWorkstreamsResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().getThreadWorkstreams(
+                toSessionUser(req.account),
+                agentUuid,
+                threadUuid,
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads')
+    @OperationId('createAgentThread')
+    async createAgentThread(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Body() body: ApiAiAgentThreadCreateRequest,
+    ): Promise<ApiAiAgentThreadCreateResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results: await this.getAiAgentService().createEmbedAgentThread(
+                    req.account,
+                    projectUuid,
+                    agentUuid,
+                    body,
+                ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().createAgentThread(
+                toSessionUser(req.account),
+                agentUuid,
+                body,
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads/{threadUuid}/messages')
+    @OperationId('createAgentThreadMessage')
+    async createAgentThreadMessage(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Body() body: ApiAiAgentThreadMessageCreateRequest,
+    ): Promise<ApiAiAgentThreadMessageCreateResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results:
+                    await this.getAiAgentService().createEmbedAgentThreadMessage(
+                        req.account,
+                        projectUuid,
+                        agentUuid,
+                        threadUuid,
+                        body,
+                    ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().createAgentThreadMessage(
+                toSessionUser(req.account),
+                agentUuid,
+                threadUuid,
+                body,
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post(
+        '/{agentUuid}/threads/{threadUuid}/tool-calls/{toolCallId}/sql-approval',
+    )
+    @OperationId('decideAgentSqlApproval')
+    async decideAgentSqlApproval(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Path() toolCallId: string,
+        @Body() body: ApiAiAgentSqlApprovalRequest,
+    ): Promise<ApiAiAgentSqlApprovalResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().decideSqlApproval(
+                toSessionUser(req.account),
+                {
+                    agentUuid,
+                    threadUuid,
+                    toolCallId,
+                    decision: body.decision,
+                },
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads/{threadUuid}/stream')
+    @OperationId('streamAgentThreadResponse')
+    async streamAgentThreadResponse(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Body() body?: ApiAiAgentThreadStreamRequest,
+    ): Promise<void> {
+        const stream =
+            req.account?.authentication.type === 'jwt'
+                ? await (() => {
+                      assertEmbeddedAuth(req.account);
+                      return this.getAiAgentService().streamEmbedAgentThreadResponse(
+                          req.account,
+                          projectUuid,
+                          {
+                              agentUuid,
+                              threadUuid,
+                              toolHints: body?.toolHints ?? [],
+                          },
+                      );
+                  })()
+                : await (() => {
+                      assertRegisteredAccount(req.account);
+                      return this.getAiAgentService().streamAgentThreadResponse(
+                          toSessionUser(req.account),
+                          {
+                              agentUuid,
+                              threadUuid,
+                              enableSqlMode: body?.enableSqlMode ?? false,
+                              autoApproveSql: body?.autoApproveSql ?? false,
+                              toolHints: body?.toolHints ?? [],
+                          },
+                      );
+                  })();
+
+        /**
+         * @ref https://github.com/lukeautry/tsoa/issues/44#issuecomment-357784246
+         * Hack to get the response object from the request
+         */
+        stream.pipeUIMessageStreamToResponse(req.res!);
+
+        // If client disconnects, continue consuming the stream so side-effects complete
+        let hasConsumed = false;
+        const isStreamTimeoutError = (error: unknown) =>
+            error instanceof Error &&
+            (error.name === 'BodyTimeoutError' ||
+                (error.name === 'TypeError' && error.message === 'terminated'));
+
+        const handleClientDisconnect = (err: Error | undefined) => {
+            if (hasConsumed) return;
+            hasConsumed = true;
+            Logger.info(
+                `Client disconnected ${
+                    err ? `with error: ${err.message}` : ''
+                }, consuming stream`,
+            );
+            if (err && !isStreamTimeoutError(err)) {
+                Sentry.captureException(err, {
+                    tags: {
+                        errorType: 'AiAgentStreamError',
+                    },
+                });
+            }
+            void stream.consumeStream({
+                onError: (error) => {
+                    Logger.error(`Error consuming stream ${String(error)}`);
+                    if (!isStreamTimeoutError(error)) {
+                        Sentry.captureException(error, {
+                            tags: {
+                                errorType: 'AiAgentStreamError',
+                            },
+                        });
+                    }
+                },
+            });
+        };
+        req.res?.on('finish', () => {
+            // If the request is finished, we can stop consuming the stream
+            hasConsumed = true;
+        });
+        req.res?.on('close', handleClientDisconnect);
+        req.res?.on('error', handleClientDisconnect);
+        req.on('aborted', handleClientDisconnect);
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads/{threadUuid}/messages/{messageUuid}/interrupt')
+    @OperationId('interruptAgentThreadMessage')
+    async interruptAgentThreadMessage(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Path() messageUuid: string,
+    ): Promise<ApiAiAgentThreadMessageInterruptResponse> {
+        assertRegisteredAccount(req.account);
+        await this.getAiAgentService().interruptAgentThreadMessage(
+            toSessionUser(req.account),
+            {
+                agentUuid,
+                threadUuid,
+                messageUuid,
+            },
+        );
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: { interrupted: true },
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads/{threadUuid}/messages/{messageUuid}/steers')
+    @OperationId('createAgentThreadMessageSteer')
+    async createAgentThreadMessageSteer(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Path() messageUuid: string,
+        @Body() body: ApiCreateAiAgentThreadMessageSteer,
+    ): Promise<ApiAiAgentThreadMessageSteerResponse> {
+        assertRegisteredAccount(req.account);
+        const steer =
+            await this.getAiAgentService().createAgentThreadMessageSteer(
+                toSessionUser(req.account),
+                {
+                    agentUuid,
+                    threadUuid,
+                    messageUuid,
+                    message: body.message,
+                },
+            );
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: { steer },
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads/{threadUuid}/generate')
+    @OperationId('generateAgentThreadResponse')
+    async generateAgentThreadResponse(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+    ): Promise<ApiAiAgentThreadGenerateResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const response =
+            await this.getAiAgentService().generateAgentThreadResponse(
+                toSessionUser(req.account),
+                {
+                    agentUuid,
+                    threadUuid,
+                },
+            );
+
+        return {
+            status: 'ok',
+            results: {
+                response,
+            },
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads/{threadUuid}/generate-title')
+    @OperationId('generateAgentThreadTitle')
+    async generateAgentThreadTitle(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+    ): Promise<ApiAiAgentThreadGenerateTitleResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const title = await this.getAiAgentService().generateThreadTitle(
+            toSessionUser(req.account),
+            {
+                agentUuid,
+                threadUuid,
+            },
+        );
+
+        return {
+            status: 'ok',
+            results: {
+                title,
+            },
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/threads/{threadUuid}/clone/{promptUuid}')
+    @OperationId('cloneAgentThread')
+    async cloneAgentThread(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Path() promptUuid: string,
+        @Query() createdFrom?: AiClonedThreadCreatedFrom,
+    ): Promise<ApiCloneThreadResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const clonedThread = await this.getAiAgentService().cloneThread(
+            toSessionUser(req.account),
+            agentUuid,
+            threadUuid,
+            promptUuid,
+            { createdFrom },
+        );
+
+        return {
+            status: 'ok',
+            results: clonedThread,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Patch(
+        '/{agentUuid}/threads/{threadUuid}/messages/{messageUuid}/savedQuery',
+    )
+    @OperationId('updateAgentThreadMessageSavedQuery')
+    async updateAgentThreadMessageSavedQuery(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Path() messageUuid: string,
+        @Body() body: { savedQueryUuid: string | null },
+    ): Promise<ApiSuccessEmpty> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            await this.getAiAgentService().updateEmbedMessageSavedQuery(
+                req.account,
+                projectUuid,
+                {
+                    savedQueryUuid: body.savedQueryUuid,
+                    agentUuid,
+                    threadUuid,
+                    messageUuid,
+                },
+            );
+        } else {
+            assertRegisteredAccount(req.account);
+            await this.getAiAgentService().updateMessageSavedQuery(
+                toSessionUser(req.account),
+                {
+                    savedQueryUuid: body.savedQueryUuid,
+                    agentUuid,
+                    threadUuid,
+                    messageUuid,
+                },
+            );
+        }
+
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Patch('/{agentUuid}/threads/{threadUuid}/messages/{messageUuid}/feedback')
+    @OperationId('updatePromptFeedback')
+    async updatePromptFeedback(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+        @Path() messageUuid: string,
+        @Body() body: { humanScore: number; humanFeedback?: string | null },
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        await this.getAiAgentService().updateHumanScoreForMessage(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            threadUuid,
+            messageUuid,
+            body.humanScore,
+            body.humanFeedback,
+        );
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/explore-access-summary')
+    @OperationId('getAgentExploreAccessSummary')
+    async getAgentExploreAccessSummary(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Body() body: { tags: string[] | null },
+    ): Promise<ApiAiAgentExploreAccessSummaryResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentService().getAgentExploreAccessSummary(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    body.tags,
+                ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/artifacts/{artifactUuid}')
+    @OperationId('getArtifact')
+    async getArtifact(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() artifactUuid: string,
+    ): Promise<ApiAiAgentArtifactResponseTSOACompat> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results: (await this.getAiAgentService().getEmbedArtifact(
+                    req.account,
+                    projectUuid,
+                    agentUuid,
+                    artifactUuid,
+                )) as unknown as AiArtifactTSOACompat,
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: (await this.getAiAgentService().getArtifact(
+                toSessionUser(req.account),
+                projectUuid,
+                agentUuid,
+                artifactUuid,
+            )) as unknown as AiArtifactTSOACompat,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/artifacts/{artifactUuid}/versions/{versionUuid}')
+    @OperationId('getArtifactVersion')
+    async getArtifactVersion(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() artifactUuid: string,
+        @Path() versionUuid: string,
+    ): Promise<ApiAiAgentArtifactResponseTSOACompat> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results: (await this.getAiAgentService().getEmbedArtifact(
+                    req.account,
+                    projectUuid,
+                    agentUuid,
+                    artifactUuid,
+                    versionUuid,
+                )) as unknown as AiArtifactTSOACompat,
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            // Use simplified type for TSOA Compat
+
+            results: (await this.getAiAgentService().getArtifact(
+                toSessionUser(req.account),
+                projectUuid,
+                agentUuid,
+                artifactUuid,
+                versionUuid,
+            )) as unknown as AiArtifactTSOACompat,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get(
+        '/{agentUuid}/artifacts/{artifactUuid}/versions/{versionUuid}/viz-query',
+    )
+    @OperationId('getArtifactVizQuery')
+    async getArtifactVizQuery(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() artifactUuid: string,
+        @Path() versionUuid: string,
+    ): Promise<ApiAiAgentThreadMessageVizQueryResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results:
+                    await this.getAiAgentService().getEmbedArtifactVizQuery(
+                        req.account,
+                        projectUuid,
+                        agentUuid,
+                        artifactUuid,
+                        versionUuid,
+                    ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentService().getArtifactVizQuery(
+                toSessionUser(req.account),
+                {
+                    projectUuid,
+                    agentUuid,
+                    artifactUuid,
+                    versionUuid,
+                },
+            ),
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('201', 'Created')
+    @Post('/{agentUuid}/threads/{threadUuid}/shares')
+    @OperationId('createAiAgentThreadShare')
+    async createAiAgentThreadShare(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() threadUuid: string,
+    ): Promise<ApiAiAgentThreadShareResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(201);
+
+        const share = await this.getAiAgentService().createThreadShare(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            threadUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: share,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/thread-shares/{aiThreadShareUuid}/clone')
+    @OperationId('cloneAiAgentThreadShare')
+    async cloneAiAgentThreadShare(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() aiThreadShareUuid: string,
+    ): Promise<ApiCloneAiAgentThreadShareResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const clonedThread = await this.getAiAgentService().cloneThreadShare(
+            toSessionUser(req.account),
+            projectUuid,
+            aiThreadShareUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: clonedThread,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get(
+        '/{agentUuid}/artifacts/{artifactUuid}/versions/{versionUuid}/charts/{chartIndex}/viz-query',
+    )
+    @OperationId('getDashboardArtifactChartVizQuery')
+    async getDashboardArtifactChartVizQuery(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() artifactUuid: string,
+        @Path() versionUuid: string,
+        @Path() chartIndex: number,
+    ): Promise<ApiAiAgentThreadMessageVizQueryResponse> {
+        this.setStatus(200);
+
+        if (req.account?.authentication.type === 'jwt') {
+            assertEmbeddedAuth(req.account);
+            return {
+                status: 'ok',
+                results:
+                    await this.getAiAgentService().getEmbedDashboardArtifactChartVizQuery(
+                        req.account,
+                        projectUuid,
+                        agentUuid,
+                        artifactUuid,
+                        versionUuid,
+                        chartIndex,
+                    ),
+            };
+        }
+
+        assertRegisteredAccount(req.account);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentService().getDashboardArtifactChartVizQuery(
+                    toSessionUser(req.account),
+                    {
+                        projectUuid,
+                        agentUuid,
+                        artifactUuid,
+                        versionUuid,
+                        chartIndex,
+                    },
+                ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Patch(
+        '/{agentUuid}/artifacts/{artifactUuid}/versions/{versionUuid}/savedDashboard',
+    )
+    @OperationId('updateArtifactVersionSavedDashboard')
+    async updateArtifactVersionSavedDashboard(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() artifactUuid: string,
+        @Path() versionUuid: string,
+        @Body() body: { savedDashboardUuid: string | null },
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        await this.getAiAgentService().updateArtifactVersion(
+            toSessionUser(req.account),
+            {
+                agentUuid,
+                artifactUuid,
+                versionUuid,
+                savedDashboardUuid: body.savedDashboardUuid,
+            },
+        );
+
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch(
+        '/{agentUuid}/artifacts/{artifactUuid}/versions/{versionUuid}/verified',
+    )
+    @OperationId('setArtifactVersionVerified')
+    async setArtifactVersionVerified(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() artifactUuid: string,
+        @Path() versionUuid: string,
+        @Body() body: { verified: boolean },
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        await this.getAiAgentService().setArtifactVersionVerified(
+            toSessionUser(req.account),
+            {
+                agentUuid,
+                artifactUuid,
+                versionUuid,
+                verified: body.verified,
+            },
+        );
+
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('201', 'Created')
+    @Post('/{agentUuid}/evaluations')
+    @OperationId('createEvaluation')
+    async createEvaluation(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Body() body: ApiCreateEvaluationRequest,
+    ): Promise<ApiCreateEvaluationResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(201);
+
+        const evaluation = await this.getAiAgentService().createEval(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            body,
+        );
+
+        return {
+            status: 'ok',
+            results: { evalUuid: evaluation.evalUuid },
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/evaluations/{evalUuid}/run')
+    @OperationId('runEvaluation')
+    async runEvaluation(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() evalUuid: string,
+    ): Promise<ApiAiAgentEvaluationRunResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const evalRun = await this.getAiAgentService().runEval(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            evalUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: evalRun,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/evaluations')
+    @OperationId('getEvaluations')
+    async getEvaluations(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+    ): Promise<ApiAiAgentEvaluationSummaryListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const evaluations = await this.getAiAgentService().getEvalsByAgent(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: evaluations,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/evaluations/{evalUuid}')
+    @OperationId('getEvaluation')
+    async getEvaluation(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() evalUuid: string,
+    ): Promise<ApiAiAgentEvaluationResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const evaluation = await this.getAiAgentService().getEval(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            evalUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: evaluation,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/evaluations/{evalUuid}/runs')
+    @OperationId('getEvaluationRuns')
+    async getEvaluationRuns(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() evalUuid: string,
+        @Query() page?: KnexPaginateArgs['page'],
+        @Query() pageSize?: KnexPaginateArgs['pageSize'],
+    ): Promise<ApiAiAgentEvaluationRunSummaryListResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const paginateArgs: KnexPaginateArgs | undefined =
+            page !== undefined || pageSize !== undefined
+                ? {
+                      page: page ?? 1,
+                      pageSize: pageSize ?? 10,
+                  }
+                : undefined;
+
+        const runs = await this.getAiAgentService().getEvalRuns(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            evalUuid,
+            paginateArgs,
+        );
+
+        return {
+            status: 'ok',
+            results: runs,
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/{agentUuid}/evaluations/{evalUuid}/runs/{runUuid}')
+    @OperationId('getEvaluationRunResults')
+    async getEvaluationRunResults(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() evalUuid: string,
+        @Path() runUuid: string,
+    ): Promise<ApiAiAgentEvaluationRunResultsResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const runResults = await this.getAiAgentService().getEvalRunWithResults(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            evalUuid,
+            runUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: runResults,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch('/{agentUuid}/evaluations/{evalUuid}')
+    @OperationId('updateEvaluation')
+    async updateEvaluation(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() evalUuid: string,
+        @Body()
+        body: ApiUpdateEvaluationRequest,
+    ): Promise<ApiAiAgentEvaluationResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const evaluation = await this.getAiAgentService().updateEval(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            evalUuid,
+            body,
+        );
+
+        return {
+            status: 'ok',
+            results: evaluation,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/evaluations/{evalUuid}/append')
+    @OperationId('appendToEvaluation')
+    async appendToEvaluation(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() evalUuid: string,
+        @Body() body: ApiAppendEvaluationRequest,
+    ): Promise<ApiAiAgentEvaluationResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const evaluation = await this.getAiAgentService().appendToEval(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            evalUuid,
+            body,
+        );
+
+        return {
+            status: 'ok',
+            results: evaluation,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Delete('/{agentUuid}/evaluations/{evalUuid}')
+    @OperationId('deleteEvaluation')
+    async deleteEvaluation(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Path() evalUuid: string,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        await this.getAiAgentService().deleteEval(
+            toSessionUser(req.account),
+            projectUuid,
+            agentUuid,
+            evalUuid,
+        );
+
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/{agentUuid}/append-instruction')
+    @OperationId('appendInstruction')
+    async appendInstruction(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Path() agentUuid: string,
+        @Body() body: ApiAppendInstructionRequest,
+    ): Promise<ApiAppendInstructionResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        const updatedInstruction =
+            await this.getAiAgentService().appendInstruction(
+                toSessionUser(req.account),
+                projectUuid,
+                agentUuid,
+                body.instruction,
+            );
+
+        return {
+            status: 'ok',
+            results: {
+                updatedInstruction,
+            },
+        };
+    }
+
+    protected getAiAgentService() {
+        return this.services.getAiAgentService<AiAgentService>();
+    }
+
+    protected getAiAgentCoderService() {
+        return this.services.getAiAgentCoderService<AiAgentCoderService>();
+    }
+}

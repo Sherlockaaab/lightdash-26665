@@ -1,0 +1,869 @@
+import {
+    AiAgentAdminFilters,
+    AiAgentAdminSort,
+    AiAgentReviewItemStatus,
+    AiAgentReviewReplayCaptureRequest,
+    ApiAiAgentAdminConversationsResponse,
+    ApiAiAgentAdminPromptActivityResponse,
+    ApiAiAgentReviewItemActivityResponse,
+    ApiAiAgentReviewItemPrDiffResponse,
+    ApiAiAgentReviewItemResponse,
+    ApiAiAgentReviewItemsResponse,
+    ApiAiAgentReviewReplayCaptureResponse,
+    ApiAiAgentReviewSignalsResponse,
+    ApiAiAgentSummaryResponse,
+    ApiAiOrganizationSettingsResponse,
+    ApiAiReviewNotificationSettingsResponse,
+    ApiErrorPayload,
+    ApiMcpActivityResponse,
+    ApiMcpActivityStatsResponse,
+    ApiSuccessEmpty,
+    ApiUpdateAiOrganizationSettingsResponse,
+    assertRegisteredAccount,
+    CreateAiAgentReviewItem,
+    CreateAiAgentReviewItemComment,
+    KnexPaginateArgs,
+    McpActivityFilters,
+    McpActivitySort,
+    McpActivityStatsFilters,
+    ParameterError,
+    ReorderAiAgentReviewItems,
+    UpdateAiAgentReviewItemAssignee,
+    UpdateAiAgentReviewItemPriority,
+    UpdateAiAgentReviewItemStatus,
+    UpdateAiOrganizationSettings,
+    UpdateAiReviewNotificationSettings,
+    type ApiAiAgentReviewItemWritebackPreviewResponse,
+} from '@lightdash/common';
+import {
+    Body,
+    Get,
+    Hidden,
+    Middlewares,
+    OperationId,
+    Patch,
+    Path,
+    Post,
+    Put,
+    Query,
+    Request,
+    Response,
+    Route,
+    SuccessResponse,
+} from '@tsoa/runtime';
+import express from 'express';
+import { validate as isUuid } from 'uuid';
+import { toSessionUser } from '../../auth/account';
+import {
+    allowApiKeyAuthentication,
+    isAuthenticated,
+    unauthorisedInDemo,
+} from '../../controllers/authentication';
+import { BaseController } from '../../controllers/baseController';
+import { type AiAgentAdminService } from '../services/AiAgentAdminService';
+import { type AiOrganizationSettingsService } from '../services/AiOrganizationSettingsService';
+
+const MCP_ACTIVITY_MAX_PAGE_SIZE = 100;
+
+// Rejects malformed date filters at the boundary (422) instead of letting
+// Postgres fail the query with a 500
+const validateDateFilter = (
+    name: string,
+    value: string | undefined,
+): string | undefined => {
+    if (value !== undefined && Number.isNaN(new Date(value).getTime())) {
+        throw new ParameterError(`Invalid ${name}: expected an ISO date`);
+    }
+    return value;
+};
+
+// Same rationale: a non-uuid value in a whereIn on a uuid column is a
+// Postgres cast error (500), not an empty result
+const validateUuidFilter = (
+    name: string,
+    values: string[] | undefined,
+): void => {
+    if (values?.some((value) => !isUuid(value))) {
+        throw new ParameterError(`Invalid ${name}: expected UUIDs`);
+    }
+};
+
+@Route('/api/v1/aiAgents/admin')
+@Response<ApiErrorPayload>('default', 'Error')
+export class AiAgentAdminController extends BaseController {
+    /**
+     * Get all AI agent threads for admin
+     * @summary List AI agent threads
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/threads')
+    @OperationId('getAllThreads')
+    async getAllThreads(
+        @Request() req: express.Request,
+        // Pagination
+        @Query() page?: KnexPaginateArgs['page'],
+        @Query() pageSize?: KnexPaginateArgs['pageSize'],
+        // Filtering
+        @Query() projectUuids?: AiAgentAdminFilters['projectUuids'],
+        @Query() agentUuids?: AiAgentAdminFilters['agentUuids'],
+        @Query() userUuids?: AiAgentAdminFilters['userUuids'],
+        @Query() createdFrom?: AiAgentAdminFilters['createdFrom'],
+        @Query() humanScore?: AiAgentAdminFilters['humanScore'],
+        @Query() dateFrom?: AiAgentAdminFilters['dateFrom'],
+        @Query() dateTo?: AiAgentAdminFilters['dateTo'],
+        @Query() search?: AiAgentAdminFilters['search'],
+        // Sorting
+        @Query() sortField?: AiAgentAdminSort['field'],
+        @Query() sortDirection?: AiAgentAdminSort['direction'],
+    ): Promise<ApiAiAgentAdminConversationsResponse> {
+        assertRegisteredAccount(req.account);
+        const paginateArgs: KnexPaginateArgs | undefined =
+            page !== undefined || pageSize !== undefined
+                ? {
+                      page: page ?? 1,
+                      pageSize: pageSize ?? 50,
+                  }
+                : {
+                      page: 1,
+                      pageSize: 50,
+                  };
+
+        const filters: AiAgentAdminFilters = {
+            ...(projectUuids && { projectUuids }),
+            ...(agentUuids && { agentUuids }),
+            ...(userUuids && { userUuids }),
+            ...(createdFrom && { createdFrom }),
+            ...(humanScore !== undefined && { humanScore }),
+            ...(dateFrom && { dateFrom }),
+            ...(dateTo && { dateTo }),
+            ...(search && { search }),
+        };
+
+        const sort: AiAgentAdminSort | undefined = sortField
+            ? {
+                  field: sortField,
+                  direction: sortDirection ?? 'desc',
+              }
+            : undefined;
+
+        const threads = await this.getAiAgentAdminService().getAllThreads(
+            toSessionUser(req.account),
+            paginateArgs,
+            filters,
+            sort,
+        );
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: threads,
+        };
+    }
+
+    /**
+     * Get MCP tool call activity for admin
+     * @summary List MCP activity
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/mcp-activity')
+    @OperationId('getMcpActivity')
+    async getMcpActivity(
+        @Request() req: express.Request,
+        // Pagination
+        @Query() page?: KnexPaginateArgs['page'],
+        @Query() pageSize?: KnexPaginateArgs['pageSize'],
+        // Filtering
+        @Query() projectUuids?: McpActivityFilters['projectUuids'],
+        @Query() userUuids?: McpActivityFilters['userUuids'],
+        @Query() agentUuids?: McpActivityFilters['agentUuids'],
+        @Query() toolNames?: McpActivityFilters['toolNames'],
+        @Query() clientNames?: McpActivityFilters['clientNames'],
+        @Query() status?: McpActivityFilters['status'],
+        @Query() dateFrom?: McpActivityFilters['dateFrom'],
+        @Query() dateTo?: McpActivityFilters['dateTo'],
+        // Sorting
+        @Query() sortField?: McpActivitySort['field'],
+        @Query() sortDirection?: McpActivitySort['direction'],
+    ): Promise<ApiMcpActivityResponse> {
+        assertRegisteredAccount(req.account);
+        validateDateFilter('dateFrom', dateFrom);
+        validateDateFilter('dateTo', dateTo);
+        validateUuidFilter('projectUuids', projectUuids);
+        validateUuidFilter('userUuids', userUuids);
+        validateUuidFilter('agentUuids', agentUuids);
+        // Rows can carry up to 64KB of tool_args each, so cap the page size
+        const paginateArgs: KnexPaginateArgs = {
+            page: page ?? 1,
+            pageSize: Math.min(pageSize ?? 50, MCP_ACTIVITY_MAX_PAGE_SIZE),
+        };
+
+        const filters: McpActivityFilters = {
+            ...(projectUuids && { projectUuids }),
+            ...(userUuids && { userUuids }),
+            ...(agentUuids && { agentUuids }),
+            ...(toolNames && { toolNames }),
+            ...(clientNames && { clientNames }),
+            ...(status && { status }),
+            ...(dateFrom && { dateFrom }),
+            ...(dateTo && { dateTo }),
+        };
+
+        const sort: McpActivitySort | undefined = sortField
+            ? {
+                  field: sortField,
+                  direction: sortDirection ?? 'desc',
+              }
+            : undefined;
+
+        const results = await this.getAiAgentAdminService().getMcpActivity(
+            toSessionUser(req.account),
+            paginateArgs,
+            filters,
+            sort,
+        );
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results,
+        };
+    }
+
+    /**
+     * Get aggregated MCP tool call stats for admin
+     * @summary Get MCP activity stats
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/mcp-activity/stats')
+    @OperationId('getMcpActivityStats')
+    async getMcpActivityStats(
+        @Request() req: express.Request,
+        @Query() projectUuids?: McpActivityFilters['projectUuids'],
+        @Query() userUuids?: McpActivityFilters['userUuids'],
+        @Query() agentUuids?: McpActivityFilters['agentUuids'],
+        @Query() toolNames?: McpActivityFilters['toolNames'],
+        @Query() clientNames?: McpActivityFilters['clientNames'],
+        @Query() dateFrom?: McpActivityFilters['dateFrom'],
+        @Query() dateTo?: McpActivityFilters['dateTo'],
+    ): Promise<ApiMcpActivityStatsResponse> {
+        assertRegisteredAccount(req.account);
+        validateDateFilter('dateFrom', dateFrom);
+        validateDateFilter('dateTo', dateTo);
+        validateUuidFilter('projectUuids', projectUuids);
+        validateUuidFilter('userUuids', userUuids);
+        validateUuidFilter('agentUuids', agentUuids);
+
+        const filters: McpActivityStatsFilters = {
+            ...(projectUuids && { projectUuids }),
+            ...(userUuids && { userUuids }),
+            ...(agentUuids && { agentUuids }),
+            ...(toolNames && { toolNames }),
+            ...(clientNames && { clientNames }),
+            ...(dateFrom && { dateFrom }),
+            ...(dateTo && { dateTo }),
+        };
+
+        const results = await this.getAiAgentAdminService().getMcpActivityStats(
+            toSessionUser(req.account),
+            filters,
+        );
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results,
+        };
+    }
+
+    /**
+     * Get prompt activity for one project
+     * @summary Get project AI agent prompt activity
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/projects/{projectUuid}/prompt-activity')
+    @OperationId('getProjectPromptActivity')
+    async getProjectPromptActivity(
+        @Request() req: express.Request,
+        @Path() projectUuid: string,
+        @Query() days: number = 30,
+    ): Promise<ApiAiAgentAdminPromptActivityResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().getPromptActivity(
+                toSessionUser(req.account),
+                projectUuid,
+                days,
+            ),
+        };
+    }
+
+    /**
+     * Get all AI agents for admin
+     * @summary List AI agents
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/agents')
+    @OperationId('getAllAgents')
+    async getAllAgents(
+        @Request() req: express.Request,
+    ): Promise<ApiAiAgentSummaryResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().listAgents(
+                toSessionUser(req.account),
+            ),
+        };
+    }
+
+    /**
+     * Get AI agent classifier review items for admin
+     * @summary List AI agent review items
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-items')
+    @OperationId('getAiAgentReviewItems')
+    async getReviewItems(
+        @Request() req: express.Request,
+        @Query() status?: AiAgentReviewItemStatus[],
+    ): Promise<ApiAiAgentReviewItemsResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().listReviewItems(
+                toSessionUser(req.account),
+                status,
+            ),
+        };
+    }
+
+    /**
+     * Create a manual AI agent issue
+     * @summary Create AI agent review item
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('201', 'Created')
+    @Post('/review-items')
+    @OperationId('createAiAgentReviewItem')
+    async createReviewItem(
+        @Request() req: express.Request,
+        @Body() body: CreateAiAgentReviewItem,
+    ): Promise<ApiAiAgentReviewItemResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(201);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().createReviewItem(
+                toSessionUser(req.account),
+                body,
+            ),
+        };
+    }
+
+    /**
+     * Get AI agent classifier review signals for admin debugging
+     * @summary List AI agent review signals
+     */
+    /**
+     * Get a single AI agent review item (lightweight, for polling progress)
+     * @summary Get AI agent review item
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-items/{fingerprint}')
+    @OperationId('getAiAgentReviewItem')
+    async getReviewItem(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+    ): Promise<ApiAiAgentReviewItemResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().getReviewItem(
+                toSessionUser(req.account),
+                fingerprint,
+            ),
+        };
+    }
+
+    /**
+     * Rebuild judge replay inputs for historical review signals so the eval
+     * scoreboard can replay the judge offline. Read-only; feature-flag gated.
+     * @summary Capture AI review judge replay inputs
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/review-replay-capture')
+    @OperationId('captureAiAgentReviewReplayInputs')
+    async captureReviewReplayInputs(
+        @Request() req: express.Request,
+        @Body() body: AiAgentReviewReplayCaptureRequest,
+    ): Promise<ApiAiAgentReviewReplayCaptureResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentAdminService().captureReviewReplayInputs(
+                    toSessionUser(req.account),
+                    body,
+                ),
+        };
+    }
+
+    /**
+     * Get the remediation activity feed for a review item
+     * @summary Get AI agent review item activity
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-items/{fingerprint}/activity')
+    @OperationId('getAiAgentReviewItemActivity')
+    async getReviewItemActivity(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+    ): Promise<ApiAiAgentReviewItemActivityResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().getReviewItemActivity(
+                toSessionUser(req.account),
+                fingerprint,
+            ),
+        };
+    }
+
+    /**
+     * Get the file diff of the pull request linked to a review item
+     * @summary Get AI agent review item PR diff
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-items/{fingerprint}/pr-diff')
+    @OperationId('getAiAgentReviewItemPrDiff')
+    async getReviewItemPrDiff(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+    ): Promise<ApiAiAgentReviewItemPrDiffResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().getReviewItemPrDiff(
+                toSessionUser(req.account),
+                fingerprint,
+            ),
+        };
+    }
+
+    /**
+     * Get the review item linked to a remediation preview work thread
+     * @summary Get AI agent review item by preview thread
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-items/by-preview-thread/{threadUuid}')
+    @OperationId('getAiAgentReviewItemByPreviewThread')
+    async getReviewItemByPreviewThread(
+        @Request() req: express.Request,
+        @Path() threadUuid: string,
+    ): Promise<ApiAiAgentReviewItemResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentAdminService().getReviewItemByPreviewThread(
+                    toSessionUser(req.account),
+                    threadUuid,
+                ),
+        };
+    }
+
+    /**
+     * Persist the board's manual card order for one lane. Declared before the
+     * `{fingerprint}` route so "reorder" isn't matched as a fingerprint.
+     * @summary Reorder AI agent review items on the board
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch('/review-items/reorder')
+    @OperationId('reorderAiAgentReviewItems')
+    async reorderReviewItems(
+        @Request() req: express.Request,
+        @Body() body: ReorderAiAgentReviewItems,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        await this.getAiAgentAdminService().reorderReviewItems(
+            toSessionUser(req.account),
+            body.orderedFingerprints,
+        );
+        this.setStatus(200);
+        return { status: 'ok', results: undefined };
+    }
+
+    /**
+     * Update the status of an AI agent review item (e.g. dismiss it)
+     * @summary Update AI agent review item status
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch('/review-items/{fingerprint}')
+    @OperationId('updateAiAgentReviewItemStatus')
+    async updateReviewItemStatus(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+        @Body() body: UpdateAiAgentReviewItemStatus,
+    ): Promise<ApiAiAgentReviewItemResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().updateReviewItemStatus(
+                toSessionUser(req.account),
+                fingerprint,
+                body,
+            ),
+        };
+    }
+
+    /**
+     * Set the assignee on an AI agent review item
+     * @summary Update AI agent review item assignee
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch('/review-items/{fingerprint}/assignee')
+    @OperationId('updateAiAgentReviewItemAssignee')
+    async updateReviewItemAssignee(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+        @Body() body: UpdateAiAgentReviewItemAssignee,
+    ): Promise<ApiAiAgentReviewItemResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        const results =
+            await this.getAiAgentAdminService().updateReviewItemAssignee(
+                toSessionUser(req.account),
+                fingerprint,
+                body.assignedToUserUuid,
+            );
+        return { status: 'ok', results };
+    }
+
+    /**
+     * Set the priority on an AI agent review item
+     * @summary Update AI agent review item priority
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Patch('/review-items/{fingerprint}/priority')
+    @OperationId('updateAiAgentReviewItemPriority')
+    async updateReviewItemPriority(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+        @Body() body: UpdateAiAgentReviewItemPriority,
+    ): Promise<ApiAiAgentReviewItemResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        const results =
+            await this.getAiAgentAdminService().updateReviewItemPriority(
+                toSessionUser(req.account),
+                fingerprint,
+                body,
+            );
+        return { status: 'ok', results };
+    }
+
+    /**
+     * Add a comment to an AI agent review item
+     * @summary Add AI agent review item comment
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/review-items/{fingerprint}/comments')
+    @OperationId('addAiAgentReviewItemComment')
+    async addReviewItemComment(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+        @Body() body: CreateAiAgentReviewItemComment,
+    ): Promise<ApiAiAgentReviewItemActivityResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        const results =
+            await this.getAiAgentAdminService().addReviewItemComment(
+                toSessionUser(req.account),
+                fingerprint,
+                body.body,
+            );
+        return { status: 'ok', results };
+    }
+
+    /**
+     * Open a writeback pull request for a review item (semantic-layer or
+     * project-context root cause)
+     * @summary Create AI agent review item writeback PR
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/review-items/{fingerprint}/writeback')
+    @OperationId('createAiAgentReviewItemWriteback')
+    async createReviewItemWriteback(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+    ): Promise<ApiAiAgentReviewItemResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentAdminService().createReviewItemWriteback(
+                    toSessionUser(req.account),
+                    fingerprint,
+                ),
+        };
+    }
+
+    /**
+     * Re-verify a remediation after its PR changed: recompiles the existing
+     * preview and re-runs the Test-fix verification thread.
+     * @summary Retest an AI agent review remediation
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Post('/review-items/{fingerprint}/retest')
+    @OperationId('retestAiAgentReviewRemediation')
+    async retestReviewRemediation(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+    ): Promise<ApiAiAgentReviewItemActivityResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentAdminService().retestReviewRemediation(
+                    toSessionUser(req.account),
+                    fingerprint,
+                ),
+        };
+    }
+
+    /**
+     * Preview the file change a writeback PR would make, without opening it.
+     * Only project_context findings have a deterministic diff.
+     * @summary Preview AI agent review item writeback diff
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-items/{fingerprint}/writeback-preview')
+    @OperationId('getAiAgentReviewItemWritebackPreview')
+    async getReviewItemWritebackPreview(
+        @Request() req: express.Request,
+        @Path() fingerprint: string,
+    ): Promise<ApiAiAgentReviewItemWritebackPreviewResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentAdminService().getReviewItemWritebackPreview(
+                    toSessionUser(req.account),
+                    fingerprint,
+                ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-signals')
+    @OperationId('getAiAgentReviewSignals')
+    async getReviewSignals(
+        @Request() req: express.Request,
+    ): Promise<ApiAiAgentReviewSignalsResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.getAiAgentAdminService().listReviewSignals(
+                toSessionUser(req.account),
+            ),
+        };
+    }
+
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/embed-token')
+    @Hidden()
+    @OperationId('getEmbedToken')
+    async getEmbedToken(
+        @Request() req: express.Request,
+    ): Promise<{ status: string; results: { token: string; url: string } }> {
+        assertRegisteredAccount(req.account);
+        const results = await this.getAiAgentAdminService().generateEmbedToken(
+            toSessionUser(req.account),
+        );
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results,
+        };
+    }
+
+    /**
+     * Get AI review notification settings
+     * @summary Get AI review notification settings
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/review-notification-settings')
+    @OperationId('getAiReviewNotificationSettings')
+    async getReviewNotificationSettings(
+        @Request() req: express.Request,
+    ): Promise<ApiAiReviewNotificationSettingsResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentAdminService().getReviewNotificationSettings(
+                    toSessionUser(req.account),
+                ),
+        };
+    }
+
+    /**
+     * Update AI review notification settings
+     * @summary Update AI review notification settings
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Success')
+    @Put('/review-notification-settings')
+    @OperationId('updateAiReviewNotificationSettings')
+    async updateReviewNotificationSettings(
+        @Request() req: express.Request,
+        @Body() body: UpdateAiReviewNotificationSettings,
+    ): Promise<ApiAiReviewNotificationSettingsResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results:
+                await this.getAiAgentAdminService().updateReviewNotificationSettings(
+                    toSessionUser(req.account),
+                    body,
+                ),
+        };
+    }
+
+    /**
+     * Get AI organization settings
+     * @summary Get AI settings
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Retrieved AI organization settings')
+    @Get('/settings')
+    @OperationId('getAiOrganizationSettings')
+    async getSettings(
+        @Request() req: express.Request,
+    ): Promise<ApiAiOrganizationSettingsResponse> {
+        assertRegisteredAccount(req.account);
+        const settings =
+            await this.getAiOrganizationSettingsService().getSettings(
+                toSessionUser(req.account),
+            );
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: settings,
+        };
+    }
+
+    /**
+     * Update AI organization settings
+     * @summary Update AI settings
+     */
+    @Middlewares([
+        allowApiKeyAuthentication,
+        isAuthenticated,
+        unauthorisedInDemo,
+    ])
+    @SuccessResponse('200', 'Updated AI organization settings')
+    @Patch('/settings')
+    @OperationId('upsertAiOrganizationSettings')
+    async upsertSettings(
+        @Request() req: express.Request,
+        @Body() body: UpdateAiOrganizationSettings,
+    ): Promise<ApiUpdateAiOrganizationSettingsResponse> {
+        assertRegisteredAccount(req.account);
+        const settings =
+            await this.getAiOrganizationSettingsService().upsertSettings(
+                toSessionUser(req.account),
+                body,
+            );
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: settings,
+        };
+    }
+
+    protected getAiAgentAdminService() {
+        return this.services.getAiAgentAdminService<AiAgentAdminService>();
+    }
+
+    protected getAiOrganizationSettingsService() {
+        return this.services.getAiOrganizationSettingsService<AiOrganizationSettingsService>();
+    }
+}

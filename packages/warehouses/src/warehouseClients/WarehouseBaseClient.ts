@@ -1,0 +1,268 @@
+import {
+    AnyType,
+    CreateWarehouseCredentials,
+    DimensionType,
+    Metric,
+    PartitionColumn,
+    setCatalogTimestampDomain,
+    SupportedDbtAdapter,
+    TimeIntervalUnit,
+    WarehouseCatalog,
+    WarehouseResults,
+    WarehouseSqlBuilder,
+    WeekDay,
+    type TimestampDomain,
+    type WarehouseExecuteAsyncQuery,
+    type WarehouseExecuteAsyncQueryArgs,
+    type WarehousePhaseTimings,
+    type WarehouseQueryPhase,
+} from '@lightdash/common';
+import { type WarehouseClient } from '../types';
+
+export default abstract class WarehouseBaseClient<
+    T extends CreateWarehouseCredentials,
+> implements WarehouseClient {
+    credentials: T;
+
+    protected sqlBuilder: WarehouseSqlBuilder;
+
+    protected constructor(credentials: T, sqlBuilder: WarehouseSqlBuilder) {
+        this.credentials = credentials;
+        this.sqlBuilder = sqlBuilder;
+    }
+
+    getAdapterType(): SupportedDbtAdapter {
+        return this.sqlBuilder.getAdapterType();
+    }
+
+    supportsCteMaterialization(): boolean {
+        return this.sqlBuilder.supportsCteMaterialization();
+    }
+
+    getStringQuoteChar(): string {
+        return this.sqlBuilder.getStringQuoteChar();
+    }
+
+    getEscapeStringQuoteChar(): string {
+        return this.sqlBuilder.getEscapeStringQuoteChar();
+    }
+
+    getFieldQuoteChar(): string {
+        return this.sqlBuilder.getFieldQuoteChar();
+    }
+
+    getFloatingType(): string {
+        return this.sqlBuilder.getFloatingType();
+    }
+
+    getNullSafeEqualSql(left: string, right: string): string {
+        return this.sqlBuilder.getNullSafeEqualSql(left, right);
+    }
+
+    getNullSafeEqualJoinSql(left: string, right: string): string {
+        return this.sqlBuilder.getNullSafeEqualJoinSql(left, right);
+    }
+
+    buildArrayAgg(expression: string, orderBy?: string): string {
+        return this.sqlBuilder.buildArrayAgg(expression, orderBy);
+    }
+
+    buildArray(elements: string[]): string {
+        return this.sqlBuilder.buildArray(elements);
+    }
+
+    abstract getCatalog(
+        config: { database: string; schema: string; table: string }[],
+    ): Promise<WarehouseCatalog>;
+
+    abstract streamQuery(
+        query: string,
+        streamCallback: (data: WarehouseResults) => void | Promise<void>,
+        options: {
+            values?: AnyType[];
+            queryParams?: Record<string, AnyType>;
+            tags?: Record<string, string>;
+            timezone?: string;
+            onPhaseTiming?: (
+                phase: WarehouseQueryPhase,
+                durationMs: number,
+            ) => void;
+        },
+    ): Promise<void>;
+
+    async executeAsyncQuery(
+        {
+            sql,
+            values,
+            queryParams,
+            tags,
+            timezone,
+        }: WarehouseExecuteAsyncQueryArgs,
+        resultsStreamCallback?: (
+            rows: WarehouseResults['rows'],
+            fields: WarehouseResults['fields'],
+        ) => void | Promise<void>,
+    ): Promise<WarehouseExecuteAsyncQuery> {
+        let rowCount = 0;
+
+        const phaseTimings: WarehousePhaseTimings = {};
+        const startTime = performance.now();
+        await this.streamQuery(
+            sql,
+            async ({ rows, fields }) => {
+                rowCount = (rowCount ?? 0) + rows.length;
+                await resultsStreamCallback?.(rows, fields);
+            },
+            {
+                values,
+                queryParams,
+                tags,
+                timezone,
+                onPhaseTiming: (phase, durationMs) => {
+                    phaseTimings[phase] =
+                        (phaseTimings[phase] ?? 0) + durationMs;
+                },
+            },
+        );
+
+        // we could have this return further down but types are a bit messy with this union and count updating on a callback
+        return {
+            queryId: null,
+            queryMetadata: null,
+            durationMs: performance.now() - startTime,
+            totalRows: rowCount,
+            phaseTimings,
+        };
+    }
+
+    async runQuery(
+        sql: string,
+        tags?: Record<string, string>,
+        timezone?: string,
+        values?: AnyType[],
+        queryParams?: Record<string, AnyType>,
+    ) {
+        let fields: WarehouseResults['fields'] = {};
+        const rows: WarehouseResults['rows'] = [];
+
+        await this.streamQuery(
+            sql,
+            (data) => {
+                fields = data.fields;
+                rows.push(...data.rows);
+            },
+            {
+                values,
+                queryParams,
+                tags,
+                timezone,
+            },
+        );
+
+        return { fields, rows };
+    }
+
+    getMetricSql(sql: string, metric: Metric): string {
+        return this.sqlBuilder.getMetricSql(sql, metric);
+    }
+
+    getStartOfWeek(): WeekDay | null | undefined {
+        return this.sqlBuilder.getStartOfWeek();
+    }
+
+    async test(): Promise<void> {
+        await this.runQuery('SELECT 1');
+    }
+
+    concatString(...args: string[]): string {
+        return this.sqlBuilder.concatString(...args);
+    }
+
+    abstract getAllTables(
+        schema?: string,
+        tags?: Record<string, string>,
+    ): Promise<
+        {
+            database: string;
+            schema: string;
+            table: string;
+            partitionColumn?: PartitionColumn;
+        }[]
+    >;
+
+    abstract getFields(
+        tableName: string,
+        schema?: string,
+        database?: string,
+        tags?: Record<string, string>,
+    ): Promise<WarehouseCatalog>;
+
+    parseWarehouseCatalog(
+        rows: Record<string, AnyType>[],
+        mapFieldType: (type: string) => DimensionType,
+        mapTimestampDomain?: (type: string) => TimestampDomain | undefined,
+    ): WarehouseCatalog {
+        return rows.reduce(
+            (
+                acc,
+                {
+                    table_catalog,
+                    table_schema,
+                    table_name,
+                    column_name,
+                    data_type,
+                },
+            ) => {
+                acc[table_catalog] = acc[table_catalog] || {};
+                acc[table_catalog][table_schema] =
+                    acc[table_catalog][table_schema] || {};
+                acc[table_catalog][table_schema][table_name] =
+                    acc[table_catalog][table_schema][table_name] || {};
+                if (column_name && data_type) {
+                    acc[table_catalog][table_schema][table_name][column_name] =
+                        mapFieldType(data_type);
+                    setCatalogTimestampDomain(
+                        acc,
+                        table_catalog,
+                        table_schema,
+                        table_name,
+                        column_name,
+                        mapTimestampDomain?.(data_type),
+                    );
+                }
+                return acc;
+            },
+            {},
+        );
+    }
+
+    parseError(error: Error): Error {
+        return error;
+    }
+
+    escapeString(value: string): string {
+        return this.sqlBuilder.escapeString(value);
+    }
+
+    castToTimestamp(date: Date): string {
+        return this.sqlBuilder.castToTimestamp(date);
+    }
+
+    getIntervalSql(value: number, unit: TimeIntervalUnit): string {
+        return this.sqlBuilder.getIntervalSql(value, unit);
+    }
+
+    getTimestampDiffSeconds(
+        startTimestampSql: string,
+        endTimestampSql: string,
+    ): string {
+        return this.sqlBuilder.getTimestampDiffSeconds(
+            startTimestampSql,
+            endTimestampSql,
+        );
+    }
+
+    getMedianSql(valueSql: string): string {
+        return this.sqlBuilder.getMedianSql(valueSql);
+    }
+}

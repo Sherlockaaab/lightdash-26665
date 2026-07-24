@@ -1,0 +1,514 @@
+import {
+    GoogleSheetsTransientError,
+    QueueTraceProperties,
+    ResultsExpiredError,
+    SCHEDULER_TASKS,
+    SchedulerTaskName,
+    TaskPayloadMap,
+} from '@lightdash/common';
+import * as Sentry from '@sentry/node';
+import { JobHelpers, Task, TaskList } from 'graphile-worker';
+import moment from 'moment';
+import ExecutionContext from 'node-execution-context';
+import { ExecutionContextInfo } from '../logging/winston';
+import {
+    noopOrganizationNameResolver,
+    type OrganizationNameResolver,
+} from '../sentry/organizationNameResolver';
+import { continueTrace, traceSpan } from '../tracing/tracing';
+import { TypedTask, type TypedTaskList } from './types';
+
+const getTagsForTask: {
+    [K in SchedulerTaskName]: (
+        payload: TaskPayloadMap[K],
+    ) => Record<string, string>;
+} = {
+    [SCHEDULER_TASKS.HANDLE_SCHEDULED_DELIVERY]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.SEND_SLACK_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SEND_MSTEAMS_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SEND_GOOGLE_CHAT_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SEND_EMAIL_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    // Batch notification tasks
+    [SCHEDULER_TASKS.SEND_SLACK_BATCH_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SEND_EMAIL_BATCH_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SEND_MSTEAMS_BATCH_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SEND_GOOGLE_CHAT_BATCH_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.UPLOAD_GSHEETS]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.UPLOAD_GSHEET_FROM_QUERY]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.VALIDATE_PROJECT]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.COMPILE_PROJECT]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.MATERIALIZE_PRE_AGGREGATE]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.CREATE_PROJECT_WITH_COMPILE]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': '',
+    }),
+
+    [SCHEDULER_TASKS.TEST_AND_COMPILE_PROJECT]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.SQL_RUNNER]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.SQL_RUNNER_PIVOT_QUERY]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.REPLACE_CUSTOM_FIELDS]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.INDEX_CATALOG]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.GENERATE_DAILY_JOBS]: () => ({}),
+
+    [SCHEDULER_TASKS.EXPORT_CSV_DASHBOARD]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.EXPORT_CONTENT]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.SLACK_AI_PROMPT]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.AI_AGENT_EVAL_RESULT]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.AI_AGENT_REVIEW_CLASSIFIER]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'project.uuid': payload.projectUuid,
+        'agent.uuid': payload.agentUuid,
+        'thread.uuid': payload.threadUuid,
+        'prompt.uuid': payload.promptUuid,
+        'ai_agent_review.event_type': payload.eventType,
+    }),
+
+    [SCHEDULER_TASKS.AI_AGENT_REVIEW_WRITEBACK]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'project.uuid': payload.projectUuid,
+        'user.uuid': payload.userUuid,
+    }),
+
+    [SCHEDULER_TASKS.AI_AGENT_REVIEW_REMEDIATION_PREVIEW]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'project.uuid': payload.projectUuid,
+        'user.uuid': payload.userUuid,
+        'ai_agent_review.fingerprint': payload.fingerprint,
+        'ai_agent_review.remediation_uuid': payload.remediationUuid,
+    }),
+
+    [SCHEDULER_TASKS.AI_AGENT_REVIEW_REMEDIATION_COMPILE]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'project.uuid': payload.projectUuid,
+        'user.uuid': payload.userUuid,
+        'ai_agent_review.fingerprint': payload.fingerprint,
+        'ai_agent_review.remediation_uuid': payload.remediationUuid,
+    }),
+
+    [SCHEDULER_TASKS.AI_AGENT_REVIEW_REMEDIATION_RUN]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'project.uuid': payload.projectUuid,
+        'user.uuid': payload.userUuid,
+        'agent.uuid': payload.agentUuid,
+        'thread.uuid': payload.threadUuid,
+        'ai_agent_review.fingerprint': payload.fingerprint,
+        'ai_agent_review.remediation_uuid': payload.remediationUuid,
+    }),
+
+    [SCHEDULER_TASKS.SEND_REVIEW_NOTIFICATION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'project.uuid': payload.projectUuid,
+        'user.uuid': payload.userUuid ?? '',
+    }),
+
+    [SCHEDULER_TASKS.EMBED_ARTIFACT_VERSION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.GENERATE_ARTIFACT_QUESTION]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.RENAME_RESOURCES]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+
+    [SCHEDULER_TASKS.CLEAN_QUERY_HISTORY]: () => ({}),
+    [SCHEDULER_TASKS.DOWNLOAD_ASYNC_QUERY_RESULTS]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SYNC_SLACK_CHANNELS]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+    }),
+    [SCHEDULER_TASKS.GENERATE_SLACK_CHANNEL_SYNC_JOBS]: () => ({}),
+    [SCHEDULER_TASKS.CHECK_FOR_STUCK_JOBS]: () => ({}),
+    [SCHEDULER_TASKS.CLEAN_DEPLOY_SESSIONS]: () => ({}),
+    [SCHEDULER_TASKS.MANAGED_AGENT_HEARTBEAT]: (payload) => ({
+        'project.uuid': payload.projectUuid,
+        'managed_agent.triggered_by': payload.triggeredBy ?? 'cron',
+    }),
+    [SCHEDULER_TASKS.APP_GENERATE_PIPELINE]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.APP_BUILD_FROM_SOURCE]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.SWEEP_STALE_APP_LOCKS]: () => ({}),
+    [SCHEDULER_TASKS.SWEEP_STALE_AI_WRITEBACK_RUNS]: () => ({}),
+    [SCHEDULER_TASKS.SWEEP_STALE_AI_DEEP_RESEARCH_RUNS]: () => ({}),
+    [SCHEDULER_TASKS.CLEAN_MCP_TOOL_CALLS]: () => ({}),
+    [SCHEDULER_TASKS.AI_WRITEBACK_PIPELINE]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.AI_DEEP_RESEARCH]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.AGENT_ONBOARDING_RUN]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+        'agent_onboarding.run_uuid': payload.agentOnboardingRunUuid,
+    }),
+    [SCHEDULER_TASKS.AI_AGENT_EDIT_DBT_PROJECT_PIPELINE]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+    [SCHEDULER_TASKS.CLEAN_EXPIRED_PREVIEWS]: () => ({}),
+    [SCHEDULER_TASKS.COMPACT_USAGE_EVENTS]: () => ({}),
+    [SCHEDULER_TASKS.POLL_EMAIL_WHITELABEL]: () => ({}),
+    [SCHEDULER_TASKS.INGEST_PROJECT_CONTEXT]: (payload) => ({
+        'organization.uuid': payload.organizationUuid,
+        'user.uuid': payload.userUuid,
+        'project.uuid': payload.projectUuid,
+    }),
+} as const;
+
+const getTagsFromPayload = <T extends SchedulerTaskName>(
+    taskName: T,
+    payload: TaskPayloadMap[T],
+): Record<string, string> => {
+    const tagFn = getTagsForTask[taskName];
+    return typeof tagFn === 'function' ? tagFn(payload) : {};
+};
+
+type TraceTaskOptions = {
+    resolveOrganizationName?: OrganizationNameResolver;
+};
+
+/**
+ * Traces a task and adds tags to the Sentry span
+ * @param taskName - The name of the task to trace
+ * @param task - The task to trace
+ * @param options - Options including an optional org-name resolver
+ * @returns A function that can be used to trace a task
+ */
+export const traceTask = <T extends SchedulerTaskName>(
+    taskName: T,
+    task: TypedTask<TaskPayloadMap[T]>,
+    options: TraceTaskOptions = {},
+) => {
+    const resolveOrganizationName =
+        options.resolveOrganizationName ?? noopOrganizationNameResolver;
+    const tracedTask: (
+        payload: TaskPayloadMap[T] & QueueTraceProperties,
+        helpers: JobHelpers,
+    ) => void = async (payload, helpers) => {
+        const { traceHeader, baggageHeader, otelTraceparent, otelBaggage } =
+            payload;
+
+        await continueTrace(
+            {
+                sentryTrace: traceHeader,
+                traceparent: otelTraceparent,
+                baggage: otelBaggage ?? baggageHeader,
+            },
+            async () =>
+                traceSpan(
+                    {
+                        name: `worker.task.${taskName}`,
+                        attributes: {
+                            'scheduler.task': taskName,
+                            'job.id': helpers.job.id,
+                            'job.queue': helpers.job.queue_name || 'unknown',
+                            'job.attempts': helpers.job.attempts,
+                            'job.max_attempts': helpers.job.max_attempts,
+                        },
+                    },
+                    async (span) => {
+                        const { job } = helpers;
+
+                        const payloadTags = getTagsFromPayload(
+                            taskName,
+                            payload,
+                        );
+
+                        const organizationUuid =
+                            payloadTags['organization.uuid'];
+
+                        const organizationName = organizationUuid
+                            ? await resolveOrganizationName(
+                                  organizationUuid,
+                              ).catch(() => undefined)
+                            : undefined;
+
+                        // Sentry tags below are error-scope only; stamp the
+                        // attribution on the task span so it's queryable in
+                        // the trace backend.
+                        span.setAttributes({
+                            ...payloadTags,
+                            ...(organizationName && {
+                                'organization.name': organizationName,
+                            }),
+                        });
+
+                        if ('user.uuid' in payloadTags) {
+                            Sentry.setUser({
+                                id: payloadTags['user.uuid'],
+                                organization: organizationUuid,
+                            });
+                        }
+
+                        Sentry.setTags({
+                            'scheduler.task': taskName,
+                            'worker.task.name': taskName,
+                            'job.id': job.id,
+                            'worker.id': job.locked_by,
+                            'worker.job.id': job.id,
+                            'worker.job.task_identifier': job.task_identifier,
+                            'worker.job.attempts': job.attempts,
+                            'worker.job.max_attempts': job.max_attempts,
+                            ...(job.locked_at && {
+                                'worker.job.locked_at': moment(
+                                    job.locked_at,
+                                ).toISOString(),
+                            }),
+                            ...(job.created_at && {
+                                'worker.job.created_at':
+                                    job.created_at.toISOString(),
+                            }),
+                            ...(job.locked_by && {
+                                'worker.job.locked_by': job.locked_by,
+                            }),
+                            ...(job.key && {
+                                'worker.job.key': job.key,
+                            }),
+                            ...('organizationUuid' in payloadTags &&
+                                typeof payloadTags.organizationUuid ===
+                                    'string' && {
+                                    'worker.task.organization_id':
+                                        payloadTags.organizationUuid,
+                                }),
+                            ...payloadTags,
+                            ...(organizationName && {
+                                'organization.name': organizationName,
+                            }),
+                        });
+
+                        try {
+                            const executionContext: ExecutionContextInfo = {
+                                worker: {
+                                    id: job.locked_by,
+                                },
+                                job: {
+                                    id: job.id,
+                                    queue_name: job.queue_name,
+                                    task_identifier: job.task_identifier,
+                                    priority: job.priority,
+                                    attempts: job.attempts,
+                                },
+                                ...(organizationUuid && {
+                                    organization_uuid: organizationUuid,
+                                }),
+                                ...(organizationName && {
+                                    organization_name: organizationName,
+                                }),
+                            };
+                            await ExecutionContext.run(
+                                () => task(payload, helpers),
+                                executionContext,
+                            );
+                        } catch (e) {
+                            span.setStatus({
+                                code: 2, // Error
+                            });
+
+                            // Add breadcrumb for worker context
+                            Sentry.addBreadcrumb({
+                                category: 'worker',
+                                message: `Error occurred in scheduler worker context - ${taskName}`,
+                                level: 'error',
+                                data: {
+                                    taskName,
+                                    jobId: String(job.id),
+                                    workerInstance: job.locked_by,
+                                },
+                            });
+
+                            // Only capture to Sentry if this is the final attempt or it's not a retryable error
+                            // ResultsExpiredError is expected (expired S3 cache) and should not go to Sentry
+                            const isRetryableError =
+                                e instanceof GoogleSheetsTransientError;
+                            const isExpectedError =
+                                e instanceof ResultsExpiredError;
+                            const hasRetriesRemaining =
+                                job.attempts < job.max_attempts;
+
+                            if (
+                                !isExpectedError &&
+                                (!isRetryableError || !hasRetriesRemaining)
+                            ) {
+                                Sentry.withScope((scope) => {
+                                    scope.setFingerprint([
+                                        'scheduler_worker',
+                                        taskName,
+                                        (e as Error).name || 'Error',
+                                        (e as Error).message || 'Unknown error',
+                                    ]);
+                                    Sentry.captureException(e);
+                                });
+                            }
+
+                            throw e;
+                        }
+                    },
+                ),
+        );
+    };
+    return tracedTask;
+};
+
+/**
+ * Traces a list of tasks and converts them to a Graphile Worker TaskList
+ * @param tasks - The list of tasks to trace
+ * @param options - Options including an optional org-name resolver
+ * @returns A list of traced tasks that can be used in a Graphile Worker
+ */
+export const traceTasks = (
+    tasks: Partial<TypedTaskList>,
+    options: TraceTaskOptions = {},
+) => {
+    const tracedTasks = Object.keys(tasks).reduce<TaskList>(
+        (accTasks, taskName) => {
+            const handler = tasks[
+                taskName as keyof TypedTaskList
+            ] as TypedTask<unknown>;
+            return {
+                ...accTasks,
+                // NOTE: Graphile Worker requires the task to be of type Task, which is not typed. We need to cast it to unknown.
+                [taskName]: traceTask(
+                    taskName as SchedulerTaskName,
+                    handler,
+                    options,
+                ) as Task,
+            };
+        },
+        {} as TaskList,
+    );
+    return tracedTasks;
+};

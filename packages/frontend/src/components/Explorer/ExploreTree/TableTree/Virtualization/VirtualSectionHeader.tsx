@@ -1,0 +1,215 @@
+import { subject } from '@casl/ability';
+import { FeatureFlags, isCustomSqlDimension } from '@lightdash/common';
+import { Button, Group, Text, ActionIcon, Tooltip } from '@mantine-8/core';
+import { IconCode, IconPlus } from '@tabler/icons-react';
+import { memo, useCallback, useMemo, type FC } from 'react';
+import {
+    explorerActions,
+    selectAdditionalMetrics,
+    selectCustomDimensions,
+    useExplorerDispatch,
+    useExplorerSelector,
+} from '../../../../../features/explorer/store';
+import { useProjectUuid } from '../../../../../hooks/useProjectUuid';
+import { useServerFeatureFlag } from '../../../../../hooks/useServerOrClientFeatureFlag';
+import useApp from '../../../../../providers/App/useApp';
+import useTracking from '../../../../../providers/Tracking/useTracking';
+import { EventName } from '../../../../../types/Events';
+import MantineIcon from '../../../../common/MantineIcon';
+import DocumentationHelpButton from '../../../../DocumentationHelpButton';
+import { TreeSection, type SectionHeaderItem } from './types';
+
+interface VirtualSectionHeaderProps {
+    item: SectionHeaderItem;
+}
+
+/**
+ * Renders a section header (Dimensions, Metrics, etc.) in the virtualized tree
+ */
+const VirtualSectionHeaderComponent: FC<VirtualSectionHeaderProps> = ({
+    item,
+}) => {
+    const { label, color, depth, tableName, treeSection, helpButton } =
+        item.data;
+    const projectUuid = useProjectUuid();
+    const { user } = useApp();
+    const { track } = useTracking();
+    const dispatch = useExplorerDispatch();
+
+    // Get all custom metrics and dimensions for write-back
+    const additionalMetrics = useExplorerSelector(selectAdditionalMetrics);
+    const allCustomDimensions = useExplorerSelector(selectCustomDimensions);
+
+    // Write-back requires a base dimension column to attach the metric to in YAML
+    const allAdditionalMetrics = useMemo(
+        () => additionalMetrics?.filter((metric) => metric.baseDimensionName),
+        [additionalMetrics],
+    );
+
+    // Feature flag for bin dimensions write-back
+    const { data: writeBackCustomBinDimensionsFlag } = useServerFeatureFlag(
+        FeatureFlags.WriteBackCustomBinDimensions,
+    );
+    const isWriteBackCustomBinDimensionsEnabled =
+        writeBackCustomBinDimensionsFlag?.enabled ?? false;
+
+    const canManageCustomFields = user.data?.ability?.can(
+        'manage',
+        subject('CustomFields', {
+            organizationUuid: user.data.organizationUuid,
+            projectUuid,
+        }),
+    );
+
+    const customDimensionsToWriteBack = useMemo(() => {
+        if (!allCustomDimensions) return [];
+        const baseList = isWriteBackCustomBinDimensionsEnabled
+            ? allCustomDimensions
+            : allCustomDimensions.filter(isCustomSqlDimension);
+        return canManageCustomFields
+            ? baseList
+            : baseList.filter((dim) => !isCustomSqlDimension(dim));
+    }, [
+        allCustomDimensions,
+        isWriteBackCustomBinDimensionsEnabled,
+        canManageCustomFields,
+    ]);
+
+    const handleAddCustomDimension = useCallback(() => {
+        dispatch(
+            explorerActions.toggleCustomDimensionModal({
+                isEditing: false,
+                table: tableName,
+                item: undefined,
+            }),
+        );
+    }, [dispatch, tableName]);
+
+    const handleWriteBackCustomMetrics = useCallback(() => {
+        if (projectUuid && user.data?.organizationUuid) {
+            track({
+                name: EventName.WRITE_BACK_FROM_CUSTOM_METRIC_HEADER_CLICKED,
+                properties: {
+                    userId: user.data.userUuid,
+                    projectId: projectUuid,
+                    organizationId: user.data.organizationUuid,
+                    customMetricsCount: allAdditionalMetrics?.length || 0,
+                    customDimensionsCount: 0,
+                },
+            });
+        }
+        dispatch(
+            explorerActions.toggleWriteBackModal({
+                items: allAdditionalMetrics,
+            }),
+        );
+    }, [projectUuid, user.data, allAdditionalMetrics, dispatch, track]);
+
+    const handleWriteBackCustomDimensions = useCallback(() => {
+        if (projectUuid && user.data?.organizationUuid) {
+            track({
+                name: EventName.WRITE_BACK_FROM_CUSTOM_DIMENSION_HEADER_CLICKED,
+                properties: {
+                    userId: user.data.userUuid,
+                    projectId: projectUuid,
+                    organizationId: user.data.organizationUuid,
+                    customMetricsCount: 0,
+                    customDimensionsCount:
+                        customDimensionsToWriteBack?.length || 0,
+                },
+            });
+        }
+        dispatch(
+            explorerActions.toggleWriteBackModal({
+                items: customDimensionsToWriteBack || [],
+            }),
+        );
+    }, [projectUuid, user.data, customDimensionsToWriteBack, dispatch, track]);
+
+    // Section headers use simplified padding: depth * 20
+    // (no base 12px like tree nodes)
+    const pl = useMemo(() => {
+        return depth ? `${depth * 20}px` : undefined;
+    }, [depth]);
+
+    const showAddButton =
+        treeSection === TreeSection.Dimensions && canManageCustomFields;
+
+    const showWriteBackCustomMetrics =
+        treeSection === TreeSection.CustomMetrics &&
+        allAdditionalMetrics &&
+        allAdditionalMetrics.length > 0;
+
+    const showWriteBackCustomDimensions =
+        treeSection === TreeSection.CustomDimensions &&
+        customDimensionsToWriteBack.length > 0;
+
+    return (
+        <Group mt="sm" mb="xs" pl={pl} pr="sm" justify="space-between">
+            <Group gap="xs">
+                <Text fz="sm" fw={600} c={color}>
+                    {label}
+                </Text>
+                {helpButton && (
+                    <DocumentationHelpButton
+                        href={helpButton.href}
+                        tooltipProps={{
+                            label: helpButton.tooltipText,
+                            multiline: true,
+                        }}
+                    />
+                )}
+            </Group>
+
+            <Group gap="xs">
+                {showAddButton && (
+                    <Tooltip
+                        label="Add a custom dimension with SQL"
+                        position="left"
+                    >
+                        <Button
+                            variant="subtle"
+                            size="compact-xs"
+                            leftSection={<MantineIcon icon={IconPlus} />}
+                            onClick={handleAddCustomDimension}
+                            data-testid="VirtualSectionHeader/AddCustomDimensionButton"
+                        >
+                            Add
+                        </Button>
+                    </Tooltip>
+                )}
+
+                {showWriteBackCustomMetrics && (
+                    <Tooltip label="Write back custom metrics">
+                        <ActionIcon
+                            variant="subtle"
+                            color="gray"
+                            onClick={handleWriteBackCustomMetrics}
+                            data-testid="VirtualSectionHeader/WriteBackCustomMetricsButton"
+                        >
+                            <MantineIcon icon={IconCode} />
+                        </ActionIcon>
+                    </Tooltip>
+                )}
+
+                {showWriteBackCustomDimensions && (
+                    <Tooltip label="Write back custom dimensions">
+                        <ActionIcon
+                            variant="subtle"
+                            color="gray"
+                            onClick={handleWriteBackCustomDimensions}
+                            data-testid="VirtualSectionHeader/WriteBackCustomDimensionsButton"
+                        >
+                            <MantineIcon icon={IconCode} />
+                        </ActionIcon>
+                    </Tooltip>
+                )}
+            </Group>
+        </Group>
+    );
+};
+
+const VirtualSectionHeader = memo(VirtualSectionHeaderComponent);
+VirtualSectionHeader.displayName = 'VirtualSectionHeader';
+
+export default VirtualSectionHeader;

@@ -1,0 +1,52 @@
+import { type WarehouseTypes } from '@lightdash/common';
+import { Button, Stack } from '@mantine-8/core';
+import { IconChevronLeft } from '@tabler/icons-react';
+import { type FC } from 'react';
+import { CreateProjectConnection } from '../..';
+import MantineIcon from '../../../common/MantineIcon';
+import { OnboardingTitle } from '../common/OnboardingTitle';
+import { getWarehouseLabel } from '../utils';
+
+interface ConnectManuallyStep2Props {
+    isCreatingFirstProject: boolean;
+    selectedWarehouse: WarehouseTypes;
+    warehouseOnly?: boolean;
+    onBack: () => void;
+    successRedirect?: (projectUuid: string) => string;
+}
+
+const ConnectManuallyStep2: FC<ConnectManuallyStep2Props> = ({
+    isCreatingFirstProject,
+    selectedWarehouse,
+    warehouseOnly = false,
+    onBack,
+    successRedirect,
+}) => {
+    return (
+        <>
+            <Stack align="flex-start">
+                <Button
+                    variant="subtle"
+                    size="sm"
+                    leftSection={<MantineIcon icon={IconChevronLeft} />}
+                    onClick={onBack}
+                >
+                    Back
+                </Button>
+
+                <OnboardingTitle>
+                    Create a {getWarehouseLabel(selectedWarehouse)} connection
+                </OnboardingTitle>
+
+                <CreateProjectConnection
+                    isCreatingFirstProject={isCreatingFirstProject}
+                    selectedWarehouse={selectedWarehouse}
+                    warehouseOnly={warehouseOnly}
+                    successRedirect={successRedirect}
+                />
+            </Stack>
+        </>
+    );
+};
+
+export default ConnectManuallyStep2;

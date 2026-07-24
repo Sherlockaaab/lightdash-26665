@@ -1,0 +1,93 @@
+import {
+    TextInput,
+    Stack,
+    Title,
+    Button,
+    SegmentedControl,
+    Select,
+    Switch,
+    Card,
+} from '@mantine-8/core';
+import type { Meta, StoryObj } from '@storybook/react-vite';
+
+interface FormCardProps {
+    hasError?: boolean;
+}
+
+export function FormCard({ hasError = false }: FormCardProps) {
+    const errorMessage = hasError ? 'This field is required' : undefined;
+
+    return (
+        <Card shadow="subtle" radius="md" p="lg" withBorder={false}>
+            <Stack>
+                <Title order={4}>This is a form card</Title>
+                <Stack>
+                    <TextInput
+                        radius="md"
+                        label="Name"
+                        placeholder="Name"
+                        error={errorMessage}
+                    />
+                    <TextInput
+                        radius="md"
+                        label="Email"
+                        placeholder="Email"
+                        error={errorMessage}
+                    />
+                    <TextInput
+                        radius="md"
+                        label="Phone"
+                        placeholder="Phone"
+                        error={errorMessage}
+                    />
+                    <Select
+                        allowDeselect={false}
+                        radius="md"
+                        label="Login options"
+                        placeholder="Select"
+                        data={['Option 1', 'Option 2', 'Option 3']}
+                        error={errorMessage}
+                    />
+                    <Switch label="Remember me" />
+                    <SegmentedControl
+                        radius="md"
+                        data={['Option 1', 'Option 2', 'Option 3']}
+                        style={{
+                            alignSelf: 'flex-start',
+                        }}
+                    />
+                    <Button
+                        type="submit"
+                        radius="md"
+                        variant="dark"
+                        style={{
+                            alignSelf: 'flex-end',
+                        }}
+                    >
+                        Submit
+                    </Button>
+                </Stack>
+            </Stack>
+        </Card>
+    );
+}
+
+const meta: Meta<typeof FormCard> = {
+    component: FormCard,
+    argTypes: {
+        hasError: {
+            control: 'boolean',
+            description: 'Toggle error state for all form inputs',
+            defaultValue: false,
+        },
+    },
+};
+
+export default meta;
+type Story = StoryObj<typeof FormCard>;
+
+export const Primary: Story = {
+    args: {
+        hasError: false,
+    },
+};

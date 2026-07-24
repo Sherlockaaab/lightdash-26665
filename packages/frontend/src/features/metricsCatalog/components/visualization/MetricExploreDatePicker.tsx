@@ -1,0 +1,345 @@
+import {
+    formatDate,
+    TimeFrames,
+    type MetricExplorerDateRange,
+    type TimeDimensionConfig,
+} from '@lightdash/common';
+import {
+    TextInput,
+    Box,
+    Divider,
+    Group,
+    Stack,
+    Text,
+    UnstyledButton,
+    Button,
+    SegmentedControl,
+    Popover,
+    Tooltip,
+} from '@mantine-8/core';
+import { DatePicker, MonthPicker, YearPicker } from '@mantine/dates';
+import { useCallback, useEffect, useRef, type FC } from 'react';
+import useTracking from '../../../../providers/Tracking/useTracking';
+import { EventName } from '../../../../types/Events';
+import { useAppSelector } from '../../../sqlRunner/store/hooks';
+import { useDateRangePicker } from '../../hooks/useDateRangePicker';
+import { getMatchingPresetLabel } from '../../utils/metricExploreDate';
+import styles from './MetricExploreDatePicker.module.css';
+import { TimeDimensionIntervalPicker } from './TimeDimensionIntervalPicker';
+
+type Props = {
+    dateRange: MetricExplorerDateRange;
+    onChange: (dateRange: MetricExplorerDateRange) => void;
+    showTimeDimensionIntervalPicker: boolean;
+    timeDimensionBaseField: TimeDimensionConfig | undefined;
+    setTimeDimensionOverride: (
+        timeDimensionOverride: TimeDimensionConfig | undefined,
+    ) => void;
+    timeInterval: TimeFrames;
+    onTimeIntervalChange: (timeInterval: TimeFrames) => void;
+    isFetching: boolean;
+    disabled?: boolean;
+};
+
+export const MetricExploreDatePicker: FC<Props> = ({
+    dateRange,
+    onChange,
+    showTimeDimensionIntervalPicker,
+    timeDimensionBaseField,
+    timeInterval,
+    onTimeIntervalChange,
+    setTimeDimensionOverride,
+    isFetching,
+    disabled = false,
+}) => {
+    const { track } = useTracking();
+    const userUuid = useAppSelector(
+        (state) => state.metricsCatalog.user?.userUuid,
+    );
+    const organizationUuid = useAppSelector(
+        (state) => state.metricsCatalog.organizationUuid,
+    );
+    const projectUuid = useAppSelector(
+        (state) => state.metricsCatalog.projectUuid,
+    );
+    const {
+        isOpen,
+        tempSelectedPreset,
+        presets,
+        buttonLabel,
+        formattedTempDateRange,
+        handleOpen,
+        handleApply,
+        handlePresetSelect,
+        reset,
+        calendarConfig,
+    } = useDateRangePicker({
+        value: dateRange,
+        onChange,
+        timeInterval,
+    });
+
+    const handleTrackDateFilterApplied = useCallback(() => {
+        track({
+            name: EventName.METRICS_CATALOG_EXPLORE_DATE_FILTER_APPLIED,
+            properties: {
+                organizationId: organizationUuid,
+                projectId: projectUuid,
+                userId: userUuid,
+            },
+        });
+    }, [organizationUuid, projectUuid, track, userUuid]);
+
+    const lastStableMatchingPresetLabel = useRef(
+        getMatchingPresetLabel(dateRange, timeInterval),
+    );
+
+    useEffect(() => {
+        if (!isFetching) {
+            lastStableMatchingPresetLabel.current = getMatchingPresetLabel(
+                dateRange,
+                timeInterval,
+            );
+        }
+    }, [dateRange, timeInterval, isFetching]);
+
+    const effectiveMatchingPresetLabel = isFetching
+        ? lastStableMatchingPresetLabel.current
+        : getMatchingPresetLabel(dateRange, timeInterval);
+
+    const customWithPresets = [
+        {
+            label: effectiveMatchingPresetLabel ? (
+                'Custom'
+            ) : (
+                <UnstyledButton
+                    onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+                        e.stopPropagation();
+                        handleOpen(true);
+                    }}
+                >
+                    <Text size="sm" fw={500} c="ldDark.8">
+                        Custom:{' '}
+                        <Text size="sm" fw={500} c="ldGray.6" span>
+                            {buttonLabel}
+                        </Text>
+                    </Text>
+                </UnstyledButton>
+            ),
+            value: 'custom',
+        },
+        ...presets.map((preset) => ({
+            label: (
+                <Tooltip
+                    label={`${formatDate(preset.getValue()[0])} to ${formatDate(
+                        preset.getValue()[1],
+                    )}`}
+                >
+                    <Box>{preset.controlLabel}</Box>
+                </Tooltip>
+            ),
+            value: preset.controlLabel,
+        })),
+    ];
+
+    return (
+        <Popover
+            opened={isOpen}
+            onChange={handleOpen}
+            position="bottom-start"
+            shadow="sm"
+        >
+            <Popover.Target>
+                <Group justify="space-between" w="fill-available" wrap="nowrap">
+                    <SegmentedControl
+                        disabled={isFetching || disabled}
+                        size="xs"
+                        h={32}
+                        data={customWithPresets}
+                        value={
+                            isOpen ||
+                            !timeDimensionBaseField ||
+                            !effectiveMatchingPresetLabel ||
+                            !presets.some(
+                                (p) =>
+                                    p.controlLabel ===
+                                    effectiveMatchingPresetLabel,
+                            )
+                                ? 'custom'
+                                : effectiveMatchingPresetLabel
+                        }
+                        onChange={(value) => {
+                            if (isFetching) return;
+
+                            if (value === 'custom') {
+                                handleOpen(true);
+                            } else {
+                                handleOpen(false);
+
+                                const presetDateRange = presets
+                                    .find(
+                                        (preset) =>
+                                            preset.controlLabel === value,
+                                    )
+                                    ?.getValue();
+                                if (presetDateRange) {
+                                    handleTrackDateFilterApplied();
+                                    onChange(
+                                        presetDateRange as MetricExplorerDateRange,
+                                    );
+                                }
+                            }
+                        }}
+                        transitionDuration={300}
+                        transitionTimingFunction="linear"
+                        withItemsBorders={false}
+                        classNames={{
+                            root: styles.root,
+                            label: styles.label,
+                            indicator: styles.indicator,
+                        }}
+                    />
+                    {showTimeDimensionIntervalPicker &&
+                        timeDimensionBaseField && (
+                            <Tooltip
+                                label="Change granularity"
+                                position="top"
+                                withinPortal
+                            >
+                                <Box>
+                                    <TimeDimensionIntervalPicker
+                                        dimension={timeDimensionBaseField}
+                                        onChange={(value) => {
+                                            setTimeDimensionOverride(value);
+                                            onTimeIntervalChange(
+                                                value?.interval ?? timeInterval,
+                                            );
+                                            reset();
+                                        }}
+                                    />
+                                </Box>
+                            </Tooltip>
+                        )}
+                </Group>
+            </Popover.Target>
+
+            <Popover.Dropdown p={0}>
+                <Group gap={0} align="flex-start">
+                    <Stack gap={2} py="xs" px="sm">
+                        {presets.map((preset) => (
+                            <UnstyledButton
+                                key={preset.label}
+                                onClick={() => handlePresetSelect(preset)}
+                                data-selected={
+                                    tempSelectedPreset?.label ===
+                                        preset.label || undefined
+                                }
+                                className={styles.presetButton}
+                            >
+                                {preset.label}
+                            </UnstyledButton>
+                        ))}
+                    </Stack>
+
+                    <Divider orientation="vertical" color="ldGray.2" />
+                    <Stack gap={0}>
+                        <Box px="xs">
+                            {calendarConfig?.type === TimeFrames.YEAR ? (
+                                <YearPicker
+                                    {...calendarConfig.props}
+                                    mih={180}
+                                    w="100%"
+                                    color="dark"
+                                    size="xs"
+                                />
+                            ) : calendarConfig?.type === TimeFrames.MONTH ? (
+                                <MonthPicker
+                                    {...calendarConfig.props}
+                                    mih={180}
+                                    color="dark"
+                                    size="xs"
+                                />
+                            ) : (
+                                <DatePicker
+                                    {...calendarConfig?.props}
+                                    mih={225}
+                                    color="dark"
+                                    size="xs"
+                                    withCellSpacing={false}
+                                />
+                            )}
+                        </Box>
+                        <Divider color="ldGray.2" />
+                        <Box p="sm">
+                            <Group justify="space-between" gap="xl">
+                                <Group gap="xs">
+                                    <TextInput
+                                        size="xs"
+                                        radius="md"
+                                        w={100}
+                                        value={formattedTempDateRange[0]}
+                                        readOnly
+                                        disabled={!formattedTempDateRange[0]}
+                                        styles={(theme) => ({
+                                            input: {
+                                                boxShadow: theme.shadows.subtle,
+                                                border: `1px solid ${theme.colors.ldGray[2]}`,
+                                            },
+                                        })}
+                                    />
+                                    <Text size="xs" c="ldGray.5">
+                                        -
+                                    </Text>
+                                    <TextInput
+                                        size="xs"
+                                        radius="md"
+                                        w={100}
+                                        value={formattedTempDateRange[1]}
+                                        readOnly
+                                        disabled={!formattedTempDateRange[1]}
+                                        styles={(theme) => ({
+                                            input: {
+                                                boxShadow: theme.shadows.subtle,
+                                                border: `1px solid ${theme.colors.ldGray[2]}`,
+                                            },
+                                        })}
+                                    />
+                                </Group>
+
+                                <Group gap="xs">
+                                    <Button
+                                        size="xs"
+                                        radius="md"
+                                        variant="default"
+                                        onClick={() => handleOpen(false)}
+                                        style={(theme) => ({
+                                            boxShadow: theme.shadows.subtle,
+                                            border: `1px solid ${theme.colors.ldGray[2]}`,
+                                        })}
+                                    >
+                                        Cancel
+                                    </Button>
+                                    <Button
+                                        size="xs"
+                                        radius="md"
+                                        color="dark"
+                                        onClick={() => {
+                                            handleApply();
+
+                                            handleTrackDateFilterApplied();
+                                        }}
+                                        style={(theme) => ({
+                                            boxShadow: theme.shadows.subtle,
+                                        })}
+                                    >
+                                        Apply
+                                    </Button>
+                                </Group>
+                            </Group>
+                        </Box>
+                    </Stack>
+                </Group>
+            </Popover.Dropdown>
+        </Popover>
+    );
+};

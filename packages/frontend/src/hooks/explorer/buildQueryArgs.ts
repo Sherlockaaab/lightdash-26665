@@ -1,0 +1,83 @@
+import {
+    derivePivotConfigurationFromChart,
+    getFieldsFromMetricQuery,
+    type DateGranularity,
+    type Explore,
+    type FieldId,
+    type MetricQuery,
+    type ParametersValuesMap,
+    type QueryExecutionContext,
+    type SavedChartDAO,
+} from '@lightdash/common';
+import type { QueryResultsProps } from '../useQueryResults';
+
+/**
+ * Builds query arguments for execution
+ *
+ * This is shared logic between useExplorerQueryManager (automatic queries)
+ * and useExplorerQuery (manual queries like fetchResults)
+ */
+export function buildQueryArgs(options: {
+    activeFields: Set<FieldId>;
+    tableName: string | undefined;
+    projectUuid: string | undefined;
+    explore: Explore | undefined;
+    computedMetricQuery: MetricQuery;
+    parameters: ParametersValuesMap | undefined;
+    isEditMode: boolean;
+    viewModeQueryArgs?:
+        | { chartUuid: string; context?: QueryExecutionContext }
+        | { chartUuid: string; chartVersionUuid: string };
+    dateZoomGranularity?: DateGranularity | string;
+    minimal: boolean;
+    usePreAggregateCache?: boolean;
+    savedChart: Pick<SavedChartDAO, 'chartConfig' | 'pivotConfig'>;
+}): QueryResultsProps | null {
+    const {
+        activeFields,
+        tableName,
+        projectUuid,
+        explore,
+        computedMetricQuery,
+        parameters,
+        isEditMode,
+        viewModeQueryArgs,
+        dateZoomGranularity,
+        minimal,
+    } = options;
+
+    const hasFields = activeFields.size > 0;
+
+    if (!tableName || !hasFields || !projectUuid || !explore) {
+        return null;
+    }
+
+    const items = getFieldsFromMetricQuery(computedMetricQuery, explore);
+    const pivotConfiguration = derivePivotConfigurationFromChart(
+        options.savedChart,
+        computedMetricQuery,
+        items,
+    );
+
+    const pivotDimensions = options.savedChart.pivotConfig?.columns;
+
+    // View mode hits the saved-chart path (chartUuid) and respects the
+    // caller's cache flag. Edit mode hits the raw-query path, which must
+    // not be cached — the explore re-run is the user's signal to refetch.
+    const savedChartArgs = !isEditMode ? viewModeQueryArgs : undefined;
+
+    return {
+        projectUuid,
+        tableId: tableName,
+        query: {
+            ...computedMetricQuery,
+            pivotDimensions,
+        },
+        ...savedChartArgs,
+        dateZoomGranularity,
+        invalidateCache: savedChartArgs ? minimal : true,
+        usePreAggregateCache: options.usePreAggregateCache,
+        parameters: parameters || {},
+        pivotConfiguration,
+    };
+}

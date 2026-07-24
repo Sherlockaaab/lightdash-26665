@@ -1,0 +1,1925 @@
+import {
+    CatalogType,
+    MetricType,
+    NotFoundError,
+    QueryExecutionContext,
+    QueryHistoryStatus,
+} from '@lightdash/common';
+import * as runQueryTool from '../ai/tools/runQuery';
+import { McpService, McpToolName } from './McpService';
+
+type RegisteredToolCallback = (
+    args: Record<string, unknown>,
+    extra: Record<string, unknown>,
+) => Promise<unknown>;
+
+const mockRegisteredMcpTools = new Map<string, RegisteredToolCallback>();
+
+vi.mock('@sentry/node', () => ({
+    captureException: vi.fn(),
+    getActiveSpan: () => undefined,
+    isEnabled: () => false,
+    startSpanManual: (_options: unknown, callback: CallableFunction) =>
+        callback({ spanContext: () => ({ spanId: 'span-id' }) }, vi.fn()),
+    wrapMcpServerWithSentry: (server: unknown) => server,
+}));
+
+vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
+    McpServer: vi.fn().mockImplementation(
+        // eslint-disable-next-line prefer-arrow-callback
+        function MockMcpServer() {
+            return {
+                registerResource: vi.fn(),
+                registerPrompt: vi.fn(),
+                registerTool: vi.fn(
+                    (
+                        name: string,
+                        _config: Record<string, unknown>,
+                        callback: RegisteredToolCallback,
+                    ) => {
+                        mockRegisteredMcpTools.set(name, callback);
+                        return {};
+                    },
+                ),
+            };
+        },
+    ),
+}));
+
+const projectUuid = 'project-uuid';
+const organizationUuid = 'organization-uuid';
+const userUuid = 'user-uuid';
+const queryUuid = '11111111-1111-4111-8111-111111111111';
+const allowedSpaceUuid = 'allowed-space-uuid';
+const blockedSpaceUuid = 'blocked-space-uuid';
+
+const makeSpaceMetadata = (spaceUuid: string) => ({
+    uuid: spaceUuid,
+    name: spaceUuid === allowedSpaceUuid ? 'Allowed Space' : 'Blocked Space',
+    slug: spaceUuid === allowedSpaceUuid ? 'allowed-space' : 'blocked-space',
+    breadcrumbs: [
+        {
+            uuid: spaceUuid,
+            name:
+                spaceUuid === allowedSpaceUuid
+                    ? 'Allowed Space'
+                    : 'Blocked Space',
+            slug:
+                spaceUuid === allowedSpaceUuid
+                    ? 'allowed-space'
+                    : 'blocked-space',
+        },
+    ],
+});
+
+const account = {
+    isRegisteredUser: () => true,
+    isServiceAccount: () => false,
+    user: { id: userUuid },
+};
+
+const user = {
+    userUuid,
+    organizationUuid,
+    ability: {
+        can: vi.fn(() => true),
+        cannot: vi.fn(() => false),
+        relevantRuleFor: vi.fn(() => undefined),
+        rules: [],
+    },
+};
+
+const makeExplore = ({
+    name = 'orders',
+    tags = [],
+    metricTags,
+    dimensionTags,
+}: {
+    name?: string;
+    tags?: string[];
+    metricTags?: string[];
+    dimensionTags?: string[];
+} = {}) => {
+    const exploreLabel = name === 'orders' ? 'Orders' : 'Payments';
+
+    return {
+        name,
+        label: exploreLabel,
+        tags,
+        aiHint: [name === 'orders' ? 'Order facts' : 'Payment facts'],
+        baseTable: name,
+        joinedTables: [],
+        tables: {
+            [name]: {
+                name,
+                label: exploreLabel,
+                description: `${exploreLabel} explore`,
+                requiredAttributes: {},
+                anyAttributes: {},
+                dimensions: dimensionTags
+                    ? {
+                          status: {
+                              name: 'status',
+                              label: 'Status',
+                              table: name,
+                              tags: dimensionTags,
+                              type: 'string',
+                          },
+                      }
+                    : {},
+                metrics: {
+                    orders_count: {
+                        name: 'orders_count',
+                        label: 'Orders Count',
+                        table: name,
+                        tags: metricTags,
+                        tablesReferences: [name],
+                        type: MetricType.COUNT,
+                    },
+                },
+            },
+        },
+    };
+};
+
+const extra = {
+    signal: new AbortController().signal,
+    requestId: 'request-id',
+    sendNotification: vi.fn(),
+    sendRequest: vi.fn(),
+    authInfo: {
+        extra: {
+            user,
+            account,
+        },
+    },
+};
+
+const makeChartSearchResult = ({
+    name,
+    spaceUuid,
+}: {
+    name: string;
+    spaceUuid: string;
+}) => ({
+    uuid: `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-uuid`,
+    name,
+    description: null,
+    spaceUuid,
+    projectUuid,
+    slug: name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+    chartType: 'vertical_bar',
+    chartSource: 'saved',
+    viewsCount: 0,
+    firstViewedAt: null,
+    lastModified: null,
+    createdBy: null,
+    lastUpdatedBy: null,
+    verification: null,
+    search_rank: 1,
+});
+
+const makeQueryHistory = (
+    status: QueryHistoryStatus,
+    context: QueryExecutionContext = QueryExecutionContext.MCP_RUN_SQL,
+    error: string | null = null,
+    metricQueryOverrides: Record<string, unknown> = {},
+) => ({
+    status,
+    context,
+    error,
+    compiledSql: 'select * from (select 1) limit 10',
+    requestParameters: {
+        sql: 'select 1',
+        limit: 10,
+    },
+    metricQuery: {
+        exploreName: 'orders',
+        dimensions: [],
+        metrics: ['orders_orders_count'],
+        sorts: [],
+        filters: {},
+        limit: 10,
+        tableCalculations: [],
+        additionalMetrics: [],
+        ...metricQueryOverrides,
+    },
+});
+
+const makeMcpService = ({
+    context = {
+        projectUuid,
+        projectName: 'Project',
+        agentUuid: null,
+        agentName: null,
+        tags: null,
+    },
+    agent = null,
+    explores = { orders: makeExplore() },
+    dashboardSearchResults = [],
+    chartSearchResults = [],
+    verifiedContent = [],
+    artifactVerifiedContent = [],
+    runtimeErrors = {},
+    grepFieldsEnabled = false,
+}: {
+    context?: {
+        projectUuid: string;
+        projectName: string;
+        agentUuid: string | null;
+        agentName: string | null;
+        tags: string[] | null;
+    };
+    agent?: {
+        uuid: string;
+        name: string;
+        tags: string[] | null;
+        spaceAccess: string[];
+    } | null;
+    explores?: Record<string, ReturnType<typeof makeExplore>>;
+    dashboardSearchResults?: (Record<string, unknown> & {
+        spaceUuid: string;
+    })[];
+    chartSearchResults?: ReturnType<typeof makeChartSearchResult>[];
+    verifiedContent?: Record<string, unknown>[];
+    artifactVerifiedContent?: Record<string, unknown>[];
+    runtimeErrors?: {
+        findExplores?: string;
+        findFields?: string;
+        findFieldsByQuery?: Record<string, string>;
+    };
+    grepFieldsEnabled?: boolean;
+} = {}) => {
+    const asyncQueryService = {
+        executeAsyncSqlQuery: vi.fn(),
+        executeAsyncMetricQuery: vi.fn(),
+        getAsyncQueryHistory: vi.fn(),
+        getAsyncQueryResults: vi.fn(),
+        getRawAsyncQueryResults: vi.fn(),
+        pollQueryHistoryUntilDeadline: vi.fn(),
+    };
+
+    const mcpContextModel = {
+        getContext: vi.fn().mockResolvedValue({ context }),
+    };
+
+    const shareService = {
+        createShareUrl: vi.fn().mockResolvedValue({ nanoid: 'share-id' }),
+    };
+
+    const projectModel = {
+        findExploresFromCache: vi.fn(
+            async (
+                _projectUuid: string,
+                _sortBy: string,
+                exploreNames?: string[],
+            ) => {
+                if (!exploreNames) return explores;
+                return Object.fromEntries(
+                    Object.entries(explores).filter(([exploreName]) =>
+                        exploreNames.includes(exploreName),
+                    ),
+                );
+            },
+        ),
+    };
+
+    const projectService = {
+        getProject: vi.fn().mockResolvedValue({ organizationUuid }),
+        searchFieldUniqueValues: vi.fn().mockResolvedValue({ results: [] }),
+    };
+
+    const catalogService = {
+        searchCatalog: vi.fn(async ({ catalogSearch }) => ({
+            data:
+                catalogSearch.type === CatalogType.Table
+                    ? [
+                          {
+                              type: CatalogType.Table,
+                              name: 'orders',
+                              label: 'Orders',
+                              description: null,
+                              aiHints: null,
+                              searchRank: 1,
+                              joinedTables: [],
+                          },
+                      ]
+                    : [
+                          {
+                              type: CatalogType.Field,
+                              name: 'orders_count',
+                              label: 'Orders Count',
+                              tableName: 'orders',
+                              fieldType: 'metric',
+                              searchRank: 1,
+                              description: null,
+                          },
+                      ],
+            pagination: {},
+        })),
+    };
+
+    const aiAgentService = {
+        getAgent: vi.fn().mockImplementation(async () => {
+            if (!agent) throw new Error('Agent not mocked');
+            return {
+                description: null,
+                projectUuid,
+                context: {
+                    explores: [],
+                    verifiedQuestions: [],
+                    instruction: null,
+                },
+                ...agent,
+            };
+        }),
+        getRelevantVerifiedAnswerContextForAgent: vi.fn().mockResolvedValue({
+            relevantVerifiedAnswers: [],
+        }),
+        getVerifiedSavedArtifactContent: vi
+            .fn()
+            .mockResolvedValue(artifactVerifiedContent),
+    };
+
+    const contentVerificationService = {
+        listVerifiedContent: vi.fn().mockResolvedValue(verifiedContent),
+    };
+
+    const searchModel = {
+        searchDashboards: vi.fn().mockResolvedValue(dashboardSearchResults),
+        searchAllCharts: vi.fn().mockResolvedValue(chartSearchResults),
+    };
+
+    const spaceService = {
+        filterBySpaceAccess: vi.fn(async (_user, content) => content),
+    };
+
+    const userAttributesModel = {
+        getAttributeValuesForOrgMember: vi.fn().mockResolvedValue({}),
+    };
+
+    const makeToolsRuntime = (runtimeContext: {
+        tags: string[] | null;
+        spaceAccess: string[] | null;
+    }) => {
+        const listScopedExplores = async () =>
+            Object.values(explores).filter(
+                (explore) =>
+                    !runtimeContext.tags ||
+                    runtimeContext.tags.length === 0 ||
+                    runtimeContext.tags.some((tag) =>
+                        explore.tags.includes(tag),
+                    ),
+            );
+
+        const toMcpRuntimeResult = async <TData>(
+            getData: () => Promise<TData>,
+        ) => {
+            try {
+                return { status: 'success' as const, data: await getData() };
+            } catch (error) {
+                return {
+                    status: 'error' as const,
+                    error,
+                };
+            }
+        };
+
+        const runtime = {
+            listExplores: vi.fn(listScopedExplores),
+            getVerifiedFieldUsage: vi.fn(async () => new Map<string, number>()),
+            getExplore: vi.fn(async ({ table }: { table: string }) => {
+                const scopedExplores = await listScopedExplores();
+                const explore = scopedExplores.find(
+                    (scopedExplore) => scopedExplore.name === table,
+                );
+                if (!explore) throw new NotFoundError('Explore not found');
+                return explore;
+            }),
+            findExplores: vi.fn(
+                async (_args: {
+                    fieldSearchSize: number;
+                    searchQuery?: string;
+                }) => {
+                    const scopedExplores = await listScopedExplores();
+                    return {
+                        exploreSearchResults: scopedExplores.map((explore) => ({
+                            name: explore.name,
+                            label:
+                                (explore as { label?: string }).label ??
+                                explore.name,
+                            description: null,
+                            aiHints: undefined,
+                            searchRank: 1,
+                            joinedTables: [],
+                        })),
+                        topMatchingFields: [
+                            {
+                                name: 'orders_count',
+                                label: 'Orders Count',
+                                tableName: 'orders',
+                                fieldType: 'metric',
+                                searchRank: 1,
+                                description: null,
+                            },
+                        ],
+                    };
+                },
+            ),
+            findField: vi.fn(
+                async (_args: {
+                    table: string;
+                    fieldSearchQuery: { label: string };
+                    page?: number;
+                    pageSize?: number;
+                    explore: ReturnType<typeof makeExplore>;
+                }) => ({ fields: [], pagination: {} }),
+            ),
+            findContent: vi.fn(async () => ({
+                content: [
+                    ...dashboardSearchResults.map((dashboard) => ({
+                        ...dashboard,
+                        contentType: 'dashboard',
+                        space: makeSpaceMetadata(dashboard.spaceUuid),
+                    })),
+                    ...chartSearchResults.map((chart) => ({
+                        ...chart,
+                        contentType: 'chart',
+                        space: makeSpaceMetadata(chart.spaceUuid),
+                    })),
+                ].filter(
+                    ({ spaceUuid }) =>
+                        !runtimeContext.spaceAccess ||
+                        runtimeContext.spaceAccess.length === 0 ||
+                        runtimeContext.spaceAccess.includes(spaceUuid),
+                ),
+            })),
+            searchFieldValues: vi.fn(async (args) => {
+                if (args.fieldId === 'orders_hidden') {
+                    throw new NotFoundError(`Field not found: ${args.fieldId}`);
+                }
+                const { results } =
+                    await projectService.searchFieldUniqueValues(
+                        user,
+                        projectUuid,
+                        args.table,
+                        args.fieldId,
+                        args.query,
+                    );
+                return results;
+            }),
+        };
+
+        return {
+            ...runtime,
+            getExplore: vi.fn((args: { table: string }) =>
+                toMcpRuntimeResult(() => runtime.getExplore(args)),
+            ),
+            findExplores: vi.fn(
+                (args: { fieldSearchSize: number; searchQuery?: string }) =>
+                    toMcpRuntimeResult(() => {
+                        if (runtimeErrors.findExplores) {
+                            throw new Error(runtimeErrors.findExplores);
+                        }
+                        return runtime.findExplores(args);
+                    }),
+            ),
+            findFields: vi.fn(
+                (args: {
+                    table: string;
+                    fieldSearchQueries: Array<{ label: string }>;
+                    page?: number;
+                    pageSize?: number;
+                    explore: ReturnType<typeof makeExplore>;
+                }) =>
+                    toMcpRuntimeResult(async () =>
+                        Promise.all(
+                            args.fieldSearchQueries.map(
+                                async (fieldSearchQuery) => {
+                                    const fieldSearchError =
+                                        runtimeErrors.findFieldsByQuery?.[
+                                            fieldSearchQuery.label
+                                        ] ?? runtimeErrors.findFields;
+                                    if (fieldSearchError) {
+                                        return {
+                                            status: 'error' as const,
+                                            searchQuery: fieldSearchQuery.label,
+                                            error: fieldSearchError,
+                                        };
+                                    }
+                                    const result = await runtime.findField({
+                                        table: args.table,
+                                        fieldSearchQuery,
+                                        page: args.page,
+                                        pageSize: args.pageSize,
+                                        explore: args.explore,
+                                    });
+                                    return {
+                                        status: 'success' as const,
+                                        searchQuery: fieldSearchQuery.label,
+                                        ...result,
+                                    };
+                                },
+                            ),
+                        ),
+                    ),
+            ),
+        };
+    };
+    const aiAgentToolsService = {
+        createRuntime: vi.fn((runtimeContext) =>
+            makeToolsRuntime(runtimeContext),
+        ),
+    };
+
+    const service = new McpService({
+        aiAgentService,
+        aiAgentToolsService,
+        aiOrganizationSettingsService: {
+            getSettings: vi.fn().mockResolvedValue({ aiAgentsVisible: true }),
+        },
+        aiRouterService: {},
+        aiWritebackService: {},
+        analytics: { track: vi.fn() },
+        asyncQueryService,
+        catalogService,
+        contentService: {},
+        contentVerificationService,
+        featureFlagService: {},
+        lightdashConfig: {
+            ai: {
+                copilot: {
+                    maxQueryLimit: 500,
+                },
+            },
+            mcp: {
+                enabled: true,
+                runSqlMaxLimit: 500,
+            },
+            siteUrl: 'https://lightdash.example',
+        },
+        mcpContextModel,
+        projectModel,
+        projectService,
+        searchModel,
+        shareService,
+        spaceService,
+        userAttributesModel,
+    } as unknown as ConstructorParameters<typeof McpService>[0]);
+
+    // The constructor registers handlers fail-closed (run_sql off), so
+    // re-register here with run_sql enabled — these tests exercise the tool.
+    mockRegisteredMcpTools.clear();
+    service.setupHandlers({
+        projectPinned: false,
+        aiWritebackEnabled: false,
+        grepFieldsEnabled,
+        mcpContentWritesEnabled: true,
+        scheduledDeliveryEnabled: true,
+        runSqlEnabled: true,
+    });
+
+    return {
+        aiAgentService,
+        aiAgentToolsService,
+        asyncQueryService,
+        catalogService,
+        contentVerificationService,
+        mcpContextModel,
+        projectModel,
+        projectService,
+        searchModel,
+        service,
+        shareService,
+        spaceService,
+    };
+};
+
+const getToolCallback = (toolName: McpToolName) => {
+    const callback = mockRegisteredMcpTools.get(toolName);
+    if (!callback) {
+        throw new Error(`Tool ${toolName} was not registered`);
+    }
+    return callback;
+};
+
+const getTextResult = (result: unknown) => {
+    const response = result as { content?: Array<{ text?: string }> };
+    return response.content?.[0]?.text ?? '';
+};
+
+const parseTextResult = (result: unknown) =>
+    JSON.parse(getTextResult(result) || '{}') as Record<string, unknown>;
+
+describe('MCP async query polling', () => {
+    beforeEach(() => {
+        mockRegisteredMcpTools.clear();
+        vi.spyOn(
+            McpService as unknown as { getMcpQueryWaitMs: () => number },
+            'getMcpQueryWaitMs',
+        ).mockReturnValue(0);
+        vi.spyOn(runQueryTool, 'validateRunQueryTool').mockImplementation(
+            () => {},
+        );
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it('returns running with heartbeatAt from run_sql', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.executeAsyncSqlQuery.mockResolvedValue({ queryUuid });
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(QueryHistoryStatus.QUEUED),
+        );
+
+        const result = await getToolCallback(McpToolName.RUN_SQL)(
+            { sql: 'select 1', limit: 10 },
+            extra,
+        );
+
+        expect(asyncQueryService.executeAsyncSqlQuery).toHaveBeenCalledWith(
+            expect.objectContaining({
+                sql: 'select 1',
+                limit: 10,
+                context: QueryExecutionContext.MCP_RUN_SQL,
+            }),
+        );
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'running',
+                    queryUuid,
+                    nextPollAfterMs: 1000,
+                    heartbeatAt: expect.any(String),
+                },
+            },
+        });
+    });
+
+    it('returns sqlRunnerUrl from a completed run_sql result', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.executeAsyncSqlQuery.mockResolvedValue({ queryUuid });
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(QueryHistoryStatus.READY),
+        );
+        asyncQueryService.getAsyncQueryResults.mockResolvedValue({
+            status: QueryHistoryStatus.READY,
+            rows: [{ one: { value: { raw: 1, formatted: '1' } } }],
+            columns: { one: { reference: 'one' } },
+        });
+
+        const result = await getToolCallback(McpToolName.RUN_SQL)(
+            { sql: 'select 1', limit: 10 },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'done',
+                    rows: [{ one: 1 }],
+                    columns: ['one'],
+                    rowCount: 1,
+                    sqlRunnerUrl:
+                        'https://lightdash.example/projects/project-uuid/sql-runner?share=share-id',
+                },
+            },
+        });
+    });
+
+    it('rejects inaccessible header project overrides', async () => {
+        const { projectService } = makeMcpService();
+        const deniedUser = {
+            ...user,
+            ability: {
+                ...user.ability,
+                cannot: vi.fn(() => true),
+            },
+        };
+        const headerProjectUuid = '22222222-2222-4222-8222-222222222222';
+
+        await expect(
+            getToolCallback(McpToolName.RUN_SQL)(
+                { sql: 'select 1', limit: 10 },
+                {
+                    ...extra,
+                    authInfo: {
+                        extra: {
+                            ...extra.authInfo.extra,
+                            user: deniedUser,
+                            headerProjectUuid,
+                        },
+                    },
+                },
+            ),
+        ).rejects.toThrow('You do not have access to this project');
+        expect(projectService.getProject).toHaveBeenCalledWith(
+            headerProjectUuid,
+            account,
+        );
+    });
+
+    it('returns active agent space access in get_current_agent', async () => {
+        makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['ai'],
+                spaceAccess: ['space-uuid'],
+            },
+        });
+
+        const result = await getToolCallback(McpToolName.GET_CURRENT_AGENT)(
+            {},
+            extra,
+        );
+
+        expect(parseTextResult(result)).toMatchObject({
+            agentUuid: 'agent-uuid',
+            agentTags: ['ai'],
+            agentSpaceAccess: ['space-uuid'],
+        });
+    });
+
+    it('returns relevant verified answers in find_explores for the active agent', async () => {
+        const relevantVerifiedAnswer = {
+            artifactVersionUuid: 'artifact-version-uuid',
+            artifactType: 'chart',
+            verifiedQuestion: 'What is revenue by month?',
+            title: 'Revenue by month',
+            description: 'Verified monthly revenue trend',
+            similarity: 0.98,
+            chartConfig: {
+                tableName: 'orders',
+                metricQuery: {
+                    metrics: ['orders_revenue'],
+                },
+            },
+        };
+
+        const { aiAgentService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['ai'],
+                spaceAccess: [],
+            },
+        });
+        aiAgentService.getRelevantVerifiedAnswerContextForAgent.mockResolvedValue(
+            {
+                relevantVerifiedAnswers: [relevantVerifiedAnswer],
+            },
+        );
+
+        const result = await getToolCallback(McpToolName.FIND_EXPLORES)(
+            { searchQuery: 'Show me revenue by month' },
+            extra,
+        );
+
+        expect(
+            aiAgentService.getRelevantVerifiedAnswerContextForAgent,
+        ).toHaveBeenCalledWith(user, {
+            projectUuid,
+            agentUuid: 'agent-uuid',
+            searchQuery: 'Show me revenue by month',
+        });
+        expect(getTextResult(result)).toContain('<verifiedAnswers count="1">');
+        expect(getTextResult(result)).toContain('Revenue by month');
+        expect(result).toMatchObject({
+            structuredContent: {
+                searchQuery: 'Show me revenue by month',
+                searchResults: expect.objectContaining({
+                    results: expect.any(Array),
+                }),
+                topMatchingFields: {
+                    count: 1,
+                    fields: [
+                        expect.objectContaining({
+                            name: 'orders_count',
+                            exploreName: 'orders',
+                        }),
+                    ],
+                },
+                relevantVerifiedAnswers: [relevantVerifiedAnswer],
+            },
+        });
+    });
+
+    it('returns structured field search content in find_fields', async () => {
+        makeMcpService();
+
+        const result = await getToolCallback(McpToolName.FIND_FIELDS)(
+            {
+                table: 'orders',
+                fieldSearchQueries: [{ label: 'orders count' }],
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            content: [
+                expect.objectContaining({
+                    text: expect.stringContaining('"searchResults"'),
+                }),
+            ],
+            structuredContent: {
+                searchResults: [
+                    expect.objectContaining({
+                        status: 'success',
+                        searchQuery: 'orders count',
+                        fields: [],
+                    }),
+                ],
+            },
+        });
+    });
+
+    it('returns MCP error content when find_explores runtime returns error', async () => {
+        makeMcpService({ runtimeErrors: { findExplores: 'Runtime failed' } });
+
+        const result = await getToolCallback(McpToolName.FIND_EXPLORES)(
+            { searchQuery: 'orders' },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            isError: true,
+            content: [
+                expect.objectContaining({
+                    text: 'Error finding explores: Runtime failed',
+                }),
+            ],
+        });
+    });
+
+    it('returns mixed per-query results when find_fields runtime returns errors', async () => {
+        makeMcpService({
+            runtimeErrors: {
+                findFieldsByQuery: { 'bad field': 'Runtime failed' },
+            },
+        });
+
+        const result = await getToolCallback(McpToolName.FIND_FIELDS)(
+            {
+                table: 'orders',
+                fieldSearchQueries: [
+                    { label: 'orders count' },
+                    { label: 'bad field' },
+                ],
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                searchResults: [
+                    expect.objectContaining({
+                        status: 'success',
+                        searchQuery: 'orders count',
+                        fields: [],
+                    }),
+                    {
+                        status: 'error',
+                        searchQuery: 'bad field',
+                        error: 'Runtime failed',
+                    },
+                ],
+            },
+        });
+    });
+
+    it('registers grep_fields instead of legacy discovery tools when ai-grep-fields is enabled', async () => {
+        makeMcpService({ grepFieldsEnabled: true });
+
+        expect(() => getToolCallback(McpToolName.FIND_EXPLORES)).toThrow(
+            'Tool find_explores was not registered',
+        );
+        expect(() => getToolCallback(McpToolName.FIND_FIELDS)).toThrow(
+            'Tool find_fields was not registered',
+        );
+
+        const result = await getToolCallback(McpToolName.GREP_FIELDS)(
+            {
+                patterns: ['orders count'],
+                exploreName: null,
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            content: [
+                expect.objectContaining({
+                    text: expect.stringContaining('"patterns"'),
+                }),
+            ],
+            structuredContent: {
+                exploreName: null,
+                patterns: [
+                    expect.objectContaining({
+                        pattern: 'orders count',
+                        status: 'matches',
+                        resultsByExplore: [
+                            expect.objectContaining({
+                                exploreName: 'orders',
+                            }),
+                        ],
+                    }),
+                ],
+            },
+        });
+    });
+
+    it('returns structured metadata content when ai-grep-fields is enabled', async () => {
+        makeMcpService({ grepFieldsEnabled: true });
+
+        const result = await getToolCallback(McpToolName.GET_METADATA)(
+            {
+                requests: [
+                    { type: 'explore', exploreIds: ['orders'] },
+                    {
+                        type: 'field',
+                        fields: [
+                            {
+                                exploreId: 'orders',
+                                fieldId: 'orders_orders_count',
+                            },
+                        ],
+                    },
+                ],
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            content: [
+                expect.objectContaining({
+                    text: expect.stringContaining('"explores"'),
+                }),
+            ],
+            structuredContent: {
+                explores: [
+                    expect.objectContaining({
+                        exploreId: 'orders',
+                        status: 'found',
+                        baseTable: 'orders',
+                    }),
+                ],
+                fields: [
+                    expect.objectContaining({
+                        exploreId: 'orders',
+                        fieldId: 'orders_orders_count',
+                        status: 'found',
+                        kind: 'metric',
+                    }),
+                ],
+            },
+        });
+    });
+
+    it('lists only explores available to the active agent in grep_fields', async () => {
+        makeMcpService({
+            grepFieldsEnabled: true,
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['ai'],
+                spaceAccess: [],
+            },
+            explores: {
+                orders: makeExplore({ tags: ['ai'] }),
+                payments: makeExplore({ name: 'payments', tags: ['finance'] }),
+            },
+        });
+
+        const result = await getToolCallback(McpToolName.GREP_FIELDS)(
+            { patterns: ['orders count'], exploreName: null },
+            extra,
+        );
+
+        expect(JSON.stringify(result)).toContain('orders');
+        expect(JSON.stringify(result)).not.toContain('payments');
+    });
+
+    it('filters content by active agent space access', async () => {
+        const allowedChart = makeChartSearchResult({
+            name: 'Allowed Chart',
+            spaceUuid: allowedSpaceUuid,
+        });
+        const blockedChart = makeChartSearchResult({
+            name: 'Blocked Chart',
+            spaceUuid: blockedSpaceUuid,
+        });
+        const allowedVerifiedContent = {
+            contentType: 'chart',
+            contentUuid: 'allowed-chart-uuid',
+            name: 'Allowed Verified Chart',
+            spaceUuid: allowedSpaceUuid,
+        };
+        const blockedVerifiedContent = {
+            contentType: 'chart',
+            contentUuid: 'blocked-chart-uuid',
+            name: 'Blocked Verified Chart',
+            spaceUuid: blockedSpaceUuid,
+        };
+
+        makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: [],
+                spaceAccess: [allowedSpaceUuid],
+            },
+            chartSearchResults: [allowedChart, blockedChart],
+            verifiedContent: [allowedVerifiedContent, blockedVerifiedContent],
+        });
+
+        const contentResult = await getToolCallback(McpToolName.FIND_CONTENT)(
+            { searchQueries: [{ label: 'chart' }] },
+            extra,
+        );
+        const contentText = getTextResult(contentResult);
+
+        expect(contentText).toContain('Allowed Chart');
+        expect(contentText).not.toContain('Blocked Chart');
+
+        const verifiedResult = await getToolCallback(
+            McpToolName.LIST_VERIFIED_CONTENT,
+        )({}, extra);
+        const verifiedContentResult = JSON.parse(getTextResult(verifiedResult));
+
+        expect(verifiedContentResult).toEqual([allowedVerifiedContent]);
+    });
+
+    it('merges AI-verified saved artifacts into list_verified_content without duplicates', async () => {
+        const spaceUuid = 'space-uuid';
+        const verifiedChart = {
+            contentType: 'chart',
+            contentUuid: 'chart-uuid',
+            name: 'Verified Chart',
+            spaceUuid,
+        };
+        const artifactOnlyChart = {
+            contentType: 'chart',
+            contentUuid: 'artifact-chart-uuid',
+            name: 'AI Verified Chart',
+            spaceUuid,
+        };
+        const artifactDuplicateOfVerifiedChart = {
+            ...verifiedChart,
+            name: 'AI duplicate of Verified Chart',
+        };
+
+        makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: null,
+                agentName: null,
+                tags: null,
+            },
+            verifiedContent: [verifiedChart],
+            artifactVerifiedContent: [
+                artifactOnlyChart,
+                artifactDuplicateOfVerifiedChart,
+            ],
+        });
+
+        const verifiedResult = await getToolCallback(
+            McpToolName.LIST_VERIFIED_CONTENT,
+        )({}, extra);
+        const verifiedContentResult = JSON.parse(getTextResult(verifiedResult));
+
+        expect(verifiedContentResult).toEqual([
+            verifiedChart,
+            artifactOnlyChart,
+        ]);
+    });
+
+    it('uses active agent tags for run_metric_query', async () => {
+        const { asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: ['manual-tag'],
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore({ tags: ['agent-tag'] }) },
+        });
+        asyncQueryService.executeAsyncMetricQuery.mockResolvedValue({
+            queryUuid,
+        });
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.QUEUED,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+
+        await getToolCallback(McpToolName.RUN_METRIC_QUERY)(
+            {
+                title: 'Orders',
+                description: 'Orders count',
+                queryConfig: {
+                    exploreName: 'orders',
+                    dimensions: [],
+                    metrics: ['orders_count'],
+                    sorts: [],
+                    limit: 10,
+                    customMetrics: null,
+                    tableCalculations: null,
+                    filters: null,
+                },
+                chartConfig: null,
+            },
+            extra,
+        );
+
+        expect(asyncQueryService.executeAsyncMetricQuery).toHaveBeenCalled();
+    });
+
+    it('lists only explores available to the active agent in find_explores', async () => {
+        makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['ai'],
+                spaceAccess: [],
+            },
+            explores: {
+                orders: makeExplore({ tags: ['ai'] }),
+                payments: makeExplore({ name: 'payments', tags: ['finance'] }),
+            },
+        });
+
+        const result = await getToolCallback(McpToolName.FIND_EXPLORES)(
+            { searchQuery: 'orders' },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            content: [
+                expect.objectContaining({
+                    text: expect.stringContaining('"name": "orders"'),
+                }),
+                expect.objectContaining({
+                    text: expect.stringContaining('Active agent: Agent'),
+                }),
+            ],
+        });
+        expect(JSON.stringify(result)).not.toContain('payments');
+    });
+
+    it('does not fall back to manual tags with an active agent', async () => {
+        const { asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: ['manual-tag'],
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore({ tags: ['manual-tag'] }) },
+        });
+
+        const result = await getToolCallback(McpToolName.RUN_METRIC_QUERY)(
+            {
+                title: 'Orders',
+                description: 'Orders count',
+                queryConfig: {
+                    exploreName: 'orders',
+                    dimensions: [],
+                    metrics: ['orders_count'],
+                    sorts: [],
+                    limit: 10,
+                    customMetrics: null,
+                    tableCalculations: null,
+                    filters: null,
+                },
+                chartConfig: null,
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            isError: true,
+            content: [
+                {
+                    type: 'text',
+                    text: 'Error running metric query: Explore not found',
+                },
+            ],
+        });
+        expect(
+            asyncQueryService.executeAsyncMetricQuery,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('ignores stored agent scope for header project overrides', async () => {
+        const headerProjectUuid = '22222222-2222-4222-8222-222222222222';
+        const { aiAgentService, asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: ['manual-tag'],
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore() },
+        });
+        asyncQueryService.executeAsyncMetricQuery.mockResolvedValue({
+            queryUuid,
+        });
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.QUEUED,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+
+        await getToolCallback(McpToolName.RUN_METRIC_QUERY)(
+            {
+                title: 'Orders',
+                description: 'Orders count',
+                queryConfig: {
+                    exploreName: 'orders',
+                    dimensions: [],
+                    metrics: ['orders_count'],
+                    sorts: [],
+                    limit: 10,
+                    customMetrics: null,
+                    tableCalculations: null,
+                    filters: null,
+                },
+                chartConfig: null,
+            },
+            {
+                ...extra,
+                authInfo: {
+                    extra: {
+                        ...extra.authInfo.extra,
+                        headerProjectUuid,
+                    },
+                },
+            },
+        );
+
+        expect(aiAgentService.getAgent).not.toHaveBeenCalled();
+        expect(asyncQueryService.executeAsyncMetricQuery).toHaveBeenCalledWith(
+            expect.objectContaining({ projectUuid: headerProjectUuid }),
+        );
+    });
+
+    it('returns running with heartbeatAt from run_metric_query', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.executeAsyncMetricQuery.mockResolvedValue({
+            queryUuid,
+        });
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.QUEUED,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+        const result = await getToolCallback(McpToolName.RUN_METRIC_QUERY)(
+            {
+                title: 'Orders',
+                description: 'Orders count',
+                queryConfig: {
+                    exploreName: 'orders',
+                    dimensions: [],
+                    metrics: ['orders_count'],
+                    sorts: [],
+                    limit: 10,
+                    customMetrics: null,
+                    tableCalculations: null,
+                    filters: null,
+                },
+                chartConfig: null,
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'running',
+                    queryUuid,
+                    nextPollAfterMs: 1000,
+                    heartbeatAt: expect.any(String),
+                },
+            },
+        });
+    });
+
+    it('returns exploreUrl from a completed run_metric_query result', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.executeAsyncMetricQuery.mockResolvedValue({
+            queryUuid,
+        });
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+        asyncQueryService.getRawAsyncQueryResults.mockResolvedValue({
+            rows: [{ orders_count: 1 }],
+            fields: {},
+        });
+        const result = await getToolCallback(McpToolName.RUN_METRIC_QUERY)(
+            {
+                title: 'Orders',
+                description: 'Orders count',
+                queryConfig: {
+                    exploreName: 'orders',
+                    dimensions: [],
+                    metrics: ['orders_count'],
+                    sorts: [],
+                    limit: 10,
+                    customMetrics: null,
+                    tableCalculations: null,
+                    filters: null,
+                },
+                chartConfig: null,
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'done',
+                    queryUuid,
+                    rows: [{ orders_count: 1 }],
+                    fields: {},
+                    exploreUrl: 'https://lightdash.example/share/share-id',
+                },
+            },
+        });
+    });
+
+    it('renders a chart for completed query results', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+        asyncQueryService.getRawAsyncQueryResults.mockResolvedValue({
+            rows: [{ orders_count: 1 }],
+            fields: {},
+        });
+        const result = await getToolCallback(McpToolName.RENDER_CHART)(
+            {
+                queryUuid,
+                title: 'Orders',
+                description: 'Orders count',
+                chartConfig: null,
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'done',
+                    queryUuid,
+                    echartsOption: null,
+                    exploreUrl: 'https://lightdash.example/share/share-id',
+                },
+            },
+            _meta: {
+                result: {
+                    rows: [{ orders_count: 1 }],
+                    fields: {},
+                    echartsOption: null,
+                    exploreUrl: 'https://lightdash.example/share/share-id',
+                },
+            },
+        });
+        expect(
+            asyncQueryService.executeAsyncMetricQuery,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('keeps get_query_result running without fetching result pages', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValueOnce(
+            makeQueryHistory(QueryHistoryStatus.QUEUED),
+        );
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(QueryHistoryStatus.QUEUED),
+        );
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'running',
+                    queryUuid,
+                    nextPollAfterMs: 1000,
+                    heartbeatAt: expect.any(String),
+                },
+            },
+        });
+        expect(asyncQueryService.getAsyncQueryResults).not.toHaveBeenCalled();
+        expect(
+            asyncQueryService.getRawAsyncQueryResults,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('returns final SQL rows when get_query_result sees readiness during its wait', async () => {
+        const { asyncQueryService, shareService } = makeMcpService();
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValueOnce(
+            makeQueryHistory(QueryHistoryStatus.QUEUED),
+        );
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(QueryHistoryStatus.READY),
+        );
+        asyncQueryService.getAsyncQueryResults.mockResolvedValue({
+            status: QueryHistoryStatus.READY,
+            rows: [{ one: { value: { raw: 1, formatted: '1' } } }],
+            columns: { one: { reference: 'one' } },
+        });
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'done',
+                    queryUuid,
+                    rows: [{ one: 1 }],
+                    columns: ['one'],
+                    rowCount: 1,
+                    sqlRunnerUrl:
+                        'https://lightdash.example/projects/project-uuid/sql-runner?share=share-id',
+                },
+            },
+        });
+        expect(asyncQueryService.getAsyncQueryResults).toHaveBeenCalledWith(
+            expect.objectContaining({
+                queryUuid,
+                page: 1,
+                pageSize: undefined,
+            }),
+        );
+        expect(shareService.createShareUrl).toHaveBeenCalledWith(
+            user,
+            '/projects/project-uuid/sql-runner',
+            expect.stringContaining('"sql":"select 1"'),
+        );
+    });
+
+    it('does not return metric results outside the active agent scope', async () => {
+        const { asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore({ tags: ['other-tag'] }) },
+        });
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            isError: true,
+            content: [
+                {
+                    type: 'text',
+                    text: 'Error getting query result: Explore not found',
+                },
+            ],
+        });
+        expect(
+            asyncQueryService.getRawAsyncQueryResults,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('does not render metric results outside the active agent scope', async () => {
+        const { asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore({ tags: ['other-tag'] }) },
+        });
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+
+        const result = await getToolCallback(McpToolName.RENDER_CHART)(
+            {
+                queryUuid,
+                title: 'Orders',
+                description: 'Orders count',
+                chartConfig: null,
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            isError: true,
+            content: [
+                {
+                    type: 'text',
+                    text: 'Error rendering chart: Explore not found',
+                },
+            ],
+        });
+        expect(
+            asyncQueryService.getRawAsyncQueryResults,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('does not return metric results sorted by a hidden field', async () => {
+        const { asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore({ tags: ['agent-tag'] }) },
+        });
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+                null,
+                { sorts: [{ fieldId: 'orders_hidden_sort' }] },
+            ),
+        );
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            isError: true,
+            content: [
+                {
+                    type: 'text',
+                    text: 'Error getting query result: Field not found: orders_hidden_sort',
+                },
+            ],
+        });
+        expect(
+            asyncQueryService.getRawAsyncQueryResults,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('does not return metric results filtered by a hidden field', async () => {
+        const { asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore({ tags: ['agent-tag'] }) },
+        });
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+                null,
+                {
+                    filters: {
+                        dimensions: {
+                            and: [
+                                {
+                                    id: 'filter-1',
+                                    target: {
+                                        fieldId: 'orders_hidden_filter',
+                                    },
+                                    operator: 'equals',
+                                    values: ['complete'],
+                                },
+                            ],
+                        },
+                    },
+                },
+            ),
+        );
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            isError: true,
+            content: [
+                {
+                    type: 'text',
+                    text: 'Error getting query result: Field not found: orders_hidden_filter',
+                },
+            ],
+        });
+        expect(
+            asyncQueryService.getRawAsyncQueryResults,
+        ).not.toHaveBeenCalled();
+    });
+
+    it('allows additional metric refs using dot notation', async () => {
+        const { asyncQueryService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: {
+                orders: makeExplore({
+                    tags: ['agent-tag'],
+                    metricTags: ['agent-tag'],
+                    dimensionTags: ['agent-tag'],
+                }),
+            },
+        });
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+                null,
+                {
+                    metrics: ['orders_custom_distinct'],
+                    additionalMetrics: [
+                        {
+                            table: 'orders',
+                            name: 'custom_distinct',
+                            type: MetricType.COUNT_DISTINCT,
+                            sql: '${TABLE}.custom_distinct',
+                            distinctKeys: ['orders.status'],
+                            filters: [
+                                {
+                                    id: 'filter-1',
+                                    target: { fieldRef: 'orders.status' },
+                                    operator: 'equals',
+                                    values: ['complete'],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ),
+        );
+        asyncQueryService.getRawAsyncQueryResults.mockResolvedValue({
+            rows: [{ orders_custom_distinct: 1 }],
+            fields: {},
+        });
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'done',
+                    queryUuid,
+                    rows: [{ orders_custom_distinct: 1 }],
+                },
+            },
+        });
+        expect(asyncQueryService.getRawAsyncQueryResults).toHaveBeenCalled();
+    });
+
+    it('does not search field values outside the active agent scope', async () => {
+        const { projectService } = makeMcpService({
+            context: {
+                projectUuid,
+                projectName: 'Project',
+                agentUuid: 'agent-uuid',
+                agentName: 'Agent',
+                tags: null,
+            },
+            agent: {
+                uuid: 'agent-uuid',
+                name: 'Agent',
+                tags: ['agent-tag'],
+                spaceAccess: [],
+            },
+            explores: { orders: makeExplore({ tags: ['agent-tag'] }) },
+        });
+
+        const result = await getToolCallback(McpToolName.SEARCH_FIELD_VALUES)(
+            {
+                table: 'orders',
+                fieldId: 'orders_hidden',
+                query: null,
+                filters: null,
+            },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            content: expect.arrayContaining([
+                {
+                    type: 'text',
+                    text: expect.stringContaining(
+                        'Field not found: orders_hidden',
+                    ),
+                },
+            ]),
+        });
+        expect(projectService.searchFieldUniqueValues).not.toHaveBeenCalled();
+    });
+
+    it('returns final metric rows when get_query_result sees readiness during its wait', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValueOnce(
+            makeQueryHistory(
+                QueryHistoryStatus.QUEUED,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+        asyncQueryService.pollQueryHistoryUntilDeadline.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.READY,
+                QueryExecutionContext.MCP_RUN_METRIC_QUERY,
+            ),
+        );
+        asyncQueryService.getRawAsyncQueryResults.mockResolvedValue({
+            rows: [{ orders_count: 1 }],
+            fields: {},
+        });
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            content: [
+                {
+                    type: 'text',
+                    text: 'orders_count\n1\n',
+                },
+                {
+                    type: 'text',
+                    text: `queryUuid: ${queryUuid}`,
+                },
+            ],
+            structuredContent: {
+                result: {
+                    status: 'done',
+                    queryUuid,
+                    rows: [{ orders_count: 1 }],
+                    fields: {},
+                    exploreUrl: 'https://lightdash.example/share/share-id',
+                },
+            },
+        });
+        expect(asyncQueryService.getAsyncQueryResults).not.toHaveBeenCalled();
+    });
+
+    it('returns terminal errors from get_query_result without waiting', async () => {
+        const { asyncQueryService } = makeMcpService();
+        asyncQueryService.getAsyncQueryHistory.mockResolvedValue(
+            makeQueryHistory(
+                QueryHistoryStatus.ERROR,
+                QueryExecutionContext.MCP_RUN_SQL,
+                'Warehouse timed out',
+            ),
+        );
+
+        const result = await getToolCallback(McpToolName.GET_QUERY_RESULT)(
+            { queryUuid },
+            extra,
+        );
+
+        expect(result).toMatchObject({
+            structuredContent: {
+                result: {
+                    status: 'error',
+                    queryUuid,
+                    error: 'Warehouse timed out',
+                },
+            },
+        });
+        expect(asyncQueryService.getAsyncQueryHistory).toHaveBeenCalledTimes(1);
+        expect(
+            asyncQueryService.pollQueryHistoryUntilDeadline,
+        ).not.toHaveBeenCalled();
+        expect(asyncQueryService.getAsyncQueryResults).not.toHaveBeenCalled();
+    });
+});

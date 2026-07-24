@@ -1,0 +1,981 @@
+import { Knex } from 'knex';
+import { LightdashConfig } from '../config/parseConfig';
+import { PreAggregateDailyStatsModel } from '../ee/models/PreAggregateDailyStatsModel';
+import { PreAggregateModel } from '../ee/models/PreAggregateModel';
+import { type UtilRepository } from '../utils/UtilRepository';
+import { AnalyticsModel } from './AnalyticsModel';
+import { AppModel } from './AppModel';
+import { CatalogModel } from './CatalogModel/CatalogModel';
+import { CommentModel } from './CommentModel/CommentModel';
+import { ContentModel } from './ContentModel/ContentModel';
+import { ContentVerificationModel } from './ContentVerificationModel';
+import { DashboardModel } from './DashboardModel/DashboardModel';
+import { PersonalAccessTokenModel } from './DashboardModel/PersonalAccessTokenModel';
+import { DeploySessionModel } from './DeploySessionModel';
+import { DownloadAuditModel } from './DownloadAuditModel';
+import { DownloadFileModel } from './DownloadFileModel';
+import { EmailModel } from './EmailModel';
+import { FeatureFlagModel } from './FeatureFlagModel/FeatureFlagModel';
+import { GithubAppInstallationsModel } from './GithubAppInstallations/GithubAppInstallationsModel';
+import { GitlabAppInstallationsModel } from './GitlabAppInstallations/GitlabAppInstallationsModel';
+import { GitUserCredentialsModel } from './GitUserCredentials/GitUserCredentialsModel';
+import { GroupsModel } from './GroupsModel';
+import { InviteLinkModel } from './InviteLinkModel';
+import { JobModel } from './JobModel/JobModel';
+import { McpContextModel } from './McpContextModel';
+import { MigrationModel } from './MigrationModel/MigrationModel';
+import { NotificationsModel } from './NotificationsModel/NotificationsModel';
+import { OAuth2Model } from './OAuth2Model';
+import { OnboardingModel } from './OnboardingModel/OnboardingModel';
+import { OpenIdIdentityModel } from './OpenIdIdentitiesModel';
+import { OrganizationAllowedEmailDomainsModel } from './OrganizationAllowedEmailDomainsModel';
+import { OrganizationDesignModel } from './OrganizationDesignModel';
+import { OrganizationDomainVerificationModel } from './OrganizationDomainVerificationModel';
+import { OrganizationEmailDomainModel } from './OrganizationEmailDomainModel';
+import { OrganizationMemberProfileModel } from './OrganizationMemberProfileModel';
+import { OrganizationModel } from './OrganizationModel';
+import { OrganizationSettingsModel } from './OrganizationSettingsModel';
+import { OrganizationSsoModel } from './OrganizationSsoModel';
+import { OrganizationWarehouseCredentialsModel } from './OrganizationWarehouseCredentialsModel';
+import { PasswordResetLinkModel } from './PasswordResetLinkModel';
+import { PersistentDownloadFileModel } from './PersistentDownloadFileModel';
+import { PinnedListModel } from './PinnedListModel';
+import { ProjectCompileLogModel } from './ProjectCompileLogModel';
+import { ProjectDbtSourcesModel } from './ProjectDbtSourcesModel';
+import { ProjectModel } from './ProjectModel/ProjectModel';
+import { ProjectParametersModel } from './ProjectParametersModel';
+import { PullRequestsModel } from './PullRequestsModel';
+import { QueryHistoryModel } from './QueryHistoryModel/QueryHistoryModel';
+import { ResourceViewItemModel } from './ResourceViewItemModel';
+import { RolesModel } from './RolesModel';
+import { SavedChartModel } from './SavedChartModel';
+import { SavedSqlModel } from './SavedSqlModel';
+import { SchedulerModel } from './SchedulerModel';
+import { SearchModel } from './SearchModel';
+import { SessionModel } from './SessionModel';
+import { ShareModel } from './ShareModel';
+import { SlackAuthenticationModel } from './SlackAuthenticationModel';
+import { SlackChannelCacheModel } from './SlackChannelCacheModel';
+import { SlackUnfurlImageModel } from './SlackUnfurlImageModel';
+import { SpaceModel } from './SpaceModel';
+import { SpacePermissionModel } from './SpacePermissionModel';
+import { SpotlightTableConfigModel } from './SpotlightTableConfigModel';
+import { SshKeyPairModel } from './SshKeyPairModel';
+import { TagsModel } from './TagsModel';
+import { UserAttributesModel } from './UserAttributesModel';
+import { UserAvatarModel } from './UserAvatarModel';
+import { UserFavoritesModel } from './UserFavoritesModel';
+import { UserModel } from './UserModel';
+import { UserOAuthGrantsModel } from './UserOAuthGrantsModel';
+import { UserWarehouseCredentialsModel } from './UserWarehouseCredentials/UserWarehouseCredentialsModel';
+import { ValidationModel } from './ValidationModel/ValidationModel';
+import { WarehouseAvailableTablesModel } from './WarehouseAvailableTablesModel/WarehouseAvailableTablesModel';
+import { WarehouseConnectCodeModel } from './WarehouseConnectCodeModel';
+/**
+ * Interface outlining all models. Add new models to
+ * this list (in alphabetical order, please!).
+ */
+
+export type ModelManifest = {
+    analyticsModel: AnalyticsModel;
+    appModel: AppModel;
+    commentModel: CommentModel;
+    dashboardModel: DashboardModel;
+    deploySessionModel: DeploySessionModel;
+    downloadFileModel: DownloadFileModel;
+    downloadAuditModel: DownloadAuditModel;
+    persistentDownloadFileModel: PersistentDownloadFileModel;
+    emailModel: EmailModel;
+    githubAppInstallationsModel: GithubAppInstallationsModel;
+    gitUserCredentialsModel: GitUserCredentialsModel;
+    gitlabAppInstallationsModel: GitlabAppInstallationsModel;
+    groupsModel: GroupsModel;
+    inviteLinkModel: InviteLinkModel;
+    jobModel: JobModel;
+    mcpContextModel: McpContextModel;
+    migrationModel: MigrationModel;
+    notificationsModel: NotificationsModel;
+    oauthModel: OAuth2Model;
+    onboardingModel: OnboardingModel;
+    openIdIdentityModel: OpenIdIdentityModel;
+    organizationAllowedEmailDomainsModel: OrganizationAllowedEmailDomainsModel;
+    organizationDesignModel: OrganizationDesignModel;
+    organizationMemberProfileModel: OrganizationMemberProfileModel;
+    userAvatarModel: UserAvatarModel;
+    organizationModel: OrganizationModel;
+    organizationDomainVerificationModel: OrganizationDomainVerificationModel;
+    organizationEmailDomainModel: OrganizationEmailDomainModel;
+    organizationSettingsModel: OrganizationSettingsModel;
+    organizationSsoModel: OrganizationSsoModel;
+    organizationWarehouseCredentialsModel: OrganizationWarehouseCredentialsModel;
+    passwordResetLinkModel: PasswordResetLinkModel;
+    personalAccessTokenModel: PersonalAccessTokenModel;
+    pinnedListModel: PinnedListModel;
+    projectModel: ProjectModel;
+    projectDbtSourcesModel: ProjectDbtSourcesModel;
+    projectCompileLogModel: ProjectCompileLogModel;
+    pullRequestsModel: PullRequestsModel;
+    resourceViewItemModel: ResourceViewItemModel;
+    rolesModel: RolesModel;
+    savedChartModel: SavedChartModel;
+    schedulerModel: SchedulerModel;
+    searchModel: SearchModel;
+    sessionModel: SessionModel;
+    shareModel: ShareModel;
+    slackAuthenticationModel: SlackAuthenticationModel;
+    slackChannelCacheModel: SlackChannelCacheModel;
+    slackUnfurlImageModel: SlackUnfurlImageModel;
+    spaceModel: SpaceModel;
+    spacePermissionModel: SpacePermissionModel;
+    sshKeyPairModel: SshKeyPairModel;
+    userAttributesModel: UserAttributesModel;
+    userFavoritesModel: UserFavoritesModel;
+    userModel: UserModel;
+    userOAuthGrantsModel: UserOAuthGrantsModel;
+    userWarehouseCredentialsModel: UserWarehouseCredentialsModel;
+    warehouseAvailableTablesModel: WarehouseAvailableTablesModel;
+    warehouseConnectCodeModel: WarehouseConnectCodeModel;
+    validationModel: ValidationModel;
+    catalogModel: CatalogModel;
+    savedSqlModel: SavedSqlModel;
+    contentModel: ContentModel;
+    contentVerificationModel: ContentVerificationModel;
+    tagsModel: TagsModel;
+    featureFlagModel: FeatureFlagModel;
+    spotlightTableConfigModel: SpotlightTableConfigModel;
+    queryHistoryModel: QueryHistoryModel;
+    preAggregateModel: PreAggregateModel;
+    preAggregateDailyStatsModel: PreAggregateDailyStatsModel;
+    projectParametersModel: ProjectParametersModel;
+    /** An implementation signature for these models are not available at this stage */
+    aiAgentModel: unknown;
+    projectHomepageModel: unknown;
+    aiAgentDocumentModel: unknown;
+    aiWritebackThreadModel: unknown;
+    aiWritebackRunModel: unknown;
+    aiDeepResearchRunModel: unknown;
+    agentOnboardingRunModel: unknown;
+    sandboxRegistryModel: unknown;
+    projectCiStatusModel: unknown;
+    aiAgentReviewClassifierModel: unknown;
+    aiAgentReviewNotificationModel: unknown;
+    projectContextModel: unknown;
+    aiRouterModel: unknown;
+    mcpToolCallModel: unknown;
+    managedAgentModel: unknown;
+    aiOrganizationSettingsModel: unknown;
+    embedModel: unknown;
+    dashboardSummaryModel: unknown;
+    serviceAccountModel: unknown;
+    externalConnectionModel: unknown;
+    schedulerAiAugmentationModel: unknown;
+};
+
+/**
+ * Enforces the presence of getter methods for all models declared in the manifest.
+ */
+type ModelFactoryMethod<T extends ModelManifest> = {
+    [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+type ModelProvider<T extends ModelManifest> = (providerArgs: {
+    repository: ModelRepository;
+    database: Knex;
+    utils: UtilRepository;
+    lightdashConfig: LightdashConfig;
+}) => T[keyof T];
+
+/**
+ * Structure for describing model providers:
+ *
+ *   <modelName> -> providerMethod
+ */
+export type ModelProviderMap<T extends ModelManifest = ModelManifest> =
+    Partial<{
+        [K in keyof T]: ModelProvider<T>;
+    }>;
+
+/**
+ * Intermediate abstract class used to enforce model factory methods via the `ModelFactoryMethod`
+ * type. We need this extra thin layer to ensure we are statically aware of all members.
+ */
+abstract class ModelRepositoryBase {
+    /**
+     * Container for model provider overrides. Providers can be defined when instancing
+     * the model repository, and take precedence when instancing the given model.
+     *
+     * Providers receive an instance of the current OperationContext, and the parent
+     * ModelRepository instance.
+     *
+     * new ModelRepository({
+     *    modelProviders: {
+     *      encryptionModel: ({ repository, context }) => {
+     *          return new EncryptionModelOverride(...);
+     *      }
+     *    }
+     * })
+     *
+     * NOTE: This exact implementation is temporary, and is likely to be adjusted soon
+     * as part of the dependency injection rollout.
+     */
+    protected providers: ModelProviderMap;
+
+    protected readonly lightdashConfig: LightdashConfig;
+
+    /**
+     * Knex database instance, used for all database operations.
+     */
+    protected readonly database: Knex;
+
+    protected readonly utils: UtilRepository;
+
+    constructor({
+        modelProviders,
+        lightdashConfig,
+        database,
+        utils,
+    }: {
+        modelProviders?: ModelProviderMap<ModelManifest>;
+        lightdashConfig: LightdashConfig;
+        database: Knex;
+        utils: UtilRepository;
+    }) {
+        this.providers = modelProviders ?? {};
+        this.lightdashConfig = lightdashConfig;
+        this.database = database;
+        this.utils = utils;
+    }
+}
+
+/**
+ * Bare model repository class, which acts as a container for all existing
+ * models, and as a point to share instantiation and common logic.
+ *
+ * If you need to access a model, you should do it through an instance of this
+ * repository - ideally one that you accessed through a controller, or otherwise
+ * via dependency injection.
+ *
+ */
+export class ModelRepository
+    extends ModelRepositoryBase
+    implements ModelFactoryMethod<ModelManifest>
+{
+    /**
+     * Holds memoized instances of models after their initial instantiation:
+     */
+    protected modelInstances: Partial<ModelManifest> = {};
+
+    public getAnalyticsModel(): AnalyticsModel {
+        return this.getModel(
+            'analyticsModel',
+            () => new AnalyticsModel({ database: this.database }),
+        );
+    }
+
+    public getAppModel(): AppModel {
+        return this.getModel(
+            'appModel',
+            () => new AppModel({ database: this.database }),
+        );
+    }
+
+    public getCommentModel(): CommentModel {
+        return this.getModel(
+            'commentModel',
+            () => new CommentModel({ database: this.database }),
+        );
+    }
+
+    public getDashboardModel(): DashboardModel {
+        return this.getModel(
+            'dashboardModel',
+            () =>
+                new DashboardModel({
+                    database: this.database,
+                    contentVerificationModel:
+                        this.getContentVerificationModel(),
+                }),
+        );
+    }
+
+    public getDeploySessionModel(): DeploySessionModel {
+        return this.getModel(
+            'deploySessionModel',
+            () => new DeploySessionModel(this.database),
+        );
+    }
+
+    public getDownloadFileModel(): DownloadFileModel {
+        return this.getModel(
+            'downloadFileModel',
+            () => new DownloadFileModel({ database: this.database }),
+        );
+    }
+
+    public getDownloadAuditModel(): DownloadAuditModel {
+        return this.getModel(
+            'downloadAuditModel',
+            () => new DownloadAuditModel({ database: this.database }),
+        );
+    }
+
+    public getPersistentDownloadFileModel(): PersistentDownloadFileModel {
+        return this.getModel(
+            'persistentDownloadFileModel',
+            () =>
+                new PersistentDownloadFileModel({
+                    database: this.database,
+                }),
+        );
+    }
+
+    public getEmailModel(): EmailModel {
+        return this.getModel(
+            'emailModel',
+            () => new EmailModel({ database: this.database }),
+        );
+    }
+
+    public getGithubAppInstallationsModel(): GithubAppInstallationsModel {
+        return this.getModel(
+            'githubAppInstallationsModel',
+            () =>
+                new GithubAppInstallationsModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getGitUserCredentialsModel(): GitUserCredentialsModel {
+        return this.getModel(
+            'gitUserCredentialsModel',
+            () =>
+                new GitUserCredentialsModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getGitlabAppInstallationsModel(): GitlabAppInstallationsModel {
+        return this.getModel(
+            'gitlabAppInstallationsModel',
+            () =>
+                new GitlabAppInstallationsModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getGroupsModel(): GroupsModel {
+        return this.getModel(
+            'groupsModel',
+            () => new GroupsModel({ database: this.database }),
+        );
+    }
+
+    public getPullRequestsModel(): PullRequestsModel {
+        return this.getModel(
+            'pullRequestsModel',
+            () => new PullRequestsModel({ database: this.database }),
+        );
+    }
+
+    public getInviteLinkModel(): InviteLinkModel {
+        return this.getModel(
+            'inviteLinkModel',
+            () =>
+                new InviteLinkModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                }),
+        );
+    }
+
+    public getJobModel(): JobModel {
+        return this.getModel(
+            'jobModel',
+            () => new JobModel({ database: this.database }),
+        );
+    }
+
+    public getMcpContextModel(): McpContextModel {
+        return this.getModel(
+            'mcpContextModel',
+            () => new McpContextModel(this.database),
+        );
+    }
+
+    public getMigrationModel(): MigrationModel {
+        return this.getModel(
+            'migrationModel',
+            () => new MigrationModel({ database: this.database }),
+        );
+    }
+
+    public getNotificationsModel(): NotificationsModel {
+        return this.getModel(
+            'notificationsModel',
+            () => new NotificationsModel({ database: this.database }),
+        );
+    }
+
+    public getOauthModel(): OAuth2Model {
+        return this.getModel(
+            'oauthModel',
+            () => new OAuth2Model(this.database),
+        );
+    }
+
+    public getOnboardingModel(): OnboardingModel {
+        return this.getModel(
+            'onboardingModel',
+            () => new OnboardingModel({ database: this.database }),
+        );
+    }
+
+    public getOpenIdIdentityModel(): OpenIdIdentityModel {
+        return this.getModel(
+            'openIdIdentityModel',
+            () => new OpenIdIdentityModel({ database: this.database }),
+        );
+    }
+
+    public getOrganizationAllowedEmailDomainsModel(): OrganizationAllowedEmailDomainsModel {
+        return this.getModel(
+            'organizationAllowedEmailDomainsModel',
+            () =>
+                new OrganizationAllowedEmailDomainsModel({
+                    database: this.database,
+                }),
+        );
+    }
+
+    public getOrganizationMemberProfileModel(): OrganizationMemberProfileModel {
+        return this.getModel(
+            'organizationMemberProfileModel',
+            () =>
+                new OrganizationMemberProfileModel({
+                    database: this.database,
+                }),
+        );
+    }
+
+    public getUserAvatarModel(): UserAvatarModel {
+        return this.getModel(
+            'userAvatarModel',
+            () => new UserAvatarModel({ database: this.database }),
+        );
+    }
+
+    public getOrganizationModel(): OrganizationModel {
+        return this.getModel(
+            'organizationModel',
+            () => new OrganizationModel(this.database, this.lightdashConfig),
+        );
+    }
+
+    public getOrganizationDomainVerificationModel(): OrganizationDomainVerificationModel {
+        return this.getModel(
+            'organizationDomainVerificationModel',
+            () =>
+                new OrganizationDomainVerificationModel({
+                    database: this.database,
+                }),
+        );
+    }
+
+    public getOrganizationEmailDomainModel(): OrganizationEmailDomainModel {
+        return this.getModel(
+            'organizationEmailDomainModel',
+            () =>
+                new OrganizationEmailDomainModel({
+                    database: this.database,
+                }),
+        );
+    }
+
+    public getOrganizationDesignModel(): OrganizationDesignModel {
+        return this.getModel(
+            'organizationDesignModel',
+            () => new OrganizationDesignModel({ database: this.database }),
+        );
+    }
+
+    public getOrganizationWarehouseCredentialsModel(): OrganizationWarehouseCredentialsModel {
+        return this.getModel(
+            'organizationWarehouseCredentialsModel',
+            () =>
+                new OrganizationWarehouseCredentialsModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getOrganizationSettingsModel(): OrganizationSettingsModel {
+        return this.getModel(
+            'organizationSettingsModel',
+            () => new OrganizationSettingsModel({ database: this.database }),
+        );
+    }
+
+    public getOrganizationSsoModel(): OrganizationSsoModel {
+        return this.getModel(
+            'organizationSsoModel',
+            () =>
+                new OrganizationSsoModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getPasswordResetLinkModel(): PasswordResetLinkModel {
+        return this.getModel(
+            'passwordResetLinkModel',
+            () =>
+                new PasswordResetLinkModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                }),
+        );
+    }
+
+    public getPersonalAccessTokenModel(): PersonalAccessTokenModel {
+        return this.getModel(
+            'personalAccessTokenModel',
+            () => new PersonalAccessTokenModel({ database: this.database }),
+        );
+    }
+
+    public getPinnedListModel(): PinnedListModel {
+        return this.getModel(
+            'pinnedListModel',
+            () => new PinnedListModel({ database: this.database }),
+        );
+    }
+
+    public getProjectModel(): ProjectModel {
+        return this.getModel(
+            'projectModel',
+            () =>
+                new ProjectModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getProjectDbtSourcesModel(): ProjectDbtSourcesModel {
+        return this.getModel(
+            'projectDbtSourcesModel',
+            () =>
+                new ProjectDbtSourcesModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getProjectCompileLogModel(): ProjectCompileLogModel {
+        return this.getModel(
+            'projectCompileLogModel',
+            () => new ProjectCompileLogModel({ database: this.database }),
+        );
+    }
+
+    public getResourceViewItemModel(): ResourceViewItemModel {
+        return this.getModel(
+            'resourceViewItemModel',
+            () => new ResourceViewItemModel({ database: this.database }),
+        );
+    }
+
+    public getRolesModel(): RolesModel {
+        return this.getModel('rolesModel', () => new RolesModel(this.database));
+    }
+
+    public getSavedChartModel(): SavedChartModel {
+        return this.getModel(
+            'savedChartModel',
+            () =>
+                new SavedChartModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                    contentVerificationModel:
+                        this.getContentVerificationModel(),
+                }),
+        );
+    }
+
+    public getSchedulerModel(): SchedulerModel {
+        return this.getModel(
+            'schedulerModel',
+            () => new SchedulerModel({ database: this.database }),
+        );
+    }
+
+    public getSearchModel(): SearchModel {
+        return this.getModel(
+            'searchModel',
+            () =>
+                new SearchModel({
+                    database: this.database,
+                    contentVerificationModel:
+                        this.getContentVerificationModel(),
+                }),
+        );
+    }
+
+    public getSessionModel(): SessionModel {
+        return this.getModel(
+            'sessionModel',
+            () => new SessionModel(this.database),
+        );
+    }
+
+    public getShareModel(): ShareModel {
+        return this.getModel(
+            'shareModel',
+            () => new ShareModel({ database: this.database }),
+        );
+    }
+
+    public getSlackAuthenticationModel(): SlackAuthenticationModel {
+        return this.getModel(
+            'slackAuthenticationModel',
+            () => new SlackAuthenticationModel({ database: this.database }),
+        );
+    }
+
+    public getSlackChannelCacheModel(): SlackChannelCacheModel {
+        return this.getModel(
+            'slackChannelCacheModel',
+            () => new SlackChannelCacheModel({ database: this.database }),
+        );
+    }
+
+    public getSlackUnfurlImageModel(): SlackUnfurlImageModel {
+        return this.getModel(
+            'slackUnfurlImageModel',
+            () => new SlackUnfurlImageModel({ database: this.database }),
+        );
+    }
+
+    public getSpaceModel(): SpaceModel {
+        return this.getModel(
+            'spaceModel',
+            () => new SpaceModel({ database: this.database }),
+        );
+    }
+
+    public getSpacePermissionModel(): SpacePermissionModel {
+        return this.getModel(
+            'spacePermissionModel',
+            () => new SpacePermissionModel(this.database),
+        );
+    }
+
+    public getSshKeyPairModel(): SshKeyPairModel {
+        return this.getModel(
+            'sshKeyPairModel',
+            () =>
+                new SshKeyPairModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getUserAttributesModel(): UserAttributesModel {
+        return this.getModel(
+            'userAttributesModel',
+            () => new UserAttributesModel({ database: this.database }),
+        );
+    }
+
+    public getUserFavoritesModel(): UserFavoritesModel {
+        return this.getModel(
+            'userFavoritesModel',
+            () => new UserFavoritesModel({ database: this.database }),
+        );
+    }
+
+    public getUserModel(): UserModel {
+        return this.getModel(
+            'userModel',
+            () =>
+                new UserModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                    featureFlagModel: this.getFeatureFlagModel(),
+                }),
+        );
+    }
+
+    public getUserOAuthGrantsModel(): UserOAuthGrantsModel {
+        return this.getModel(
+            'userOAuthGrantsModel',
+            () =>
+                new UserOAuthGrantsModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                    userModel: this.getUserModel(),
+                }),
+        );
+    }
+
+    public getUserWarehouseCredentialsModel(): UserWarehouseCredentialsModel {
+        return this.getModel(
+            'userWarehouseCredentialsModel',
+            () =>
+                new UserWarehouseCredentialsModel({
+                    database: this.database,
+                    encryptionUtil: this.utils.getEncryptionUtil(),
+                }),
+        );
+    }
+
+    public getWarehouseAvailableTablesModel(): WarehouseAvailableTablesModel {
+        return this.getModel(
+            'warehouseAvailableTablesModel',
+            () => new WarehouseAvailableTablesModel(this.database),
+        );
+    }
+
+    public getWarehouseConnectCodeModel(): WarehouseConnectCodeModel {
+        return this.getModel(
+            'warehouseConnectCodeModel',
+            () => new WarehouseConnectCodeModel({ database: this.database }),
+        );
+    }
+
+    public getValidationModel(): ValidationModel {
+        return this.getModel(
+            'validationModel',
+            () => new ValidationModel({ database: this.database }),
+        );
+    }
+
+    public getCatalogModel(): CatalogModel {
+        return this.getModel(
+            'catalogModel',
+            () =>
+                new CatalogModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                }),
+        );
+    }
+
+    public getSavedSqlModel(): SavedSqlModel {
+        return this.getModel(
+            'savedSqlModel',
+            () =>
+                new SavedSqlModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                }),
+        );
+    }
+
+    public getContentModel(): ContentModel {
+        return this.getModel(
+            'contentModel',
+            () => new ContentModel({ database: this.database }),
+        );
+    }
+
+    public getContentVerificationModel(): ContentVerificationModel {
+        return this.getModel(
+            'contentVerificationModel',
+            () => new ContentVerificationModel({ database: this.database }),
+        );
+    }
+
+    public getFeatureFlagModel(): FeatureFlagModel {
+        return this.getModel(
+            'featureFlagModel',
+            () =>
+                new FeatureFlagModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                }),
+        );
+    }
+
+    public getAiAgentModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiAgentModel');
+    }
+
+    public getProjectHomepageModel<ModelImplT>(): ModelImplT {
+        return this.getModel('projectHomepageModel');
+    }
+
+    public getMcpToolCallModel<ModelImplT>(): ModelImplT {
+        return this.getModel('mcpToolCallModel');
+    }
+
+    public getAiAgentDocumentModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiAgentDocumentModel');
+    }
+
+    public getAiWritebackThreadModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiWritebackThreadModel');
+    }
+
+    public getAiWritebackRunModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiWritebackRunModel');
+    }
+
+    public getAiDeepResearchRunModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiDeepResearchRunModel');
+    }
+
+    public getAgentOnboardingRunModel<ModelImplT>(): ModelImplT {
+        return this.getModel('agentOnboardingRunModel');
+    }
+
+    public getSandboxRegistryModel<ModelImplT>(): ModelImplT {
+        return this.getModel('sandboxRegistryModel');
+    }
+
+    public getProjectCiStatusModel<ModelImplT>(): ModelImplT {
+        return this.getModel('projectCiStatusModel');
+    }
+
+    public getProjectContextModel<ModelImplT>(): ModelImplT {
+        return this.getModel('projectContextModel');
+    }
+
+    public getSchedulerAiAugmentationModel<ModelImplT>(): ModelImplT {
+        return this.getModel('schedulerAiAugmentationModel');
+    }
+
+    public getAiAgentReviewClassifierModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiAgentReviewClassifierModel');
+    }
+
+    public getAiAgentReviewNotificationModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiAgentReviewNotificationModel');
+    }
+
+    public getAiRouterModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiRouterModel');
+    }
+
+    public getAiOrganizationSettingsModel<ModelImplT>(): ModelImplT {
+        return this.getModel('aiOrganizationSettingsModel');
+    }
+
+    public getEmbedModel<ModelImplT>(): ModelImplT {
+        return this.getModel('embedModel');
+    }
+
+    public getDashboardSummaryModel<ModelImplT>(): ModelImplT {
+        return this.getModel('dashboardSummaryModel');
+    }
+
+    public getTagsModel(): TagsModel {
+        return this.getModel(
+            'tagsModel',
+            () => new TagsModel({ database: this.database }),
+        );
+    }
+
+    public getManagedAgentModel<ModelImplT>(): ModelImplT {
+        return this.getModel('managedAgentModel');
+    }
+
+    public getServiceAccountModel<ModelImplT>(): ModelImplT {
+        return this.getModel('serviceAccountModel');
+    }
+
+    public getExternalConnectionModel<ModelImplT>(): ModelImplT {
+        return this.getModel('externalConnectionModel');
+    }
+
+    public getSpotlightTableConfigModel(): SpotlightTableConfigModel {
+        return this.getModel(
+            'spotlightTableConfigModel',
+            () =>
+                new SpotlightTableConfigModel({
+                    database: this.database,
+                    lightdashConfig: this.lightdashConfig,
+                }),
+        );
+    }
+
+    public getQueryHistoryModel(): QueryHistoryModel {
+        return this.getModel(
+            'queryHistoryModel',
+            () => new QueryHistoryModel({ database: this.database }),
+        );
+    }
+
+    public getPreAggregateDailyStatsModel(): PreAggregateDailyStatsModel {
+        return this.getModel(
+            'preAggregateDailyStatsModel',
+            () =>
+                new PreAggregateDailyStatsModel({
+                    database: this.database,
+                }),
+        );
+    }
+
+    public getPreAggregateModel(): PreAggregateModel {
+        return this.getModel(
+            'preAggregateModel',
+            () =>
+                new PreAggregateModel({
+                    database: this.database,
+                }),
+        );
+    }
+
+    public getProjectParametersModel(): ProjectParametersModel {
+        return this.getModel(
+            'projectParametersModel',
+            () => new ProjectParametersModel({ database: this.database }),
+        );
+    }
+
+    /**
+     * Handles initializing a model, and taking into account model
+     * providers + memoization.
+     *
+     * If a factory is not provided, and a model provider is not defined,
+     * this method throws an error. This should not happen in normal operation.
+     */
+    private getModel<K extends keyof ModelManifest, T extends ModelManifest[K]>(
+        modelName: K,
+        factory?: () => T,
+    ): T {
+        if (this.modelInstances[modelName] == null) {
+            let modelInstance: T;
+
+            if (this.providers[modelName] != null) {
+                modelInstance = this.providers[modelName]!({
+                    repository: this,
+                    database: this.database,
+                    utils: this.utils,
+                    lightdashConfig: this.lightdashConfig,
+                }) as T;
+            } else if (factory != null) {
+                modelInstance = factory();
+            } else {
+                throw new Error(
+                    `Unable to initialize model '${modelName}' - no factory or provider.`,
+                );
+            }
+
+            this.modelInstances[modelName] = modelInstance;
+        }
+
+        return this.modelInstances[modelName] as T;
+    }
+}

@@ -1,0 +1,217 @@
+import { subject } from '@casl/ability';
+import {
+    ChartType,
+    getCustomLabelsFromColumnProperties,
+    getHiddenTableFields,
+    getPivotConfig,
+    type ApiScheduledDownloadCsv,
+} from '@lightdash/common';
+import { ActionIcon, Popover } from '@mantine-8/core';
+import { IconShare2 } from '@tabler/icons-react';
+import { memo, useCallback } from 'react';
+import useEchartsCartesianConfig from '../../../hooks/echarts/useEchartsCartesianConfig';
+import { Can } from '../../../providers/Ability';
+import useApp from '../../../providers/App/useApp';
+import { type Limit } from '../../ExportResults/types';
+import ExportSelector from '../../ExportSelector';
+import { isTableVisualizationConfig } from '../../LightdashVisualization/types';
+import { useVisualizationContext } from '../../LightdashVisualization/useVisualizationContext';
+import {
+    COLLAPSABLE_CARD_ACTION_ICON_PROPS,
+    COLLAPSABLE_CARD_POPOVER_PROPS,
+} from '../CollapsableCard/constants';
+import MantineIcon from '../MantineIcon';
+import ChartDownloadOptions from './ChartDownloadOptions';
+import {
+    CHART_TYPES_WITHOUT_DATA_EXPORT,
+    CHART_TYPES_WITHOUT_IMAGE_EXPORT,
+} from './chartDownloadUtils';
+
+export type ChartDownloadMenuProps = {
+    getDownloadQueryUuid: (
+        limit: number | null,
+        exportPivotedResults?: boolean,
+    ) => Promise<string>;
+    projectUuid: string;
+    chartName?: string;
+    getGsheetLink?: (
+        columnOrder: string[],
+        showTableNames: boolean,
+        customLabels?: Record<string, string>,
+    ) => Promise<ApiScheduledDownloadCsv>;
+};
+
+const ChartDownloadMenu: React.FC<ChartDownloadMenuProps> = memo(
+    ({ getDownloadQueryUuid, getGsheetLink, projectUuid, chartName }) => {
+        const {
+            chartRef,
+            visualizationConfig,
+            resultsData,
+            pivotDimensions,
+            chartConfig,
+            columnOrder,
+        } = useVisualizationContext();
+
+        const eChartsOptions = useEchartsCartesianConfig();
+
+        const disabled =
+            (isTableVisualizationConfig(visualizationConfig) &&
+                !resultsData?.totalResults) ||
+            (visualizationConfig.chartType === ChartType.CARTESIAN &&
+                !eChartsOptions);
+
+        const { user } = useApp();
+
+        const getChartInstance = useCallback(
+            () => chartRef.current?.getEchartsInstance(),
+            [chartRef],
+        );
+
+        // Build pivot config with pivot dimensions. metricQuery is required to
+        // classify hidden fields; without results there is nothing to pivot yet.
+        const pivotConfig = resultsData?.metricQuery
+            ? getPivotConfig({
+                  chartConfig,
+                  pivotConfig: pivotDimensions
+                      ? {
+                            columns: pivotDimensions,
+                            ...(isTableVisualizationConfig(
+                                visualizationConfig,
+                            ) &&
+                                visualizationConfig.chartConfig
+                                    .configuredRowFieldIds && {
+                                    rows: visualizationConfig.chartConfig
+                                        .configuredRowFieldIds,
+                                }),
+                        }
+                      : undefined,
+                  tableConfig: {
+                      columnOrder,
+                  },
+                  metricQuery: resultsData.metricQuery,
+              })
+            : undefined;
+
+        const getChartDownloadQueryUuid = useCallback(
+            (
+                limit: number | null,
+                _limitType: Limit,
+                exportPivotedData: boolean = true,
+            ) => {
+                return getDownloadQueryUuid(limit, exportPivotedData);
+            },
+            [getDownloadQueryUuid],
+        );
+
+        if (
+            CHART_TYPES_WITHOUT_IMAGE_EXPORT.includes(
+                visualizationConfig.chartType,
+            ) &&
+            CHART_TYPES_WITHOUT_DATA_EXPORT.includes(
+                visualizationConfig.chartType,
+            )
+        ) {
+            return null;
+        }
+        return isTableVisualizationConfig(visualizationConfig) &&
+            getChartDownloadQueryUuid ? (
+            <Can
+                I="manage"
+                this={subject('ExportCsv', {
+                    organizationUuid: user.data?.organizationUuid,
+                    projectUuid,
+                })}
+            >
+                <Popover
+                    {...COLLAPSABLE_CARD_POPOVER_PROPS}
+                    disabled={disabled}
+                    position="bottom-end"
+                >
+                    <Popover.Target>
+                        <ActionIcon
+                            data-testid="export-csv-button"
+                            {...COLLAPSABLE_CARD_ACTION_ICON_PROPS}
+                            disabled={disabled}
+                        >
+                            <MantineIcon icon={IconShare2} />
+                        </ActionIcon>
+                    </Popover.Target>
+
+                    <Popover.Dropdown>
+                        <ExportSelector
+                            projectUuid={projectUuid}
+                            totalResults={resultsData?.totalResults}
+                            getDownloadQueryUuid={getChartDownloadQueryUuid}
+                            columnOrder={
+                                visualizationConfig.chartConfig.columnOrder
+                            }
+                            customLabels={getCustomLabelsFromColumnProperties(
+                                visualizationConfig.chartConfig
+                                    .columnProperties,
+                            )}
+                            hiddenFields={getHiddenTableFields({
+                                type: ChartType.TABLE,
+                                config: visualizationConfig.chartConfig
+                                    .validConfig,
+                            })}
+                            showTableNames={
+                                visualizationConfig.chartConfig.showTableNames
+                            }
+                            chartName={chartName}
+                            pivotConfig={pivotConfig}
+                            conditionalFormattings={
+                                visualizationConfig.chartConfig
+                                    .conditionalFormattings
+                            }
+                            getGsheetLink={
+                                getGsheetLink === undefined
+                                    ? undefined
+                                    : () =>
+                                          getGsheetLink(
+                                              visualizationConfig.chartConfig
+                                                  .columnOrder,
+                                              visualizationConfig.chartConfig
+                                                  .showTableNames,
+                                              getCustomLabelsFromColumnProperties(
+                                                  visualizationConfig
+                                                      .chartConfig
+                                                      .columnProperties,
+                                              ),
+                                          )
+                            }
+                        />
+                    </Popover.Dropdown>
+                </Popover>
+            </Can>
+        ) : isTableVisualizationConfig(visualizationConfig) &&
+          !getDownloadQueryUuid ? null : (
+            <Popover
+                {...COLLAPSABLE_CARD_POPOVER_PROPS}
+                disabled={disabled}
+                position="bottom-end"
+            >
+                <Popover.Target>
+                    <ActionIcon
+                        data-testid="export-csv-button"
+                        {...COLLAPSABLE_CARD_ACTION_ICON_PROPS}
+                        disabled={disabled}
+                    >
+                        <MantineIcon icon={IconShare2} />
+                    </ActionIcon>
+                </Popover.Target>
+
+                <Popover.Dropdown>
+                    {visualizationConfig?.chartType &&
+                    !isTableVisualizationConfig(visualizationConfig) &&
+                    chartRef.current ? (
+                        <ChartDownloadOptions
+                            getChartInstance={getChartInstance}
+                        />
+                    ) : null}
+                </Popover.Dropdown>
+            </Popover>
+        );
+    },
+);
+
+export default ChartDownloadMenu;

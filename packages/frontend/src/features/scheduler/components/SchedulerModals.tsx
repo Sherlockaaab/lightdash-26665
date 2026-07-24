@@ -1,0 +1,147 @@
+import { type ItemsMap } from '@lightdash/common';
+import { useDebouncedValue } from '@mantine-8/hooks';
+import { useState, type FC } from 'react';
+import {
+    selectParameterDefinitions,
+    selectParameters,
+    useExplorerSelector,
+} from '../../../features/explorer/store';
+import useDashboardContext from '../../../providers/Dashboard/useDashboardContext';
+import {
+    useAppSchedulerCreateMutation,
+    useAppSchedulers,
+} from '../hooks/useAppSchedulers';
+import {
+    useChartSchedulerCreateMutation,
+    useChartSchedulers,
+} from '../hooks/useChartSchedulers';
+import {
+    useDashboardSchedulerCreateMutation,
+    useDashboardSchedulers,
+} from '../hooks/useDashboardSchedulers';
+import SchedulerModal from './SchedulerModal';
+import { DELIVERY_FORMATS } from './types';
+
+interface DashboardSchedulersProps {
+    dashboardUuid: string;
+    name: string;
+    isOpen: boolean;
+    onClose: () => void;
+    /** If provided, opens directly in edit mode for this scheduler */
+    initialSchedulerUuid?: string;
+}
+
+export const DashboardSchedulersModal: FC<DashboardSchedulersProps> = ({
+    dashboardUuid,
+    name,
+    ...modalProps
+}) => {
+    const [searchQuery, setSearchQuery] = useState<string | undefined>();
+    const [debouncedSearchQuery] = useDebouncedValue(searchQuery, 300);
+    const schedulersQuery = useDashboardSchedulers({
+        dashboardUuid,
+        searchQuery: debouncedSearchQuery,
+        includeLatestRun: true,
+    });
+    const createMutation = useDashboardSchedulerCreateMutation();
+
+    // Extract parameter data from dashboard context
+    const currentParameterValues = useDashboardContext(
+        (c) => c.parameterValues,
+    );
+    const availableParameters = useDashboardContext(
+        (c) => c.parameterDefinitions,
+    );
+
+    return (
+        <SchedulerModal
+            resourceUuid={dashboardUuid}
+            name={name}
+            schedulersQuery={schedulersQuery}
+            createMutation={createMutation}
+            isChart={false}
+            currentParameterValues={currentParameterValues}
+            availableParameters={availableParameters}
+            searchQuery={searchQuery}
+            onSearchQueryChange={setSearchQuery}
+            {...modalProps}
+        />
+    );
+};
+
+interface ChartSchedulersProps {
+    chartUuid: string;
+    name: string;
+    isOpen: boolean;
+    isThresholdAlert?: boolean;
+    itemsMap?: ItemsMap;
+    onClose: () => void;
+    /** If provided, opens directly in edit mode for this scheduler */
+    initialSchedulerUuid?: string;
+}
+
+interface AppSchedulersProps {
+    projectUuid: string;
+    appUuid: string;
+    name: string;
+    isOpen: boolean;
+    onClose: () => void;
+    /** If provided, opens directly in edit mode for this scheduler */
+    initialSchedulerUuid?: string;
+}
+
+export const AppSchedulersModal: FC<AppSchedulersProps> = ({
+    projectUuid,
+    appUuid,
+    name,
+    ...modalProps
+}) => {
+    const schedulersQuery = useAppSchedulers({ projectUuid, appUuid });
+    const createMutation = useAppSchedulerCreateMutation(projectUuid);
+
+    return (
+        <SchedulerModal
+            resourceUuid={appUuid}
+            name={name}
+            schedulersQuery={schedulersQuery}
+            createMutation={createMutation}
+            isApp
+            {...modalProps}
+        />
+    );
+};
+
+export const ChartSchedulersModal: FC<ChartSchedulersProps> = ({
+    chartUuid,
+    name,
+    ...modalProps
+}) => {
+    const [searchQuery, setSearchQuery] = useState<string | undefined>();
+    const [debouncedSearchQuery] = useDebouncedValue(searchQuery, 300);
+    const chartSchedulersQuery = useChartSchedulers({
+        chartUuid,
+        searchQuery: debouncedSearchQuery,
+        formats: DELIVERY_FORMATS,
+        includeLatestRun: true,
+    });
+    const createMutation = useChartSchedulerCreateMutation();
+
+    // Extract parameter data from Redux
+    const currentParameterValues = useExplorerSelector(selectParameters);
+    const availableParameters = useExplorerSelector(selectParameterDefinitions);
+
+    return (
+        <SchedulerModal
+            resourceUuid={chartUuid}
+            name={name}
+            schedulersQuery={chartSchedulersQuery}
+            createMutation={createMutation}
+            isChart
+            currentParameterValues={currentParameterValues}
+            availableParameters={availableParameters}
+            searchQuery={searchQuery}
+            onSearchQueryChange={setSearchQuery}
+            {...modalProps}
+        />
+    );
+};

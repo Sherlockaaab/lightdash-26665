@@ -1,0 +1,2543 @@
+import {
+    assertUnreachable,
+    ContentType,
+    CreateDashboard,
+    CreateDashboardChartTile,
+    CreateDashboardDataAppTile,
+    CreateDashboardHeadingTile,
+    CreateDashboardLoomTile,
+    CreateDashboardMarkdownTile,
+    CreateDashboardSqlChartTile,
+    DashboardChartTile,
+    DashboardDAO,
+    DashboardDataAppTile,
+    DashboardHeadingTile,
+    DashboardLoomTile,
+    DashboardMarkdownTile,
+    DashboardSqlChartTile,
+    DashboardTab,
+    DashboardTileTypes,
+    DashboardUnversionedFields,
+    DashboardVersionedFields,
+    HTML_SANITIZE_MARKDOWN_TILE_RULES,
+    isDashboardChartTileType,
+    isDashboardDataAppTileType,
+    isDashboardHeadingTileType,
+    isDashboardLoomTileType,
+    isDashboardMarkdownTileType,
+    isDashboardSqlChartTile,
+    LightdashUser,
+    NotFoundError,
+    sanitizeHtml,
+    SavedChart,
+    SessionUser,
+    UnexpectedServerError,
+    UpdateMultipleDashboards,
+    type DashboardBasicDetailsWithTileTypes,
+    type DashboardFilters,
+    type DashboardParameters,
+    type DashboardVersionSummary,
+} from '@lightdash/common';
+import { Knex } from 'knex';
+import { validate as isValidUuid, v4 as uuidv4 } from 'uuid';
+import { AppsTableName } from '../../database/entities/apps';
+import {
+    DashboardsTableName,
+    DashboardTable,
+    DashboardTabsTableName,
+    DashboardTileChartTable,
+    DashboardTileChartTableName,
+    DashboardTileDataAppsTableName,
+    DashboardTileHeadingsTableName,
+    DashboardTileLoomsTableName,
+    DashboardTileMarkdownsTableName,
+    DashboardTileSqlChartTableName,
+    DashboardTilesTableName,
+    DashboardVersionsTableName,
+    DashboardVersionTable,
+    DashboardViewsTableName,
+} from '../../database/entities/dashboards';
+import {
+    OrganizationTable,
+    OrganizationTableName,
+} from '../../database/entities/organizations';
+import {
+    PinnedDashboardTable,
+    PinnedDashboardTableName,
+    PinnedListTable,
+    PinnedListTableName,
+} from '../../database/entities/pinnedList';
+import {
+    ProjectTable,
+    ProjectTableName,
+} from '../../database/entities/projects';
+import {
+    SavedChartsTableName,
+    SavedChartTable,
+} from '../../database/entities/savedCharts';
+import { SavedSqlTableName } from '../../database/entities/savedSql';
+import { SpaceTableName } from '../../database/entities/spaces';
+import { UserTable, UserTableName } from '../../database/entities/users';
+import { DbValidationTable } from '../../database/entities/validation';
+import Logger from '../../logging/logger';
+import {
+    acquireProjectSlugLock,
+    generateUniqueSlug,
+} from '../../utils/SlugUtils';
+import { ContentVerificationModel } from '../ContentVerificationModel';
+import Transaction = Knex.Transaction;
+
+export type GetDashboardQuery = Pick<
+    DashboardTable['base'],
+    | 'dashboard_id'
+    | 'dashboard_uuid'
+    | 'name'
+    | 'description'
+    | 'slug'
+    | 'views_count'
+    | 'first_viewed_at'
+> &
+    Pick<
+        DashboardVersionTable['base'],
+        | 'dashboard_version_id'
+        | 'dashboard_version_uuid'
+        | 'created_at'
+        | 'config'
+    > &
+    Pick<ProjectTable['base'], 'project_uuid'> &
+    Pick<UserTable['base'], 'user_uuid' | 'first_name' | 'last_name'> &
+    Pick<OrganizationTable['base'], 'organization_uuid'> &
+    Pick<PinnedListTable['base'], 'pinned_list_uuid'> &
+    Pick<PinnedDashboardTable['base'], 'order'>;
+
+export type GetDashboardDetailsQuery = Pick<
+    DashboardTable['base'],
+    | 'dashboard_uuid'
+    | 'name'
+    | 'description'
+    | 'views_count'
+    | 'first_viewed_at'
+> &
+    Pick<DashboardVersionTable['base'], 'created_at'> &
+    Pick<ProjectTable['base'], 'project_uuid'> &
+    Pick<UserTable['base'], 'user_uuid' | 'first_name' | 'last_name'> &
+    Pick<OrganizationTable['base'], 'organization_uuid'> &
+    Pick<PinnedListTable['base'], 'pinned_list_uuid'> &
+    Pick<PinnedDashboardTable['base'], 'order'>;
+
+export type GetChartTileQuery = Pick<
+    DashboardTileChartTable['base'],
+    'dashboard_tile_uuid'
+> &
+    Pick<SavedChartTable['base'], 'saved_query_uuid'>;
+
+type DashboardModelArguments = {
+    database: Knex;
+    contentVerificationModel?: ContentVerificationModel;
+};
+
+export class DashboardModel {
+    private readonly database: Knex;
+
+    private contentVerificationModel: ContentVerificationModel | undefined;
+
+    constructor(args: DashboardModelArguments) {
+        this.database = args.database;
+        this.contentVerificationModel = args.contentVerificationModel;
+    }
+
+    private static async createVersion(
+        trx: Transaction,
+        dashboardId: number,
+        version: DashboardVersionedFields,
+    ): Promise<void> {
+        // Narrow date-zoom control tileTargets to tiles present in this version,
+        // mirroring the filter tileTargets narrowing below. This drops targets
+        // for tiles removed on any deletion path (tile/tab/batch delete) without
+        // any frontend wiring. Control-level pruning stays a frontend concern.
+        const savedTileUuids = new Set(
+            version.tiles
+                .map((tile) => tile.uuid)
+                .filter((uuid): uuid is string => !!uuid),
+        );
+        const config = version.config?.dateZoomConfig
+            ? {
+                  ...version.config,
+                  dateZoomConfig: {
+                      ...version.config.dateZoomConfig,
+                      tileTargets: Object.fromEntries(
+                          Object.entries(
+                              version.config.dateZoomConfig.tileTargets,
+                          ).filter(([tileUuid]) =>
+                              savedTileUuids.has(tileUuid),
+                          ),
+                      ),
+                  },
+              }
+            : version.config;
+
+        const [versionId] = await trx(DashboardVersionsTableName).insert(
+            {
+                dashboard_id: dashboardId,
+                dashboard_version_uuid: uuidv4(),
+                updated_by_user_uuid: version.updatedByUser?.userUuid,
+                config,
+            },
+            ['dashboard_version_id', 'updated_by_user_uuid'],
+        );
+
+        await trx(DashboardViewsTableName).insert({
+            dashboard_version_id: versionId.dashboard_version_id,
+            name: 'Default',
+            filters: version.filters || {
+                dimensions: [],
+                metrics: [],
+                tableCalculations: [],
+            },
+            parameters: version.parameters || null,
+        });
+
+        if (version.tabs.length > 0) {
+            await trx(DashboardTabsTableName).insert(
+                version.tabs.map((tab) => ({
+                    dashboard_version_id: versionId.dashboard_version_id,
+                    name: tab.name,
+                    uuid: tab.uuid,
+                    dashboard_id: dashboardId,
+                    order: tab.order,
+                    hidden: tab.hidden ?? false,
+                })),
+            );
+        }
+
+        // Tiles may carry a tabUuid for a tab that no longer exists in this
+        // version (stale frontend state, concurrent edits, CLI/promotion).
+        // Drop those references so the insert can't violate the
+        // (tab_uuid, dashboard_version_id) FK on dashboard_tabs.
+        const validTabUuids = new Set(version.tabs.map((tab) => tab.uuid));
+
+        const tilesWithUuids: Array<
+            | (CreateDashboardChartTile & { uuid: string })
+            | (CreateDashboardMarkdownTile & { uuid: string })
+            | (CreateDashboardLoomTile & { uuid: string })
+            | (CreateDashboardSqlChartTile & { uuid: string })
+            | (CreateDashboardHeadingTile & { uuid: string })
+            | (CreateDashboardDataAppTile & { uuid: string })
+        > = version.tiles.map((tile) => ({
+            ...tile,
+            uuid: tile.uuid || uuidv4(),
+        }));
+
+        const droppedTabUuids = [
+            ...new Set(
+                tilesWithUuids
+                    .map((t) => t.tabUuid)
+                    .filter(
+                        (uuid): uuid is string =>
+                            !!uuid && !validTabUuids.has(uuid),
+                    ),
+            ),
+        ];
+        if (droppedTabUuids.length > 0) {
+            Logger.warn(
+                `Dropped stale tabUuid on tiles for dashboard ${dashboardId} version ${versionId.dashboard_version_id}: ${droppedTabUuids.join(', ')}`,
+            );
+        }
+
+        if (tilesWithUuids.length > 0) {
+            await trx(DashboardTilesTableName).insert(
+                tilesWithUuids.map(({ uuid, type, w, h, x, y, tabUuid }) => ({
+                    dashboard_version_id: versionId.dashboard_version_id,
+                    dashboard_tile_uuid: uuid,
+                    type,
+                    height: h,
+                    width: w,
+                    x_offset: x,
+                    y_offset: y,
+                    tab_uuid:
+                        tabUuid && validTabUuids.has(tabUuid) ? tabUuid : null,
+                })),
+            );
+        }
+
+        const chartTiles = tilesWithUuids.filter(isDashboardChartTileType);
+        if (chartTiles.length > 0) {
+            const chartIds = await trx(SavedChartsTableName)
+                .select(['saved_query_id', 'saved_query_uuid'])
+                .whereIn(
+                    'saved_query_uuid',
+                    chartTiles.map(
+                        ({ properties }) => properties.savedChartUuid,
+                    ),
+                )
+                .whereNull('deleted_at');
+
+            const getChartId = (savedChartUuid: string): number => {
+                const matchingChartId = chartIds.find(
+                    (chart) => chart.saved_query_uuid === savedChartUuid,
+                )?.saved_query_id;
+                if (matchingChartId === undefined) {
+                    throw new NotFoundError('Saved chart not found');
+                }
+                return matchingChartId;
+            };
+
+            await trx(DashboardTileChartTableName).insert(
+                tilesWithUuids
+                    .filter(isDashboardChartTileType)
+                    .map(({ uuid, properties }) => ({
+                        dashboard_version_id: versionId.dashboard_version_id,
+                        dashboard_tile_uuid: uuid,
+                        saved_chart_id: properties.savedChartUuid
+                            ? getChartId(properties.savedChartUuid)
+                            : null,
+                        hide_title: properties.hideTitle,
+                        title: properties.title,
+                    })),
+            );
+        }
+
+        const loomTiles = tilesWithUuids.filter(isDashboardLoomTileType);
+        if (loomTiles.length > 0) {
+            await trx(DashboardTileLoomsTableName).insert(
+                loomTiles.map(({ uuid, properties }) => ({
+                    dashboard_version_id: versionId.dashboard_version_id,
+                    dashboard_tile_uuid: uuid,
+                    title: properties.title,
+                    url: properties.url,
+                    hide_title: properties.hideTitle,
+                })),
+            );
+        }
+
+        const markdownTiles = tilesWithUuids.filter(
+            isDashboardMarkdownTileType,
+        );
+        if (markdownTiles.length > 0) {
+            await trx(DashboardTileMarkdownsTableName).insert(
+                markdownTiles.map(({ uuid, properties }) => ({
+                    dashboard_version_id: versionId.dashboard_version_id,
+                    dashboard_tile_uuid: uuid,
+                    title: properties.title,
+                    content: sanitizeHtml(
+                        properties.content,
+                        HTML_SANITIZE_MARKDOWN_TILE_RULES,
+                    ),
+                    hide_frame: properties.hideFrame ?? false,
+                })),
+            );
+        }
+
+        const headingTiles = tilesWithUuids.filter(isDashboardHeadingTileType);
+        if (headingTiles.length > 0) {
+            await trx(DashboardTileHeadingsTableName).insert(
+                headingTiles.map(({ uuid, properties }) => ({
+                    dashboard_version_id: versionId.dashboard_version_id,
+                    dashboard_tile_uuid: uuid,
+                    text: properties.text,
+                    show_divider: properties.showDivider ?? false,
+                })),
+            );
+        }
+
+        const sqlChartTiles = tilesWithUuids.filter(isDashboardSqlChartTile);
+        if (sqlChartTiles.length > 0) {
+            await trx(DashboardTileSqlChartTableName).insert(
+                sqlChartTiles.map(({ uuid, properties }) => ({
+                    dashboard_version_id: versionId.dashboard_version_id,
+                    dashboard_tile_uuid: uuid,
+                    saved_sql_uuid: properties.savedSqlUuid,
+                    hide_title: properties.hideTitle,
+                    title: properties.title,
+                })),
+            );
+        }
+
+        const dataAppTiles = tilesWithUuids.filter(isDashboardDataAppTileType);
+        if (dataAppTiles.length > 0) {
+            await trx(DashboardTileDataAppsTableName).insert(
+                dataAppTiles.map(({ uuid, properties }) => ({
+                    dashboard_version_id: versionId.dashboard_version_id,
+                    dashboard_tile_uuid: uuid,
+                    app_uuid: properties.appUuid,
+                    title: properties.title ?? null,
+                    hide_title: properties.hideTitle ?? false,
+                })),
+            );
+        }
+
+        const tileUuids = tilesWithUuids.map((tile) => tile.uuid);
+
+        // TODO: remove after resolving a problem with importing lodash-es in the backend
+        const pick = <T>(object: Record<string, T>, keys: string[]) =>
+            Object.keys(object)
+                .filter((key) => keys.includes(key))
+                .reduce<typeof object>(
+                    (obj, key) => ({ ...obj, [key]: object[key] }),
+                    {},
+                );
+
+        const updateData: {
+            filters: DashboardFilters;
+            parameters?: DashboardParameters;
+        } = {
+            filters: {
+                dimensions:
+                    version.filters?.dimensions.map((filter) => ({
+                        ...filter,
+                        tileTargets: filter.tileTargets
+                            ? pick(filter.tileTargets, tileUuids)
+                            : undefined,
+                    })) ?? [],
+                metrics:
+                    version.filters?.metrics?.map((filter) => ({
+                        ...filter,
+                        tileTargets: filter.tileTargets
+                            ? pick(filter.tileTargets, tileUuids)
+                            : undefined,
+                    })) ?? [],
+                tableCalculations:
+                    version.filters?.tableCalculations?.map((filter) => ({
+                        ...filter,
+                        tileTargets: filter.tileTargets
+                            ? pick(filter.tileTargets, tileUuids)
+                            : undefined,
+                    })) ?? [],
+            },
+        };
+
+        // Only update parameters if they were provided in the version
+        if (version.parameters !== undefined) {
+            updateData.parameters = version.parameters;
+        }
+
+        await trx(DashboardViewsTableName)
+            .update(updateData)
+            .where({ dashboard_version_id: versionId.dashboard_version_id });
+    }
+
+    private async getDashboardVersionTileTypes(dashboardVersionId: number) {
+        const tileTypes = await this.database(DashboardTilesTableName)
+            .select<
+                {
+                    type: DashboardTileTypes;
+                }[]
+            >(`${DashboardTilesTableName}.type`)
+            .where(
+                `${DashboardTilesTableName}.dashboard_version_id`,
+                dashboardVersionId,
+            )
+            .distinctOn(`${DashboardTilesTableName}.type`);
+
+        return tileTypes.map((t) => t.type);
+    }
+
+    async getAllByProject(
+        projectUuid: string,
+        chartUuid?: string,
+    ): Promise<DashboardBasicDetailsWithTileTypes[]> {
+        const cteTableName = 'cte';
+        const dashboardsQuery = this.database
+            .with(cteTableName, (queryBuilder) => {
+                void queryBuilder
+                    .table(DashboardsTableName)
+                    .leftJoin(
+                        DashboardVersionsTableName,
+                        `${DashboardsTableName}.dashboard_id`,
+                        `${DashboardVersionsTableName}.dashboard_id`,
+                    )
+                    .leftJoin(
+                        SpaceTableName,
+                        `${DashboardsTableName}.space_id`,
+                        `${SpaceTableName}.space_id`,
+                    )
+                    .leftJoin(
+                        UserTableName,
+                        `${UserTableName}.user_uuid`,
+                        `${DashboardVersionsTableName}.updated_by_user_uuid`,
+                    )
+                    .innerJoin(
+                        ProjectTableName,
+                        `${SpaceTableName}.project_id`,
+                        `${ProjectTableName}.project_id`,
+                    )
+                    .innerJoin(
+                        OrganizationTableName,
+                        `${ProjectTableName}.organization_id`,
+                        `${OrganizationTableName}.organization_id`,
+                    )
+                    .leftJoin(
+                        PinnedDashboardTableName,
+                        `${PinnedDashboardTableName}.dashboard_uuid`,
+                        `${DashboardsTableName}.dashboard_uuid`,
+                    )
+                    .leftJoin(
+                        PinnedListTableName,
+                        `${PinnedListTableName}.pinned_list_uuid`,
+                        `${PinnedDashboardTableName}.pinned_list_uuid`,
+                    )
+                    .select<GetDashboardDetailsQuery[]>([
+                        `${DashboardsTableName}.dashboard_uuid`,
+                        `${DashboardsTableName}.name`,
+                        `${DashboardsTableName}.description`,
+                        `${DashboardVersionsTableName}.created_at`,
+                        `${DashboardVersionsTableName}.dashboard_version_id`,
+                        `${ProjectTableName}.project_uuid`,
+                        `${UserTableName}.user_uuid`,
+                        `${UserTableName}.first_name`,
+                        `${UserTableName}.last_name`,
+                        `${OrganizationTableName}.organization_uuid`,
+                        `${SpaceTableName}.space_uuid`,
+                        `${PinnedListTableName}.pinned_list_uuid`,
+                        `${PinnedDashboardTableName}.order`,
+                        `${DashboardsTableName}.views_count`,
+                        `${DashboardsTableName}.first_viewed_at`,
+                        this.database.raw(`
+                            COALESCE(
+                                (
+                                    SELECT json_agg(validations.*)
+                                    FROM validations
+                                    WHERE validations.dashboard_uuid = ${DashboardsTableName}.dashboard_uuid
+                                    AND validations.job_id IS NULL
+                                ), '[]'
+                            ) as validation_errors
+                        `),
+                    ])
+                    .orderBy([
+                        {
+                            column: `${DashboardVersionsTableName}.dashboard_id`,
+                        },
+                        {
+                            column: `${DashboardVersionsTableName}.created_at`,
+                            order: 'desc',
+                        },
+                    ])
+                    .distinctOn(`${DashboardVersionsTableName}.dashboard_id`)
+                    .where(`${ProjectTableName}.project_uuid`, projectUuid)
+                    .whereNull(`${DashboardsTableName}.deleted_at`);
+            })
+            .select(`${cteTableName}.*`);
+
+        if (chartUuid) {
+            void dashboardsQuery
+                .leftJoin(
+                    DashboardTilesTableName,
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                    `${cteTableName}.dashboard_version_id`,
+                )
+                .leftJoin(
+                    DashboardTileChartTableName,
+                    function joinDashboardTileChartTableName() {
+                        this.on(
+                            `${DashboardTileChartTableName}.dashboard_version_id`,
+                            '=',
+                            `${DashboardTilesTableName}.dashboard_version_id`,
+                        );
+                        this.andOn(
+                            `${DashboardTileChartTableName}.dashboard_tile_uuid`,
+                            '=',
+                            `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                        );
+                    },
+                )
+                .leftJoin(
+                    SavedChartsTableName,
+                    `${SavedChartsTableName}.saved_query_id`,
+                    `${DashboardTileChartTableName}.saved_chart_id`,
+                )
+                .whereNull(`${SavedChartsTableName}.deleted_at`)
+                .distinctOn(`${cteTableName}.dashboard_uuid`)
+                .andWhere(
+                    `${SavedChartsTableName}.saved_query_uuid`,
+                    chartUuid,
+                );
+        }
+        const dashboards = await dashboardsQuery.from(cteTableName);
+
+        return Promise.all(
+            dashboards.map(
+                async ({
+                    name,
+                    description,
+                    dashboard_uuid,
+                    created_at,
+                    project_uuid,
+                    user_uuid,
+                    first_name,
+                    last_name,
+                    organization_uuid,
+                    space_uuid,
+                    pinned_list_uuid,
+                    order,
+                    views_count,
+                    first_viewed_at,
+                    validation_errors,
+                    dashboard_version_id,
+                }) => {
+                    const tileTypes =
+                        await this.getDashboardVersionTileTypes(
+                            dashboard_version_id,
+                        );
+
+                    return {
+                        organizationUuid: organization_uuid,
+                        name,
+                        description,
+                        uuid: dashboard_uuid,
+                        updatedAt: created_at,
+                        projectUuid: project_uuid,
+                        updatedByUser: {
+                            userUuid: user_uuid,
+                            firstName: first_name,
+                            lastName: last_name,
+                        },
+                        spaceUuid: space_uuid,
+                        pinnedListUuid: pinned_list_uuid,
+                        pinnedListOrder: order,
+                        views: views_count,
+                        firstViewedAt: first_viewed_at,
+                        validationErrors: validation_errors?.map(
+                            (error: DbValidationTable) => ({
+                                validationUuid: error.validation_uuid,
+                                validationId: error.validation_id,
+                                error: error.error,
+                                createdAt: error.created_at,
+                            }),
+                        ),
+                        verification: null,
+                        tileTypes,
+                    };
+                },
+            ),
+        );
+    }
+
+    async findDashboardsForValidation(
+        projectUuid: string,
+        dashboardUuid?: string,
+    ): Promise<
+        Array<{
+            dashboardUuid: string;
+            name: string;
+            filters: DashboardFilters;
+            parameters: DashboardParameters | null;
+            chartUuids: string[];
+        }>
+    > {
+        const cteName = 'dashboard_last_version_cte';
+        return (
+            this.database
+                // cte to get the last version of each dashboard in the project
+                .with(cteName, (qb) => {
+                    let cteQuery = qb
+                        .select({
+                            dashboard_uuid: `${DashboardsTableName}.dashboard_uuid`,
+                            name: `${DashboardsTableName}.name`,
+                            dashboard_version_id: this.database.raw(
+                                'MAX(dashboard_versions.dashboard_version_id)',
+                            ),
+                        })
+                        .from(DashboardsTableName)
+                        .leftJoin(
+                            SpaceTableName,
+                            `${DashboardsTableName}.space_id`,
+                            `${SpaceTableName}.space_id`,
+                        )
+                        .leftJoin(
+                            ProjectTableName,
+                            `${SpaceTableName}.project_id`,
+                            'projects.project_id',
+                        )
+                        .leftJoin(
+                            DashboardVersionsTableName,
+                            `${DashboardsTableName}.dashboard_id`,
+                            `${DashboardVersionsTableName}.dashboard_id`,
+                        )
+                        .where('projects.project_uuid', projectUuid)
+                        .whereNull(`${DashboardsTableName}.deleted_at`);
+
+                    // Filter by specific dashboard UUID if provided
+                    if (dashboardUuid) {
+                        cteQuery = cteQuery.where(
+                            `${DashboardsTableName}.dashboard_uuid`,
+                            dashboardUuid,
+                        );
+                    }
+
+                    void cteQuery.groupBy(
+                        `${DashboardsTableName}.dashboard_uuid`,
+                        `${DashboardsTableName}.name`,
+                    );
+                })
+                .select({
+                    dashboardUuid: `${cteName}.dashboard_uuid`,
+                    name: `${cteName}.name`,
+                    filters: `${DashboardViewsTableName}.filters`,
+                    parameters: `${DashboardViewsTableName}.parameters`,
+                    chartUuids: this.database.raw(
+                        `COALESCE(ARRAY_AGG(DISTINCT ${SavedChartsTableName}.saved_query_uuid) FILTER (WHERE ${SavedChartsTableName}.saved_query_uuid IS NOT NULL), '{}')`,
+                    ),
+                })
+                .from(cteName)
+                .leftJoin(
+                    DashboardViewsTableName,
+                    `${cteName}.dashboard_version_id`,
+                    `${DashboardViewsTableName}.dashboard_version_id`,
+                )
+                .leftJoin(
+                    DashboardTileChartTableName,
+                    `${cteName}.dashboard_version_id`,
+                    `${DashboardTileChartTableName}.dashboard_version_id`,
+                )
+                .leftJoin(
+                    SavedChartsTableName,
+                    `${DashboardTileChartTableName}.saved_chart_id`,
+                    `${SavedChartsTableName}.saved_query_id`,
+                )
+                .whereNull(`${SavedChartsTableName}.deleted_at`)
+                .groupBy(1, 2, 3, 4)
+        );
+    }
+
+    async getSlugsForUuids(uuids: string[]): Promise<Record<string, string>> {
+        // Uuids are globally unique, so no need to filter by project
+        const dashboards = await this.database(DashboardsTableName)
+            .select('slug', 'dashboard_uuid')
+            .whereIn('dashboard_uuid', uuids)
+            .whereNull('deleted_at');
+        return Object.fromEntries(
+            dashboards.map((dashboard) => [
+                dashboard.dashboard_uuid,
+                dashboard.slug,
+            ]),
+        );
+    }
+
+    async find({
+        slug,
+        slugs,
+        projectUuid,
+        organizationUuid,
+    }: {
+        projectUuid?: string;
+        organizationUuid?: string;
+        slug?: string;
+        slugs?: string[];
+    }): Promise<
+        Pick<
+            DashboardDAO,
+            'uuid' | 'name' | 'spaceUuid' | 'description' | 'slug'
+        >[]
+    > {
+        const query = this.database(DashboardsTableName)
+            .select(
+                `${DashboardsTableName}.name`,
+                `${DashboardsTableName}.dashboard_uuid`,
+                `${SpaceTableName}.space_uuid`,
+                `${DashboardsTableName}.description`,
+                `${DashboardsTableName}.slug`,
+            )
+            .whereNull(`${DashboardsTableName}.deleted_at`);
+
+        if (projectUuid || organizationUuid) {
+            void query
+                .innerJoin(SpaceTableName, function spaceJoin() {
+                    this.on(
+                        `${SpaceTableName}.space_id`,
+                        '=',
+                        `${DashboardsTableName}.space_id`,
+                    );
+                })
+                .leftJoin(
+                    'projects',
+                    `${SpaceTableName}.project_id`,
+                    'projects.project_id',
+                );
+        }
+
+        if (projectUuid) {
+            void query.where('projects.project_uuid', projectUuid);
+        }
+
+        if (organizationUuid) {
+            void query
+                .leftJoin(
+                    OrganizationTableName,
+                    `${OrganizationTableName}.organization_id`,
+                    'projects.organization_id',
+                )
+                .where(
+                    `${OrganizationTableName}.organization_uuid`,
+                    organizationUuid,
+                );
+        }
+
+        if (slug) {
+            void query.where(`${DashboardsTableName}.slug`, slug);
+        }
+
+        if (slugs) {
+            void query.whereIn(`${DashboardsTableName}.slug`, slugs);
+        }
+
+        const dashboards = await query;
+
+        return dashboards.map(
+            ({
+                name,
+                dashboard_uuid,
+                space_uuid,
+                description,
+                slug: dashboardSlug,
+            }) => ({
+                name,
+                description,
+                uuid: dashboard_uuid,
+                spaceUuid: space_uuid,
+                slug: dashboardSlug,
+            }),
+        );
+    }
+
+    async getByIdOrSlug(
+        dashboardUuidOrSlug: string,
+        options?: { deleted?: boolean | 'any'; projectUuid?: string },
+    ): Promise<DashboardDAO> {
+        const query = this.database(DashboardsTableName)
+            .leftJoin(
+                DashboardVersionsTableName,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+            )
+            .leftJoin(
+                UserTableName,
+                `${DashboardVersionsTableName}.updated_by_user_uuid`,
+                `${UserTableName}.user_uuid`,
+            )
+            .leftJoin(
+                SpaceTableName,
+                `${DashboardsTableName}.space_id`,
+                `${SpaceTableName}.space_id`,
+            )
+            .leftJoin(
+                ProjectTableName,
+                `${ProjectTableName}.project_id`,
+                `${SpaceTableName}.project_id`,
+            )
+            .leftJoin(
+                OrganizationTableName,
+                `${OrganizationTableName}.organization_id`,
+                `${ProjectTableName}.organization_id`,
+            )
+            .leftJoin(
+                PinnedDashboardTableName,
+                `${PinnedDashboardTableName}.dashboard_uuid`,
+                `${DashboardsTableName}.dashboard_uuid`,
+            )
+            .leftJoin(
+                PinnedListTableName,
+                `${PinnedListTableName}.pinned_list_uuid`,
+                `${PinnedDashboardTableName}.pinned_list_uuid`,
+            )
+            // Join for deleted_by user info
+            .leftJoin(
+                `${UserTableName} as deleted_by_user`,
+                `${DashboardsTableName}.deleted_by_user_uuid`,
+                'deleted_by_user.user_uuid',
+            )
+            .select<
+                (GetDashboardQuery & {
+                    space_uuid: string;
+                    space_name: string;
+                    deleted_at: Date | null;
+                    deleted_by_user_uuid: string | null;
+                    deleted_by_user_first_name: string | null;
+                    deleted_by_user_last_name: string | null;
+                    color_palette_uuid: string | null;
+                })[]
+            >([
+                `${ProjectTableName}.project_uuid`,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardsTableName}.dashboard_uuid`,
+                `${DashboardsTableName}.name`,
+                `${DashboardsTableName}.description`,
+                `${DashboardsTableName}.slug`,
+                `${DashboardVersionsTableName}.dashboard_version_id`,
+                `${DashboardVersionsTableName}.dashboard_version_uuid`,
+                `${DashboardVersionsTableName}.created_at`,
+                `${DashboardVersionsTableName}.config`,
+                `${UserTableName}.user_uuid`,
+                `${UserTableName}.first_name`,
+                `${UserTableName}.last_name`,
+                `${OrganizationTableName}.organization_uuid`,
+                `${SpaceTableName}.space_uuid`,
+                `${SpaceTableName}.name as space_name`,
+                `${PinnedListTableName}.pinned_list_uuid`,
+                `${PinnedDashboardTableName}.order`,
+                `${DashboardsTableName}.views_count`,
+                `${DashboardsTableName}.first_viewed_at`,
+                `${DashboardsTableName}.deleted_at`,
+                `${DashboardsTableName}.deleted_by_user_uuid`,
+                `${DashboardsTableName}.color_palette_uuid`,
+                'deleted_by_user.first_name as deleted_by_user_first_name',
+                'deleted_by_user.last_name as deleted_by_user_last_name',
+            ])
+            .orderBy(`${DashboardVersionsTableName}.created_at`, 'desc')
+            .limit(1);
+
+        // Filter by deleted status: deleted=true gets deleted items, deleted='any' skips filter, default gets non-deleted
+        if (options?.deleted === 'any') {
+            // No filter — find regardless of deleted status
+        } else if (options?.deleted) {
+            void query.whereNotNull(`${DashboardsTableName}.deleted_at`);
+        } else {
+            void query.whereNull(`${DashboardsTableName}.deleted_at`);
+        }
+
+        if (isValidUuid(dashboardUuidOrSlug)) {
+            void query.where((builder) => {
+                void builder
+                    .where(
+                        `${DashboardsTableName}.dashboard_uuid`,
+                        dashboardUuidOrSlug,
+                    )
+                    .orWhere(
+                        `${DashboardsTableName}.slug`,
+                        dashboardUuidOrSlug,
+                    );
+            });
+        } else {
+            void query.where(
+                `${DashboardsTableName}.slug`,
+                dashboardUuidOrSlug,
+            );
+        }
+
+        if (options?.projectUuid) {
+            void query.where(
+                `${ProjectTableName}.project_uuid`,
+                options.projectUuid,
+            );
+        }
+
+        const [dashboard] = await query;
+
+        if (!dashboard) {
+            throw new NotFoundError('Dashboard not found');
+        }
+
+        const viewQuery = this.database(DashboardViewsTableName)
+            .select('*')
+            .orderBy(`${DashboardViewsTableName}.created_at`, 'desc')
+            .where(`dashboard_version_id`, dashboard.dashboard_version_id);
+
+        const tilesQuery = this.database(DashboardTilesTableName)
+            .select<
+                {
+                    x_offset: number;
+                    y_offset: number;
+                    type: DashboardTileTypes;
+                    width: number;
+                    height: number;
+                    dashboard_tile_uuid: string;
+                    saved_query_uuid: string | null;
+                    saved_sql_uuid: string | null;
+                    url: string | null;
+                    content: string | null;
+                    text: string | null;
+                    hide_title: boolean | null;
+                    hide_frame: boolean | null;
+                    show_divider: boolean | null;
+                    title: string | null;
+                    views_count: string;
+                    first_viewed_at: Date | null;
+                    belongs_to_dashboard: boolean;
+                    name: string | null;
+                    last_version_chart_kind: string | null;
+                    tab_uuid: string;
+                    chart_slug: string;
+                    app_uuid: string | null;
+                    data_app_deleted_at: Date | null;
+                }[]
+            >(
+                `${DashboardTilesTableName}.x_offset`,
+                `${DashboardTilesTableName}.y_offset`,
+                `${DashboardTilesTableName}.type`,
+                `${DashboardTilesTableName}.width`,
+                `${DashboardTilesTableName}.height`,
+                `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                `${DashboardTilesTableName}.tab_uuid`,
+                `${SavedChartsTableName}.saved_query_uuid`,
+                this.database.raw(
+                    ` COALESCE(
+                        ${SavedChartsTableName}.name,
+                        ${SavedSqlTableName}.name
+                    ) AS name`,
+                ),
+                this.database.raw(
+                    ` COALESCE(
+                        ${SavedChartsTableName}.slug,
+                        ${SavedSqlTableName}.slug
+                    ) AS chart_slug`,
+                ),
+                `${SavedChartsTableName}.last_version_chart_kind`,
+                `${DashboardTileSqlChartTableName}.saved_sql_uuid`,
+                this.database.raw(
+                    `${SavedChartsTableName}.dashboard_uuid IS NOT NULL AS belongs_to_dashboard`,
+                ),
+                this.database.raw(
+                    `COALESCE(
+                        ${DashboardTileChartTableName}.title,
+                        ${DashboardTileLoomsTableName}.title,
+                        ${DashboardTileMarkdownsTableName}.title,
+                        ${DashboardTileSqlChartTableName}.title,
+                        ${DashboardTileDataAppsTableName}.title
+                    ) AS title`,
+                ),
+                this.database.raw(
+                    `COALESCE(
+                        ${DashboardTileLoomsTableName}.hide_title,
+                        ${DashboardTileChartTableName}.hide_title,
+                        ${DashboardTileSqlChartTableName}.hide_title,
+                        ${DashboardTileDataAppsTableName}.hide_title
+                    ) AS hide_title`,
+                ),
+                `${DashboardTileLoomsTableName}.url`,
+                `${DashboardTileMarkdownsTableName}.content`,
+                `${DashboardTileMarkdownsTableName}.hide_frame`,
+                `${DashboardTileHeadingsTableName}.text`,
+                `${DashboardTileHeadingsTableName}.show_divider`,
+                `${DashboardTileDataAppsTableName}.app_uuid`,
+                this.database.raw(
+                    `${AppsTableName}.deleted_at AS data_app_deleted_at`,
+                ),
+            )
+            .leftJoin(DashboardTileChartTableName, function chartsJoin() {
+                this.on(
+                    `${DashboardTileChartTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileChartTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileSqlChartTableName, function sqlChartsJoin() {
+                this.on(
+                    `${DashboardTileSqlChartTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileSqlChartTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileLoomsTableName, function loomsJoin() {
+                this.on(
+                    `${DashboardTileLoomsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileLoomsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileMarkdownsTableName, function markdownJoin() {
+                this.on(
+                    `${DashboardTileMarkdownsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileMarkdownsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileHeadingsTableName, function headingsJoin() {
+                this.on(
+                    `${DashboardTileHeadingsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileHeadingsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(SavedSqlTableName, function nonDeletedSavedSqlJoin() {
+                this.on(
+                    `${DashboardTileSqlChartTableName}.saved_sql_uuid`,
+                    '=',
+                    `${SavedSqlTableName}.saved_sql_uuid`,
+                ).andOnNull(`${SavedSqlTableName}.deleted_at`);
+            })
+            .leftJoin(SavedChartsTableName, function savedChartsJoin() {
+                this.on(
+                    `${DashboardTileChartTableName}.saved_chart_id`,
+                    '=',
+                    `${SavedChartsTableName}.saved_query_id`,
+                ).andOnNull(`${SavedChartsTableName}.deleted_at`);
+            })
+            .leftJoin(DashboardTileDataAppsTableName, function dataAppsJoin() {
+                this.on(
+                    `${DashboardTileDataAppsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileDataAppsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            // Intentionally does NOT filter `apps.deleted_at IS NULL`. We
+            // need to surface soft-deleted apps so the frontend can render a
+            // "this app no longer exists" placeholder instead of a broken
+            // iframe.
+            .leftJoin(
+                AppsTableName,
+                `${DashboardTileDataAppsTableName}.app_uuid`,
+                `${AppsTableName}.app_id`,
+            )
+            .where(
+                `${DashboardTilesTableName}.dashboard_version_id`,
+                dashboard.dashboard_version_id,
+            )
+            .orderBy([
+                { column: `${DashboardTilesTableName}.y_offset` },
+                { column: `${DashboardTilesTableName}.x_offset` },
+                { column: `${DashboardTilesTableName}.tab_uuid` },
+                {
+                    column: `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                },
+            ]);
+
+        const tabsQuery = this.database(DashboardTabsTableName)
+            .select<DashboardTab[]>(
+                `${DashboardTabsTableName}.name`,
+                `${DashboardTabsTableName}.uuid`,
+                `${DashboardTabsTableName}.order`,
+                `${DashboardTabsTableName}.hidden`,
+            )
+            .where(
+                `${DashboardTabsTableName}.dashboard_version_id`,
+                dashboard.dashboard_version_id,
+            )
+            .andWhere(
+                `${DashboardTabsTableName}.dashboard_id`,
+                dashboard.dashboard_id,
+            );
+
+        const verificationQuery = this.contentVerificationModel?.getByContent(
+            ContentType.DASHBOARD,
+            dashboard.dashboard_uuid,
+        );
+
+        const [[view], tiles, tabs, verificationResult] = await Promise.all([
+            viewQuery,
+            tilesQuery,
+            tabsQuery,
+            verificationQuery,
+        ]);
+        const verification = verificationResult ?? null;
+
+        // A version may have no dashboard_views row (e.g. legacy or partially
+        // written data). Guard the backfill — the return below already defaults
+        // `filters` when `view` is absent.
+        if (view?.filters) {
+            view.filters.tableCalculations =
+                view.filters.tableCalculations || [];
+        }
+
+        return {
+            organizationUuid: dashboard.organization_uuid,
+            projectUuid: dashboard.project_uuid,
+            dashboardVersionId: dashboard.dashboard_version_id,
+            versionUuid: dashboard.dashboard_version_uuid,
+            uuid: dashboard.dashboard_uuid,
+            name: dashboard.name,
+            verification,
+            description: dashboard.description,
+            updatedAt: dashboard.created_at,
+            pinnedListUuid: dashboard.pinned_list_uuid,
+            pinnedListOrder: dashboard.order,
+            tiles: tiles.map(
+                ({
+                    type,
+                    height,
+                    width,
+                    x_offset,
+                    y_offset,
+                    dashboard_tile_uuid,
+                    saved_query_uuid,
+                    saved_sql_uuid,
+                    title,
+                    hide_title,
+                    url,
+                    content,
+                    hide_frame,
+                    show_divider,
+                    text,
+                    belongs_to_dashboard,
+                    name,
+                    last_version_chart_kind,
+                    tab_uuid,
+                    chart_slug,
+                    app_uuid,
+                    data_app_deleted_at,
+                }) => {
+                    const base: Omit<
+                        DashboardDAO['tiles'][number],
+                        'type' | 'properties'
+                    > = {
+                        uuid: dashboard_tile_uuid,
+                        x: x_offset,
+                        y: y_offset,
+                        h: height,
+                        w: width,
+                        tabUuid: tab_uuid,
+                    };
+
+                    const commonProperties = {
+                        title: title ?? '',
+                        hideTitle: hide_title ?? false,
+                    };
+                    switch (type) {
+                        case DashboardTileTypes.SAVED_CHART:
+                            return <DashboardChartTile>{
+                                ...base,
+                                type: DashboardTileTypes.SAVED_CHART,
+                                properties: {
+                                    ...commonProperties,
+                                    savedChartUuid: saved_query_uuid,
+                                    belongsToDashboard: belongs_to_dashboard,
+                                    chartName: name,
+                                    chartSlug: chart_slug,
+                                    lastVersionChartKind:
+                                        last_version_chart_kind,
+                                },
+                            };
+                        case DashboardTileTypes.MARKDOWN:
+                            return <DashboardMarkdownTile>{
+                                ...base,
+                                type: DashboardTileTypes.MARKDOWN,
+                                properties: {
+                                    ...commonProperties,
+                                    content: content || '',
+                                    hideFrame: hide_frame ?? false,
+                                },
+                            };
+                        case DashboardTileTypes.LOOM:
+                            return <DashboardLoomTile>{
+                                ...base,
+                                type: DashboardTileTypes.LOOM,
+                                properties: {
+                                    ...commonProperties,
+                                    url: url || '',
+                                },
+                            };
+                        case DashboardTileTypes.SQL_CHART:
+                            return <DashboardSqlChartTile>{
+                                ...base,
+                                type: DashboardTileTypes.SQL_CHART,
+                                properties: {
+                                    ...commonProperties,
+                                    chartName: name,
+                                    savedSqlUuid: saved_sql_uuid,
+                                    chartSlug: chart_slug,
+                                },
+                            };
+                        case DashboardTileTypes.HEADING:
+                            return <DashboardHeadingTile>{
+                                ...base,
+                                type: DashboardTileTypes.HEADING,
+                                properties: {
+                                    text: text || '',
+                                    showDivider: show_divider ?? false,
+                                },
+                            };
+                        case DashboardTileTypes.DATA_APP:
+                            return <DashboardDataAppTile>{
+                                ...base,
+                                type: DashboardTileTypes.DATA_APP,
+                                properties: {
+                                    ...commonProperties,
+                                    appUuid: app_uuid ?? '',
+                                    appDeletedAt:
+                                        data_app_deleted_at?.toISOString() ??
+                                        null,
+                                },
+                            };
+                        default: {
+                            return assertUnreachable(
+                                type,
+                                new UnexpectedServerError(
+                                    `Dashboard tile type "${type}" not recognised`,
+                                ),
+                            );
+                        }
+                    }
+                },
+            ),
+            tabs,
+            filters: view?.filters || {
+                dimensions: [],
+                metrics: [],
+                tableCalculations: [],
+            },
+            parameters: view?.parameters || undefined,
+            spaceUuid: dashboard.space_uuid,
+            spaceName: dashboard.space_name,
+            views: dashboard.views_count,
+            firstViewedAt: dashboard.first_viewed_at,
+            updatedByUser: {
+                userUuid: dashboard.user_uuid,
+                firstName: dashboard.first_name,
+                lastName: dashboard.last_name,
+            },
+            slug: dashboard.slug,
+            config: dashboard?.config,
+            colorPaletteUuid: dashboard.color_palette_uuid ?? null,
+            ...(dashboard.deleted_at
+                ? {
+                      deletedAt: dashboard.deleted_at,
+                      deletedBy: dashboard.deleted_by_user_uuid
+                          ? {
+                                userUuid: dashboard.deleted_by_user_uuid,
+                                firstName:
+                                    dashboard.deleted_by_user_first_name ?? '',
+                                lastName:
+                                    dashboard.deleted_by_user_last_name ?? '',
+                            }
+                          : null,
+                  }
+                : {}),
+        };
+    }
+
+    /**
+     * Lightweight query to fetch only dashboard parameters without loading
+     * tiles, tabs, verification, or other dashboard metadata.
+     * Used by dashboard chart query execution where only parameters are needed.
+     */
+    async getDashboardParametersByIdOrSlug(
+        dashboardUuidOrSlug: string,
+        projectUuid: string,
+    ): Promise<DashboardParameters | undefined> {
+        const query = this.database(DashboardsTableName)
+            .innerJoin(
+                DashboardVersionsTableName,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+            )
+            .leftJoin(
+                DashboardViewsTableName,
+                `${DashboardVersionsTableName}.dashboard_version_id`,
+                `${DashboardViewsTableName}.dashboard_version_id`,
+            )
+            .innerJoin(
+                SpaceTableName,
+                `${DashboardsTableName}.space_id`,
+                `${SpaceTableName}.space_id`,
+            )
+            .innerJoin(
+                ProjectTableName,
+                `${ProjectTableName}.project_id`,
+                `${SpaceTableName}.project_id`,
+            )
+            .select<{ parameters: DashboardParameters | null } | undefined>(
+                `${DashboardViewsTableName}.parameters`,
+            )
+            .where(`${ProjectTableName}.project_uuid`, projectUuid)
+            .whereNull(`${DashboardsTableName}.deleted_at`)
+            .orderBy(`${DashboardVersionsTableName}.created_at`, 'desc')
+            .orderBy(`${DashboardViewsTableName}.created_at`, 'desc');
+
+        // Mirror getByIdOrSlug resolution: a value that parses as a UUID may
+        // still be a slug, so match either column; otherwise match slug only.
+        if (isValidUuid(dashboardUuidOrSlug)) {
+            void query.where((builder) => {
+                void builder
+                    .where(
+                        `${DashboardsTableName}.dashboard_uuid`,
+                        dashboardUuidOrSlug,
+                    )
+                    .orWhere(
+                        `${DashboardsTableName}.slug`,
+                        dashboardUuidOrSlug,
+                    );
+            });
+        } else {
+            void query.where(
+                `${DashboardsTableName}.slug`,
+                dashboardUuidOrSlug,
+            );
+        }
+
+        const row = await query.first();
+
+        if (!row) {
+            throw new NotFoundError('Dashboard not found');
+        }
+
+        return row.parameters ?? undefined;
+    }
+
+    /*
+    This utility method wraps the slug generation functionality for testing purposes
+    */
+    static async generateUniqueSlug(trx: Knex, slug: string): Promise<string> {
+        return generateUniqueSlug(trx, DashboardsTableName, slug);
+    }
+
+    async create(
+        spaceUuid: string,
+        dashboard: CreateDashboard & { slug: string; forceSlug?: boolean },
+        user: Pick<SessionUser, 'userUuid'>,
+        projectUuid: string,
+    ): Promise<DashboardDAO> {
+        const dashboardId = await this.database.transaction(async (trx) => {
+            if (dashboard.forceSlug) {
+                // Forced slugs (content-as-code / promotion) skip unique-slug
+                // generation, and there is no DB unique constraint on the slug.
+                // Serialize concurrent creates of the same (project, slug) and
+                // dedupe against a row a racing upsert already created, so we
+                // never insert a duplicate slug (PROD-7883).
+                await acquireProjectSlugLock(trx, projectUuid, dashboard.slug);
+                const [existing] = await trx(DashboardsTableName)
+                    .innerJoin(
+                        SpaceTableName,
+                        `${SpaceTableName}.space_id`,
+                        `${DashboardsTableName}.space_id`,
+                    )
+                    .innerJoin(
+                        ProjectTableName,
+                        `${SpaceTableName}.project_id`,
+                        `${ProjectTableName}.project_id`,
+                    )
+                    .where(`${ProjectTableName}.project_uuid`, projectUuid)
+                    .where(`${DashboardsTableName}.slug`, dashboard.slug)
+                    .whereNull(`${DashboardsTableName}.deleted_at`)
+                    .select(`${DashboardsTableName}.dashboard_uuid`);
+                if (existing) {
+                    return existing.dashboard_uuid;
+                }
+            }
+
+            const [space] = await trx(SpaceTableName)
+                .innerJoin(
+                    ProjectTableName,
+                    `${ProjectTableName}.project_id`,
+                    `${SpaceTableName}.project_id`,
+                )
+                .where(`${SpaceTableName}.space_uuid`, spaceUuid)
+                .where(`${ProjectTableName}.project_uuid`, projectUuid)
+                .select(`${SpaceTableName}.space_id`)
+                .limit(1);
+            if (!space) {
+                throw new NotFoundError('Space not found');
+            }
+
+            const [newDashboard] = await trx(DashboardsTableName)
+                .insert({
+                    project_uuid: projectUuid,
+                    name: dashboard.name,
+                    description: dashboard.description,
+                    space_id: space.space_id,
+                    slug: dashboard.forceSlug
+                        ? dashboard.slug
+                        : await DashboardModel.generateUniqueSlug(
+                              trx,
+                              dashboard.slug,
+                          ),
+                })
+                .returning(['dashboard_id', 'dashboard_uuid']);
+
+            await DashboardModel.createVersion(trx, newDashboard.dashboard_id, {
+                ...dashboard,
+                tabs: dashboard.tabs || [],
+                updatedByUser: user,
+            });
+
+            return newDashboard.dashboard_uuid;
+        });
+        return this.getByIdOrSlug(dashboardId);
+    }
+
+    async update(
+        dashboardUuidOrSlug: string,
+        dashboard: DashboardUnversionedFields,
+    ): Promise<DashboardDAO> {
+        const existingDashboard = await this.getByIdOrSlug(dashboardUuidOrSlug);
+        let withSpaceId: { space_id: number } | Record<string, never> = {};
+        if (dashboard.spaceUuid) {
+            const space = await this.database(SpaceTableName)
+                .innerJoin(
+                    ProjectTableName,
+                    `${ProjectTableName}.project_id`,
+                    `${SpaceTableName}.project_id`,
+                )
+                .select(`${SpaceTableName}.space_id`)
+                .where(`${SpaceTableName}.space_uuid`, dashboard.spaceUuid)
+                .where(
+                    `${ProjectTableName}.project_uuid`,
+                    existingDashboard.projectUuid,
+                )
+                .first();
+            if (!space) {
+                throw new NotFoundError('Space not found');
+            }
+            withSpaceId = { space_id: space.space_id };
+        }
+        const withColorPalette =
+            dashboard.colorPaletteUuid !== undefined
+                ? { color_palette_uuid: dashboard.colorPaletteUuid }
+                : {};
+        const query = this.database(DashboardsTableName)
+            .update({
+                project_uuid: existingDashboard.projectUuid,
+                name: dashboard.name,
+                description: dashboard.description,
+                ...withSpaceId,
+                ...withColorPalette,
+            })
+            .where('dashboard_uuid', existingDashboard.uuid)
+            .whereNull('deleted_at');
+
+        await query;
+
+        return this.getByIdOrSlug(existingDashboard.uuid, {
+            projectUuid: existingDashboard.projectUuid,
+        });
+    }
+
+    async updateMultiple(
+        projectUuid: string,
+        dashboards: UpdateMultipleDashboards[],
+    ): Promise<DashboardDAO[]> {
+        await this.database.transaction(async (trx) => {
+            await Promise.all(
+                dashboards.map(async (dashboard) => {
+                    let withSpaceId:
+                        | { space_id: number }
+                        | Record<string, never> = {};
+                    if (dashboard.spaceUuid) {
+                        const space = await trx(SpaceTableName)
+                            .innerJoin(
+                                ProjectTableName,
+                                `${ProjectTableName}.project_id`,
+                                `${SpaceTableName}.project_id`,
+                            )
+                            .select(`${SpaceTableName}.space_id`)
+                            .where(
+                                `${SpaceTableName}.space_uuid`,
+                                dashboard.spaceUuid,
+                            )
+                            .where(
+                                `${ProjectTableName}.project_uuid`,
+                                projectUuid,
+                            )
+                            .first();
+                        if (!space) {
+                            throw new NotFoundError('Space not found');
+                        }
+                        withSpaceId = { space_id: space.space_id };
+                    }
+                    const updateCount = await trx(DashboardsTableName)
+                        .update({
+                            project_uuid: projectUuid,
+                            name: dashboard.name,
+                            description: dashboard.description,
+                            ...withSpaceId,
+                        })
+                        .where('dashboard_uuid', dashboard.uuid)
+                        .whereIn(
+                            'space_id',
+                            trx(SpaceTableName)
+                                .select(`${SpaceTableName}.space_id`)
+                                .innerJoin(
+                                    ProjectTableName,
+                                    `${ProjectTableName}.project_id`,
+                                    `${SpaceTableName}.project_id`,
+                                )
+                                .where(
+                                    `${ProjectTableName}.project_uuid`,
+                                    projectUuid,
+                                ),
+                        )
+                        .whereNull('deleted_at');
+                    if (updateCount !== 1) {
+                        throw new NotFoundError('Dashboard not found');
+                    }
+                }),
+            );
+        });
+
+        return Promise.all(
+            dashboards.map(async (dashboard) =>
+                this.getByIdOrSlug(dashboard.uuid, { projectUuid }),
+            ),
+        );
+    }
+
+    async permanentDelete(dashboardUuid: string): Promise<DashboardDAO> {
+        const dashboard = await this.getByIdOrSlug(dashboardUuid, {
+            deleted: 'any',
+        });
+        await this.database(DashboardsTableName)
+            .where('dashboard_uuid', dashboardUuid)
+            .delete();
+        return dashboard;
+    }
+
+    async softDelete(
+        dashboardUuid: string,
+        userUuid: string,
+    ): Promise<DashboardDAO> {
+        const dashboard = await this.getByIdOrSlug(dashboardUuid);
+        const now = new Date();
+        await this.database(DashboardsTableName)
+            .update({
+                deleted_at: now,
+                deleted_by_user_uuid: userUuid,
+            })
+            .where('dashboard_uuid', dashboardUuid);
+
+        // Cascade: soft-delete dashboard-scoped charts (space_id IS NULL)
+        await this.database(SavedChartsTableName)
+            .update({
+                deleted_at: now,
+                deleted_by_user_uuid: userUuid,
+            })
+            .where('dashboard_uuid', dashboardUuid)
+            .whereNull('space_id')
+            .whereNull('deleted_at');
+
+        return dashboard;
+    }
+
+    async restore(dashboardUuid: string): Promise<void> {
+        // Get the dashboard to find who deleted it (for cascade restore)
+        const [dashboardRow] = await this.database(DashboardsTableName)
+            .select('deleted_by_user_uuid')
+            .where('dashboard_uuid', dashboardUuid)
+            .whereNotNull('deleted_at');
+
+        if (!dashboardRow) {
+            throw new NotFoundError('Deleted dashboard not found');
+        }
+
+        // Restore the dashboard
+        await this.database(DashboardsTableName)
+            .update({
+                deleted_at: null,
+                deleted_by_user_uuid: null,
+            })
+            .where('dashboard_uuid', dashboardUuid);
+
+        // Cascade: restore dashboard-scoped charts that were cascade-deleted by the same user
+        if (dashboardRow.deleted_by_user_uuid) {
+            await this.database(SavedChartsTableName)
+                .update({
+                    deleted_at: null,
+                    deleted_by_user_uuid: null,
+                })
+                .where('dashboard_uuid', dashboardUuid)
+                .whereNull('space_id')
+                .where(
+                    'deleted_by_user_uuid',
+                    dashboardRow.deleted_by_user_uuid,
+                );
+        }
+    }
+
+    async addVersion(
+        dashboardUuid: string,
+        version: DashboardVersionedFields,
+        user: Pick<SessionUser, 'userUuid'>,
+        projectUuid: string,
+        tx?: Knex.Transaction,
+    ): Promise<DashboardDAO> {
+        const db = tx || this.database;
+        const [dashboard] = await db(DashboardsTableName)
+            .select(['dashboard_id'])
+            .where('dashboard_uuid', dashboardUuid)
+            .whereNull('deleted_at')
+            .limit(1);
+        if (!dashboard) {
+            throw new NotFoundError('Dashboard not found');
+        }
+
+        const doWork = async (trx: Knex.Transaction) => {
+            await DashboardModel.createVersion(trx, dashboard.dashboard_id, {
+                ...version,
+                tabs: version.tabs || [],
+                updatedByUser: user,
+            });
+        };
+
+        if (tx) {
+            await doWork(tx);
+        } else {
+            await this.database.transaction(async (trx) => doWork(trx));
+        }
+
+        return this.getByIdOrSlug(dashboardUuid);
+    }
+
+    /*
+    backend will only delete orphans if, and only if, they do not belong to any tile.
+    This means that version reverting will now work for charts created within the dashboard,
+    even if they get removed from the tile in the next dashboard version save.
+    */
+    async getOrphanedCharts(
+        dashboardUuid: string,
+    ): Promise<Pick<SavedChart, 'uuid'>[]> {
+        const getChartsInTilesQuery = this.database(DashboardTileChartTableName)
+            .distinct('saved_chart_id')
+            .leftJoin(
+                DashboardVersionsTableName,
+                `${DashboardVersionsTableName}.dashboard_version_id`,
+                `${DashboardTileChartTableName}.dashboard_version_id`,
+            )
+            .leftJoin(
+                DashboardsTableName,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+            )
+            .where(`${DashboardsTableName}.dashboard_uuid`, dashboardUuid)
+            .whereNull(`${DashboardsTableName}.deleted_at`);
+
+        const orphanedCharts = await this.database(SavedChartsTableName)
+            .select(`saved_query_uuid`)
+            .where(`${SavedChartsTableName}.dashboard_uuid`, dashboardUuid)
+            .whereNull(`${SavedChartsTableName}.deleted_at`)
+            .whereNotIn(`saved_query_id`, getChartsInTilesQuery);
+
+        return orphanedCharts.map((chart) => ({
+            uuid: chart.saved_query_uuid,
+        }));
+    }
+
+    /**
+     * Check if a specific chart exists in the latest version of a specific dashboard within a project
+     */
+    async savedChartExistsInDashboard(
+        projectUuid: string,
+        dashboardUuid: string,
+        chartUuid: string,
+    ): Promise<boolean> {
+        const cteName = 'latest_dashboard_version_cte';
+
+        const result = await this.database
+            .with(cteName, (qb) => {
+                void qb
+                    .select({
+                        dashboard_uuid: `${DashboardsTableName}.dashboard_uuid`,
+                        dashboard_version_id: this.database.raw(
+                            `MAX(${DashboardVersionsTableName}.dashboard_version_id)`,
+                        ),
+                    })
+                    .from(DashboardsTableName)
+                    .innerJoin(
+                        DashboardVersionsTableName,
+                        `${DashboardsTableName}.dashboard_id`,
+                        `${DashboardVersionsTableName}.dashboard_id`,
+                    )
+                    .innerJoin(
+                        SpaceTableName,
+                        `${DashboardsTableName}.space_id`,
+                        `${SpaceTableName}.space_id`,
+                    )
+                    .innerJoin(
+                        ProjectTableName,
+                        `${SpaceTableName}.project_id`,
+                        `${ProjectTableName}.project_id`,
+                    )
+                    .where(
+                        `${DashboardsTableName}.dashboard_uuid`,
+                        dashboardUuid,
+                    )
+                    .where(`${ProjectTableName}.project_uuid`, projectUuid)
+                    .whereNull(`${DashboardsTableName}.deleted_at`)
+                    .groupBy(`${DashboardsTableName}.dashboard_uuid`);
+            })
+            .select<
+                {
+                    dashboard_uuid: string;
+                }[]
+            >(`${cteName}.dashboard_uuid`)
+            .from(cteName)
+            .innerJoin(
+                DashboardTileChartTableName,
+                `${cteName}.dashboard_version_id`,
+                `${DashboardTileChartTableName}.dashboard_version_id`,
+            )
+            .innerJoin(SavedChartsTableName, function savedChartsJoin() {
+                this.on(
+                    `${DashboardTileChartTableName}.saved_chart_id`,
+                    '=',
+                    `${SavedChartsTableName}.saved_query_id`,
+                ).andOnNull(`${SavedChartsTableName}.deleted_at`);
+            })
+            .where(`${SavedChartsTableName}.saved_query_uuid`, chartUuid)
+            .first();
+
+        return !!result;
+    }
+
+    async savedSqlChartExistsInDashboard(
+        projectUuid: string,
+        dashboardUuid: string,
+        savedSqlUuid: string,
+    ): Promise<boolean> {
+        const cteName = 'latest_dashboard_version_cte';
+
+        const result = await this.database
+            .with(cteName, (qb) => {
+                void qb
+                    .select({
+                        dashboard_uuid: `${DashboardsTableName}.dashboard_uuid`,
+                        dashboard_version_id: this.database.raw(
+                            `MAX(${DashboardVersionsTableName}.dashboard_version_id)`,
+                        ),
+                    })
+                    .from(DashboardsTableName)
+                    .innerJoin(
+                        DashboardVersionsTableName,
+                        `${DashboardsTableName}.dashboard_id`,
+                        `${DashboardVersionsTableName}.dashboard_id`,
+                    )
+                    .innerJoin(
+                        SpaceTableName,
+                        `${DashboardsTableName}.space_id`,
+                        `${SpaceTableName}.space_id`,
+                    )
+                    .innerJoin(
+                        ProjectTableName,
+                        `${SpaceTableName}.project_id`,
+                        `${ProjectTableName}.project_id`,
+                    )
+                    .where(
+                        `${DashboardsTableName}.dashboard_uuid`,
+                        dashboardUuid,
+                    )
+                    .where(`${ProjectTableName}.project_uuid`, projectUuid)
+                    .whereNull(`${DashboardsTableName}.deleted_at`)
+                    .groupBy(`${DashboardsTableName}.dashboard_uuid`);
+            })
+            .select<
+                {
+                    dashboard_uuid: string;
+                }[]
+            >(`${cteName}.dashboard_uuid`)
+            .from(cteName)
+            .innerJoin(
+                DashboardTileSqlChartTableName,
+                `${cteName}.dashboard_version_id`,
+                `${DashboardTileSqlChartTableName}.dashboard_version_id`,
+            )
+            .innerJoin(SavedSqlTableName, function savedSqlJoin() {
+                this.on(
+                    `${DashboardTileSqlChartTableName}.saved_sql_uuid`,
+                    '=',
+                    `${SavedSqlTableName}.saved_sql_uuid`,
+                ).andOnNull(`${SavedSqlTableName}.deleted_at`);
+            })
+            .where(`${SavedSqlTableName}.saved_sql_uuid`, savedSqlUuid)
+            .first();
+
+        return !!result;
+    }
+
+    async findInfoForDbtExposures(projectUuid: string): Promise<
+        Array<
+            Pick<DashboardDAO, 'uuid' | 'name' | 'description'> &
+                Pick<LightdashUser, 'firstName' | 'lastName'> & {
+                    chartUuids: string[] | null;
+                }
+        >
+    > {
+        return this.database
+            .table(DashboardsTableName)
+            .leftJoin(
+                DashboardVersionsTableName,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+            )
+            .leftJoin(
+                DashboardTileChartTableName,
+                `${DashboardTileChartTableName}.dashboard_version_id`,
+                `${DashboardVersionsTableName}.dashboard_version_id`,
+            )
+            .leftJoin(SavedChartsTableName, function savedChartsJoin() {
+                this.on(
+                    `${DashboardTileChartTableName}.saved_chart_id`,
+                    '=',
+                    `${SavedChartsTableName}.saved_query_id`,
+                ).andOnNull(`${SavedChartsTableName}.deleted_at`);
+            })
+            .leftJoin(
+                SpaceTableName,
+                `${DashboardsTableName}.space_id`,
+                `${SpaceTableName}.space_id`,
+            )
+            .leftJoin(
+                UserTableName,
+                `${UserTableName}.user_uuid`,
+                `${DashboardVersionsTableName}.updated_by_user_uuid`,
+            )
+            .innerJoin(
+                ProjectTableName,
+                `${SpaceTableName}.project_id`,
+                `${ProjectTableName}.project_id`,
+            )
+            .select({
+                uuid: `${DashboardsTableName}.dashboard_uuid`,
+                name: `${DashboardsTableName}.name`,
+                description: `${DashboardsTableName}.description`,
+                firstName: `${UserTableName}.first_name`,
+                lastName: `${UserTableName}.last_name`,
+                chartUuids: this.database.raw(
+                    `ARRAY_AGG(DISTINCT ${SavedChartsTableName}.saved_query_uuid) FILTER (WHERE ${SavedChartsTableName}.saved_query_uuid IS NOT NULL)`,
+                ),
+            })
+            .orderBy([
+                {
+                    column: `${DashboardVersionsTableName}.dashboard_id`,
+                },
+                {
+                    column: `${DashboardVersionsTableName}.created_at`,
+                    order: 'desc',
+                },
+            ])
+            .groupBy(
+                `${DashboardsTableName}.dashboard_uuid`,
+                `${DashboardsTableName}.name`,
+                `${DashboardsTableName}.description`,
+                `${UserTableName}.first_name`,
+                `${UserTableName}.last_name`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.created_at`,
+            )
+            .distinctOn(`${DashboardVersionsTableName}.dashboard_id`)
+            .where(`${ProjectTableName}.project_uuid`, projectUuid)
+            .whereNull(`${DashboardsTableName}.deleted_at`);
+    }
+
+    async getVersionSummaryByUuid(
+        dashboardUuid: string,
+        versionUuid: string,
+    ): Promise<DashboardVersionSummary> {
+        type VersionSummaryRow = {
+            dashboard_uuid: string;
+            dashboard_version_uuid: string;
+            created_at: Date;
+            user_uuid: string | null;
+            first_name: string | null;
+            last_name: string | null;
+        };
+
+        const row = await this.database(DashboardVersionsTableName)
+            .innerJoin(
+                DashboardsTableName,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+            )
+            .leftJoin(
+                UserTableName,
+                `${UserTableName}.user_uuid`,
+                `${DashboardVersionsTableName}.updated_by_user_uuid`,
+            )
+            .select<VersionSummaryRow[]>(
+                `${DashboardsTableName}.dashboard_uuid`,
+                `${DashboardVersionsTableName}.dashboard_version_uuid`,
+                `${DashboardVersionsTableName}.created_at`,
+                `${UserTableName}.user_uuid`,
+                `${UserTableName}.first_name`,
+                `${UserTableName}.last_name`,
+            )
+            .where(`${DashboardsTableName}.dashboard_uuid`, dashboardUuid)
+            .where(
+                `${DashboardVersionsTableName}.dashboard_version_uuid`,
+                versionUuid,
+            )
+            .first();
+
+        if (!row) {
+            throw new NotFoundError('Dashboard version not found');
+        }
+
+        return {
+            dashboardUuid: row.dashboard_uuid,
+            versionUuid: row.dashboard_version_uuid,
+            createdAt: row.created_at,
+            createdBy: row.user_uuid
+                ? {
+                      userUuid: row.user_uuid,
+                      firstName: row.first_name ?? '',
+                      lastName: row.last_name ?? '',
+                  }
+                : null,
+        };
+    }
+
+    async getLatestVersionSummaries(
+        dashboardUuid: string,
+    ): Promise<DashboardVersionSummary[]> {
+        type VersionSummaryRow = {
+            dashboard_uuid: string;
+            dashboard_version_uuid: string;
+            created_at: Date;
+            user_uuid: string | null;
+            first_name: string | null;
+            last_name: string | null;
+        };
+
+        const versions = await this.database(DashboardVersionsTableName)
+            .innerJoin(
+                DashboardsTableName,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+            )
+            .leftJoin(
+                UserTableName,
+                `${UserTableName}.user_uuid`,
+                `${DashboardVersionsTableName}.updated_by_user_uuid`,
+            )
+            .select<VersionSummaryRow[]>(
+                `${DashboardsTableName}.dashboard_uuid`,
+                `${DashboardVersionsTableName}.dashboard_version_uuid`,
+                `${DashboardVersionsTableName}.created_at`,
+                `${UserTableName}.user_uuid`,
+                `${UserTableName}.first_name`,
+                `${UserTableName}.last_name`,
+            )
+            .where(`${DashboardsTableName}.dashboard_uuid`, dashboardUuid)
+            .orderBy(`${DashboardVersionsTableName}.created_at`, 'desc');
+
+        const mapRow = (row: VersionSummaryRow): DashboardVersionSummary => ({
+            dashboardUuid: row.dashboard_uuid,
+            versionUuid: row.dashboard_version_uuid,
+            createdAt: row.created_at,
+            createdBy: row.user_uuid
+                ? {
+                      userUuid: row.user_uuid,
+                      firstName: row.first_name ?? '',
+                      lastName: row.last_name ?? '',
+                  }
+                : null,
+        });
+
+        return versions.map(mapRow);
+    }
+
+    async getVersionByUuid(
+        dashboardUuid: string,
+        versionUuid: string,
+    ): Promise<DashboardDAO> {
+        const query = this.database(DashboardsTableName)
+            .leftJoin(
+                DashboardVersionsTableName,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardVersionsTableName}.dashboard_id`,
+            )
+            .leftJoin(
+                UserTableName,
+                `${DashboardVersionsTableName}.updated_by_user_uuid`,
+                `${UserTableName}.user_uuid`,
+            )
+            .leftJoin(
+                SpaceTableName,
+                `${DashboardsTableName}.space_id`,
+                `${SpaceTableName}.space_id`,
+            )
+            .leftJoin(
+                ProjectTableName,
+                `${ProjectTableName}.project_id`,
+                `${SpaceTableName}.project_id`,
+            )
+            .leftJoin(
+                OrganizationTableName,
+                `${OrganizationTableName}.organization_id`,
+                `${ProjectTableName}.organization_id`,
+            )
+            .leftJoin(
+                PinnedDashboardTableName,
+                `${PinnedDashboardTableName}.dashboard_uuid`,
+                `${DashboardsTableName}.dashboard_uuid`,
+            )
+            .leftJoin(
+                PinnedListTableName,
+                `${PinnedListTableName}.pinned_list_uuid`,
+                `${PinnedDashboardTableName}.pinned_list_uuid`,
+            )
+            .select<
+                (GetDashboardQuery & {
+                    space_uuid: string;
+                    space_name: string;
+                    color_palette_uuid: string | null;
+                })[]
+            >([
+                `${ProjectTableName}.project_uuid`,
+                `${DashboardsTableName}.dashboard_id`,
+                `${DashboardsTableName}.dashboard_uuid`,
+                `${DashboardsTableName}.name`,
+                `${DashboardsTableName}.description`,
+                `${DashboardsTableName}.slug`,
+                `${DashboardVersionsTableName}.dashboard_version_id`,
+                `${DashboardVersionsTableName}.dashboard_version_uuid`,
+                `${DashboardVersionsTableName}.created_at`,
+                `${DashboardVersionsTableName}.config`,
+                `${UserTableName}.user_uuid`,
+                `${UserTableName}.first_name`,
+                `${UserTableName}.last_name`,
+                `${OrganizationTableName}.organization_uuid`,
+                `${SpaceTableName}.space_uuid`,
+                `${SpaceTableName}.name as space_name`,
+                `${PinnedListTableName}.pinned_list_uuid`,
+                `${PinnedDashboardTableName}.order`,
+                `${DashboardsTableName}.views_count`,
+                `${DashboardsTableName}.first_viewed_at`,
+                `${DashboardsTableName}.color_palette_uuid`,
+            ])
+            .where(`${DashboardsTableName}.dashboard_uuid`, dashboardUuid)
+            .andWhere(
+                `${DashboardVersionsTableName}.dashboard_version_uuid`,
+                versionUuid,
+            )
+            .limit(1);
+
+        const [dashboard] = await query;
+
+        if (!dashboard) {
+            throw new NotFoundError('Dashboard version not found');
+        }
+
+        const [view] = await this.database(DashboardViewsTableName)
+            .select('*')
+            .orderBy(`${DashboardViewsTableName}.created_at`, 'desc')
+            .where(`dashboard_version_id`, dashboard.dashboard_version_id);
+
+        const tiles = await this.database(DashboardTilesTableName)
+            .select<
+                {
+                    x_offset: number;
+                    y_offset: number;
+                    type: DashboardTileTypes;
+                    width: number;
+                    height: number;
+                    dashboard_tile_uuid: string;
+                    saved_query_uuid: string | null;
+                    saved_sql_uuid: string | null;
+                    url: string | null;
+                    content: string | null;
+                    text: string | null;
+                    hide_title: boolean | null;
+                    hide_frame: boolean | null;
+                    show_divider: boolean | null;
+                    title: string | null;
+                    views_count: string;
+                    first_viewed_at: Date | null;
+                    belongs_to_dashboard: boolean;
+                    name: string | null;
+                    last_version_chart_kind: string | null;
+                    tab_uuid: string;
+                    chart_slug: string;
+                    app_uuid: string | null;
+                    data_app_deleted_at: Date | null;
+                }[]
+            >(
+                `${DashboardTilesTableName}.x_offset`,
+                `${DashboardTilesTableName}.y_offset`,
+                `${DashboardTilesTableName}.type`,
+                `${DashboardTilesTableName}.width`,
+                `${DashboardTilesTableName}.height`,
+                `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                `${DashboardTilesTableName}.tab_uuid`,
+                `${SavedChartsTableName}.saved_query_uuid`,
+                this.database.raw(
+                    ` COALESCE(
+                        ${SavedChartsTableName}.name,
+                        ${SavedSqlTableName}.name
+                    ) AS name`,
+                ),
+                this.database.raw(
+                    ` COALESCE(
+                        ${SavedChartsTableName}.slug,
+                        ${SavedSqlTableName}.slug
+                    ) AS chart_slug`,
+                ),
+                `${SavedChartsTableName}.last_version_chart_kind`,
+                `${DashboardTileSqlChartTableName}.saved_sql_uuid`,
+                this.database.raw(
+                    `${SavedChartsTableName}.dashboard_uuid IS NOT NULL AS belongs_to_dashboard`,
+                ),
+                this.database.raw(
+                    `COALESCE(
+                        ${DashboardTileChartTableName}.title,
+                        ${DashboardTileLoomsTableName}.title,
+                        ${DashboardTileMarkdownsTableName}.title,
+                        ${DashboardTileSqlChartTableName}.title,
+                        ${DashboardTileDataAppsTableName}.title
+                    ) AS title`,
+                ),
+                this.database.raw(
+                    `COALESCE(
+                        ${DashboardTileLoomsTableName}.hide_title,
+                        ${DashboardTileChartTableName}.hide_title,
+                        ${DashboardTileSqlChartTableName}.hide_title,
+                        ${DashboardTileDataAppsTableName}.hide_title
+                    ) AS hide_title`,
+                ),
+                `${DashboardTileLoomsTableName}.url`,
+                `${DashboardTileMarkdownsTableName}.content`,
+                `${DashboardTileMarkdownsTableName}.hide_frame`,
+                `${DashboardTileHeadingsTableName}.text`,
+                `${DashboardTileHeadingsTableName}.show_divider`,
+                `${DashboardTileDataAppsTableName}.app_uuid`,
+                this.database.raw(
+                    `${AppsTableName}.deleted_at AS data_app_deleted_at`,
+                ),
+            )
+            .leftJoin(DashboardTileChartTableName, function chartsJoin() {
+                this.on(
+                    `${DashboardTileChartTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileChartTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileSqlChartTableName, function sqlChartsJoin() {
+                this.on(
+                    `${DashboardTileSqlChartTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileSqlChartTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileLoomsTableName, function loomsJoin() {
+                this.on(
+                    `${DashboardTileLoomsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileLoomsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileMarkdownsTableName, function markdownJoin() {
+                this.on(
+                    `${DashboardTileMarkdownsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileMarkdownsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(DashboardTileHeadingsTableName, function headingsJoin() {
+                this.on(
+                    `${DashboardTileHeadingsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileHeadingsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(
+                SavedSqlTableName,
+                `${DashboardTileSqlChartTableName}.saved_sql_uuid`,
+                `${SavedSqlTableName}.saved_sql_uuid`,
+            )
+            .leftJoin(
+                SavedChartsTableName,
+                `${DashboardTileChartTableName}.saved_chart_id`,
+                `${SavedChartsTableName}.saved_query_id`,
+            )
+            .leftJoin(DashboardTileDataAppsTableName, function dataAppsJoin() {
+                this.on(
+                    `${DashboardTileDataAppsTableName}.dashboard_tile_uuid`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                );
+                this.andOn(
+                    `${DashboardTileDataAppsTableName}.dashboard_version_id`,
+                    '=',
+                    `${DashboardTilesTableName}.dashboard_version_id`,
+                );
+            })
+            .leftJoin(
+                AppsTableName,
+                `${DashboardTileDataAppsTableName}.app_uuid`,
+                `${AppsTableName}.app_id`,
+            )
+            .where(
+                `${DashboardTilesTableName}.dashboard_version_id`,
+                dashboard.dashboard_version_id,
+            )
+            .orderBy([
+                { column: `${DashboardTilesTableName}.y_offset` },
+                { column: `${DashboardTilesTableName}.x_offset` },
+                { column: `${DashboardTilesTableName}.tab_uuid` },
+                {
+                    column: `${DashboardTilesTableName}.dashboard_tile_uuid`,
+                },
+            ]);
+
+        const tabs = await this.database(DashboardTabsTableName)
+            .select<DashboardTab[]>(
+                `${DashboardTabsTableName}.name`,
+                `${DashboardTabsTableName}.uuid`,
+                `${DashboardTabsTableName}.order`,
+                `${DashboardTabsTableName}.hidden`,
+            )
+            .where(
+                `${DashboardTabsTableName}.dashboard_version_id`,
+                dashboard.dashboard_version_id,
+            )
+            .andWhere(
+                `${DashboardTabsTableName}.dashboard_id`,
+                dashboard.dashboard_id,
+            );
+
+        // A version may have no dashboard_views row (e.g. legacy or partially
+        // written data). Guard the backfill — the return below already defaults
+        // `filters` when `view` is absent.
+        if (view?.filters) {
+            view.filters.tableCalculations =
+                view.filters.tableCalculations || [];
+        }
+
+        const verification =
+            (await this.contentVerificationModel?.getByContent(
+                ContentType.DASHBOARD,
+                dashboard.dashboard_uuid,
+            )) ?? null;
+
+        return {
+            organizationUuid: dashboard.organization_uuid,
+            projectUuid: dashboard.project_uuid,
+            dashboardVersionId: dashboard.dashboard_version_id,
+            versionUuid: dashboard.dashboard_version_uuid,
+            uuid: dashboard.dashboard_uuid,
+            name: dashboard.name,
+            verification,
+            description: dashboard.description,
+            updatedAt: dashboard.created_at,
+            pinnedListUuid: dashboard.pinned_list_uuid,
+            pinnedListOrder: dashboard.order,
+            tiles: tiles.map(
+                ({
+                    type,
+                    height,
+                    width,
+                    x_offset,
+                    y_offset,
+                    dashboard_tile_uuid,
+                    saved_query_uuid,
+                    saved_sql_uuid,
+                    title,
+                    hide_title,
+                    url,
+                    content,
+                    hide_frame,
+                    show_divider,
+                    text,
+                    belongs_to_dashboard,
+                    name,
+                    last_version_chart_kind,
+                    tab_uuid,
+                    chart_slug,
+                    app_uuid,
+                    data_app_deleted_at,
+                }) => {
+                    const base: Omit<
+                        DashboardDAO['tiles'][number],
+                        'type' | 'properties'
+                    > = {
+                        uuid: dashboard_tile_uuid,
+                        x: x_offset,
+                        y: y_offset,
+                        h: height,
+                        w: width,
+                        tabUuid: tab_uuid,
+                    };
+
+                    const commonProperties = {
+                        title: title ?? '',
+                        hideTitle: hide_title ?? false,
+                    };
+                    switch (type) {
+                        case DashboardTileTypes.SAVED_CHART:
+                            return <DashboardChartTile>{
+                                ...base,
+                                type: DashboardTileTypes.SAVED_CHART,
+                                properties: {
+                                    ...commonProperties,
+                                    savedChartUuid: saved_query_uuid,
+                                    belongsToDashboard: belongs_to_dashboard,
+                                    chartName: name,
+                                    chartSlug: chart_slug,
+                                    lastVersionChartKind:
+                                        last_version_chart_kind,
+                                },
+                            };
+                        case DashboardTileTypes.MARKDOWN:
+                            return <DashboardMarkdownTile>{
+                                ...base,
+                                type: DashboardTileTypes.MARKDOWN,
+                                properties: {
+                                    ...commonProperties,
+                                    content: content || '',
+                                    hideFrame: hide_frame ?? false,
+                                },
+                            };
+                        case DashboardTileTypes.LOOM:
+                            return <DashboardLoomTile>{
+                                ...base,
+                                type: DashboardTileTypes.LOOM,
+                                properties: {
+                                    ...commonProperties,
+                                    url: url || '',
+                                },
+                            };
+                        case DashboardTileTypes.SQL_CHART:
+                            return <DashboardSqlChartTile>{
+                                ...base,
+                                type: DashboardTileTypes.SQL_CHART,
+                                properties: {
+                                    ...commonProperties,
+                                    chartName: name,
+                                    savedSqlUuid: saved_sql_uuid,
+                                    chartSlug: chart_slug,
+                                },
+                            };
+                        case DashboardTileTypes.HEADING:
+                            return <DashboardHeadingTile>{
+                                ...base,
+                                type: DashboardTileTypes.HEADING,
+                                properties: {
+                                    text: text || '',
+                                    showDivider: show_divider ?? false,
+                                },
+                            };
+                        case DashboardTileTypes.DATA_APP:
+                            return <DashboardDataAppTile>{
+                                ...base,
+                                type: DashboardTileTypes.DATA_APP,
+                                properties: {
+                                    ...commonProperties,
+                                    appUuid: app_uuid ?? '',
+                                    appDeletedAt:
+                                        data_app_deleted_at?.toISOString() ??
+                                        null,
+                                },
+                            };
+                        default: {
+                            return assertUnreachable(
+                                type,
+                                new UnexpectedServerError(
+                                    `Dashboard tile type "${type}" not recognised`,
+                                ),
+                            );
+                        }
+                    }
+                },
+            ),
+            tabs,
+            filters: view?.filters || {
+                dimensions: [],
+                metrics: [],
+                tableCalculations: [],
+            },
+            parameters: view?.parameters || undefined,
+            spaceUuid: dashboard.space_uuid,
+            spaceName: dashboard.space_name,
+            views: dashboard.views_count,
+            firstViewedAt: dashboard.first_viewed_at,
+            updatedByUser: {
+                userUuid: dashboard.user_uuid,
+                firstName: dashboard.first_name,
+                lastName: dashboard.last_name,
+            },
+            slug: dashboard.slug,
+            config: dashboard?.config,
+            colorPaletteUuid: dashboard.color_palette_uuid ?? null,
+        };
+    }
+
+    async moveToSpace(
+        {
+            projectUuid,
+            itemUuid: dashboardUuid,
+            targetSpaceUuid,
+        }: {
+            projectUuid: string;
+            itemUuid: string;
+            targetSpaceUuid: string;
+        },
+        { tx = this.database }: { tx?: Knex } = {},
+    ): Promise<void> {
+        const space = await tx(SpaceTableName)
+            .select('space_id')
+            .innerJoin(
+                ProjectTableName,
+                `${ProjectTableName}.project_id`,
+                `${SpaceTableName}.project_id`,
+            )
+            .where(`${SpaceTableName}.space_uuid`, targetSpaceUuid)
+            .where(`${ProjectTableName}.project_uuid`, projectUuid)
+            .first();
+
+        if (!space) {
+            throw new NotFoundError('Space not found');
+        }
+
+        const updateCount = await tx(DashboardsTableName)
+            .update({
+                project_uuid: projectUuid,
+                space_id: space.space_id,
+            })
+            .where('dashboard_uuid', dashboardUuid)
+            .whereIn(
+                'space_id',
+                tx(SpaceTableName)
+                    .select(`${SpaceTableName}.space_id`)
+                    .innerJoin(
+                        ProjectTableName,
+                        `${ProjectTableName}.project_id`,
+                        `${SpaceTableName}.project_id`,
+                    )
+                    .where(`${ProjectTableName}.project_uuid`, projectUuid),
+            )
+            .whereNull('deleted_at');
+
+        if (updateCount !== 1) {
+            throw new Error('Failed to move dashboard to space');
+        }
+    }
+}

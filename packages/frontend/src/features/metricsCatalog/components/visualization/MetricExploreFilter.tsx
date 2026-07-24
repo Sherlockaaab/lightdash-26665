@@ -1,0 +1,328 @@
+import {
+    FilterOperator,
+    getItemId,
+    type CompiledDimension,
+    type FilterRule,
+} from '@lightdash/common';
+import {
+    Button,
+    Group,
+    Select,
+    Stack,
+    Text,
+    useMantineColorScheme,
+} from '@mantine-8/core';
+import { IconFilter, IconX } from '@tabler/icons-react';
+import { useCallback, useMemo, useState, type FC } from 'react';
+import MantineIcon from '../../../../components/common/MantineIcon';
+import { groupComboboxItems } from '../../../../components/common/Select/utils';
+import filterStyles from '../../styles/filterStyles.module.css';
+import {
+    createFilterRule,
+    doesDimensionRequireValues,
+    getOperatorOptions,
+} from '../../utils/metricExploreFilter';
+import SelectItem from '../SelectItem';
+import styles from './MetricExploreButtons.module.css';
+import { MetricExploreFilterAutoComplete } from './MetricExploreFilterAutoComplete';
+
+type Props = {
+    dimensions: CompiledDimension[] | undefined;
+    onFilterApply: (filterRule: FilterRule | undefined) => void;
+    initialFilterRule?: FilterRule;
+};
+
+interface FilterState {
+    dimension: string | null;
+    fieldId: string | null;
+    operator: FilterOperator | null;
+    values: string[];
+}
+
+const EMPTY_FILTER_STATE: FilterState = {
+    dimension: null,
+    fieldId: null,
+    operator: null,
+    values: [],
+};
+
+export const MetricExploreFilter: FC<Props> = ({
+    dimensions,
+    onFilterApply,
+    initialFilterRule,
+}) => {
+    const { colorScheme } = useMantineColorScheme();
+
+    // Seed from the metric's default filter on mount. The parent remounts this
+    // component (via key) per metric, so this initializer re-runs on switch.
+    const [filterState, setFilterState] = useState<FilterState>(() =>
+        initialFilterRule
+            ? {
+                  fieldId: initialFilterRule.target.fieldId,
+                  dimension:
+                      dimensions?.find(
+                          (d) =>
+                              getItemId(d) === initialFilterRule.target.fieldId,
+                      )?.name ?? null,
+                  operator: initialFilterRule.operator,
+                  values: (initialFilterRule.values ?? []) as string[],
+              }
+            : EMPTY_FILTER_STATE,
+    );
+    const [activeFilter, setActiveFilter] = useState<FilterRule | undefined>(
+        initialFilterRule,
+    );
+
+    const selectedDimension = dimensions?.find(
+        (d) => getItemId(d) === filterState.fieldId,
+    );
+
+    const operatorOptions = getOperatorOptions(selectedDimension);
+    const dimensionMetadata = useMemo(() => {
+        if (!selectedDimension) return null;
+        return {
+            requiresValues: doesDimensionRequireValues(selectedDimension),
+            type: selectedDimension.type,
+        };
+    }, [selectedDimension]);
+
+    const canApplyFilter = useMemo(() => {
+        if (!filterState.dimension || !filterState.operator) return false;
+        if (!dimensionMetadata?.requiresValues) return true;
+
+        // Check if current filter state is different from active filter
+        const hasChanges =
+            !activeFilter ||
+            filterState.fieldId !== activeFilter.target.fieldId ||
+            filterState.operator !== activeFilter.operator ||
+            JSON.stringify(filterState.values) !==
+                JSON.stringify(activeFilter.values);
+
+        return filterState.values.length > 0 && hasChanges;
+    }, [filterState, dimensionMetadata, activeFilter]);
+
+    const handleApplyFilter = useCallback(() => {
+        const dimension = dimensions?.find(
+            (d) => getItemId(d) === filterState.fieldId,
+        );
+        if (!dimension || !filterState.operator) return;
+
+        const filterRule = createFilterRule(
+            dimension,
+            filterState.operator,
+            filterState.values,
+        );
+
+        setActiveFilter(filterRule);
+        onFilterApply(filterRule);
+    }, [dimensions, filterState, onFilterApply]);
+
+    const handleClearFilter = () => {
+        setActiveFilter(undefined);
+        setFilterState(EMPTY_FILTER_STATE);
+        onFilterApply(undefined);
+    };
+
+    const showClearButton = useMemo(() => {
+        return filterState.dimension ? 'visible' : 'hidden';
+    }, [filterState.dimension]);
+
+    const showValuesSection = useMemo(() => {
+        return dimensionMetadata?.requiresValues;
+    }, [dimensionMetadata?.requiresValues]);
+
+    const handleDimensionChange = useCallback(
+        (fieldId: string | null) => {
+            const newDimension = dimensions?.find(
+                (d) => getItemId(d) === fieldId,
+            );
+            if (!newDimension) return;
+            const requiresValues = doesDimensionRequireValues(newDimension);
+
+            const newState = {
+                dimension: newDimension.name,
+                fieldId: getItemId(newDimension),
+                operator: FilterOperator.EQUALS,
+                values: [],
+            };
+
+            setFilterState(newState);
+
+            // Automatically apply filter for dimensions that do not require values
+            if (!requiresValues && newDimension) {
+                const filterRule = createFilterRule(
+                    newDimension,
+                    FilterOperator.EQUALS,
+                    [],
+                );
+                setActiveFilter(filterRule);
+                onFilterApply(filterRule);
+            }
+        },
+        [dimensions, onFilterApply],
+    );
+
+    const handleOperatorChange = useCallback(
+        (operator: FilterOperator | null) => {
+            setFilterState((prev) => ({
+                ...prev,
+                operator,
+                values: showValuesSection ? prev.values : [],
+            }));
+
+            // Automatically apply filter for dimensions that do not require values
+            if (!showValuesSection && operator && selectedDimension) {
+                const filterRule = createFilterRule(
+                    selectedDimension,
+                    operator,
+                    [],
+                );
+                setActiveFilter(filterRule);
+                onFilterApply(filterRule);
+            }
+        },
+        [showValuesSection, selectedDimension, onFilterApply],
+    );
+
+    const handleTagInputChange = useCallback((values: string[]) => {
+        setFilterState((prev) => ({
+            ...prev,
+            values,
+        }));
+    }, []);
+
+    return (
+        <Stack gap="xs">
+            <Group justify="space-between">
+                <Group gap="xs" align="normal">
+                    <Text fw={500} c="ldGray.7">
+                        Filter
+                    </Text>
+                </Group>
+
+                <Group gap="xs">
+                    <Button
+                        variant="subtle"
+                        size="compact-xs"
+                        color="dark"
+                        radius="md"
+                        rightSection={
+                            <MantineIcon
+                                icon={IconX}
+                                color="ldGray.5"
+                                size={12}
+                            />
+                        }
+                        className={styles.clearButton}
+                        style={{
+                            visibility: showClearButton,
+                        }}
+                        styles={{
+                            section: {
+                                marginLeft: 4,
+                            },
+                        }}
+                        onClick={handleClearFilter}
+                    >
+                        Clear
+                    </Button>
+                </Group>
+            </Group>
+
+            <Stack gap={0} className={filterStyles.filterContainer}>
+                <Group gap={0} wrap="nowrap">
+                    <Select
+                        allowDeselect={false}
+                        placeholder="Filter by"
+                        leftSection={<MantineIcon icon={IconFilter} />}
+                        searchable
+                        comboboxProps={{ withinPortal: true }}
+                        radius="md"
+                        size="xs"
+                        data={groupComboboxItems(
+                            dimensions?.map((dimension) => ({
+                                value: getItemId(dimension),
+                                label: dimension.label,
+                                group: dimension.tableLabel,
+                            })) ?? [],
+                        )}
+                        disabled={dimensions?.length === 0}
+                        value={filterState.fieldId}
+                        renderOption={({ option, checked }) => (
+                            <SelectItem
+                                value={option.value}
+                                label={option.label}
+                                selected={checked ?? false}
+                            />
+                        )}
+                        onChange={handleDimensionChange}
+                        data-selected={!!filterState.fieldId}
+                        data-no-values={!showValuesSection ? 'true' : 'false'}
+                        classNames={{
+                            root: filterStyles.filterRoot,
+                            wrapper: filterStyles.filterWrapper,
+                            input: filterStyles.filterInput,
+                            option: filterStyles.baseItem,
+                            dropdown: filterStyles.filterDropdown,
+                            section: filterStyles.rightSection,
+                        }}
+                    />
+
+                    {filterState.fieldId && (
+                        <Select
+                            allowDeselect={false}
+                            placeholder="Condition"
+                            comboboxProps={{ withinPortal: true }}
+                            data={operatorOptions}
+                            value={filterState.operator}
+                            onChange={(value) =>
+                                handleOperatorChange(
+                                    value as FilterOperator | null,
+                                )
+                            }
+                            size="xs"
+                            radius="md"
+                            classNames={{
+                                root: filterStyles.operatorRoot,
+                                wrapper: filterStyles.operatorWrapper,
+                                input: filterStyles.operatorInput,
+                                option: filterStyles.baseItem,
+                                dropdown: filterStyles.operatorDropdown,
+                                section: filterStyles.rightSection,
+                            }}
+                            data-no-values={
+                                !showValuesSection ? 'true' : 'false'
+                            }
+                            data-full-width={
+                                !showValuesSection ? 'true' : 'false'
+                            }
+                        />
+                    )}
+                </Group>
+
+                {showValuesSection && selectedDimension && (
+                    <MetricExploreFilterAutoComplete
+                        dimension={selectedDimension}
+                        values={filterState.values}
+                        onChange={handleTagInputChange}
+                        placeholder={
+                            filterState.operator ? 'Type values...' : undefined
+                        }
+                        disabled={!filterState.operator}
+                    />
+                )}
+            </Stack>
+            {filterState.fieldId && dimensionMetadata?.requiresValues && (
+                <Button
+                    color={colorScheme === 'dark' ? 'ldGray.2' : 'dark'}
+                    size="compact-xs"
+                    disabled={!canApplyFilter}
+                    className={filterStyles.applyButton}
+                    onClick={handleApplyFilter}
+                >
+                    Apply
+                </Button>
+            )}
+        </Stack>
+    );
+};

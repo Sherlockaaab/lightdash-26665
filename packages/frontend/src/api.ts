@@ -1,0 +1,314 @@
+import {
+    JWT_HEADER_NAME,
+    LightdashRequestMethodHeader,
+    LightdashSdkVersionHeader,
+    LightdashVersionHeader,
+    RequestMethod,
+    type AnyType,
+    type ApiError,
+    type ApiResponse,
+} from '@lightdash/common';
+import { spanToTraceHeader, startSpan } from '@sentry/react';
+// No fetch import on purpose: `isomorphic-fetch` captures `window.fetch` at
+// module evaluation, so a host page (SDK embeds) that patches and later
+// restores fetch strands us with a stale reference. The global `fetch`
+// resolves at call time instead.
+import { EMBED_KEY, type InMemoryEmbed } from './ee/providers/Embed/types';
+import { getFromInMemoryStorage } from './utils/inMemoryStorage';
+
+// TODO: import from common or fix the instantiation of the request module
+const LIGHTDASH_SDK_INSTANCE_URL_LOCAL_STORAGE_KEY =
+    '__lightdash_sdk_instance_url';
+const LIGHTDASH_SDK_VERSION_LOCAL_STORAGE_KEY = '__lightdash_sdk_version';
+
+export const BASE_API_URL =
+    import.meta.env.VITEST === 'true'
+        ? `http://test.lightdash/`
+        : import.meta.env.BASE_URL;
+
+const getDefaultHeaders = (): Record<string, string> => {
+    const sdkVersion = getFromInMemoryStorage<string>(
+        LIGHTDASH_SDK_VERSION_LOCAL_STORAGE_KEY,
+    );
+
+    const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        [LightdashRequestMethodHeader]: sdkVersion
+            ? RequestMethod.SDK
+            : RequestMethod.WEB_APP,
+        [LightdashVersionHeader]: __APP_VERSION__,
+    };
+
+    if (sdkVersion) {
+        headers[LightdashSdkVersionHeader] = sdkVersion;
+    }
+
+    return headers;
+};
+
+const isSafeToAddEmbedHeader = (
+    headers: Record<string, string> | undefined,
+) => {
+    if (!headers) return true;
+
+    const isEmbedHeader = (header: string) =>
+        header.toLowerCase() === JWT_HEADER_NAME.toLowerCase();
+    return !Object.keys(headers).some(isEmbedHeader);
+};
+
+const finalizeHeaders = (
+    headers: Record<string, string> | undefined,
+    embed: InMemoryEmbed | undefined,
+    sentryTrace: string | undefined,
+): Record<string, string> => {
+    const requestHeaders: Record<string, string> = {
+        ...getDefaultHeaders(),
+        ...headers,
+    };
+
+    if (embed?.token && isSafeToAddEmbedHeader(headers)) {
+        requestHeaders[JWT_HEADER_NAME] = embed.token;
+    }
+
+    if (sentryTrace) {
+        const traceparent = sentryTraceToTraceparent(sentryTrace);
+        requestHeaders['sentry-trace'] = sentryTrace;
+        if (traceparent) {
+            requestHeaders.traceparent = traceparent;
+        }
+    }
+
+    return requestHeaders;
+};
+
+const sentryTraceToTraceparent = (sentryTrace: string): string | undefined => {
+    const [traceId, parentId, sampled] = sentryTrace.split('-');
+    if (!traceId?.match(/^[a-f0-9]{32}$/) || !parentId?.match(/^[a-f0-9]{16}$/))
+        return undefined;
+
+    return `00-${traceId}-${parentId}-${sampled === '0' ? '00' : '01'}`;
+};
+
+function finalizeUrl(url: string, embed: InMemoryEmbed | undefined): string {
+    if (embed?.projectUuid) {
+        const parsedUrl = new URL(url, window.location.origin);
+
+        if (!parsedUrl.searchParams.has('projectUuid')) {
+            parsedUrl.searchParams.set('projectUuid', embed.projectUuid);
+            return parsedUrl.toString();
+        }
+    }
+
+    return url;
+}
+
+const handleError = (err: any): ApiError => {
+    if (err.error?.statusCode && err.error?.name) {
+        if (
+            err.error?.name === 'DeactivatedAccountError' &&
+            window.location.pathname !== '/login'
+        ) {
+            // redirect to login page when account is deactivated
+            window.location.href = '/login';
+        }
+        return err;
+    }
+    // Surface the real transport error (abort, CORS, DNS, connection reset)
+    // instead of silently masking it as the generic message below.
+    console.error('Failed to reach the Lightdash server:', err);
+    return {
+        status: 'error',
+        error: {
+            name: 'NetworkError',
+            statusCode: 500,
+            message:
+                'We are currently unable to reach the Lightdash server. Please try again in a few moments.',
+            data: err,
+        },
+    };
+};
+
+type LightdashApiPropsBase = {
+    url: string;
+    headers?: Record<string, string> | undefined;
+    version?: 'v1' | 'v2';
+    signal?: AbortSignal;
+    sensitive?: boolean;
+};
+
+type LightdashApiPropsGetOrDelete = LightdashApiPropsBase & {
+    method: 'GET' | 'DELETE';
+    body?: BodyInit | null | undefined;
+};
+
+type LightdashApiPropsWrite = LightdashApiPropsBase & {
+    method: 'POST' | 'PATCH' | 'PUT';
+    body: BodyInit | null | undefined;
+};
+
+type LightdashApiProps = LightdashApiPropsGetOrDelete | LightdashApiPropsWrite;
+
+const MAX_NETWORK_HISTORY = 10;
+const SENSITIVE_DATA_REDACTED = '[REDACTED: sensitive request]';
+export let networkHistory: AnyType[] = [];
+
+export const lightdashApi = async <T extends ApiResponse['results']>({
+    method,
+    url,
+    body,
+    headers,
+    version = 'v1',
+    signal,
+    sensitive = false,
+}: LightdashApiProps): Promise<T> => {
+    const baseUrl = sessionStorage.getItem(
+        LIGHTDASH_SDK_INSTANCE_URL_LOCAL_STORAGE_KEY,
+    );
+    const apiPrefix = `${baseUrl ?? BASE_API_URL}api/${version}`;
+
+    let sentryTrace: string | undefined;
+    // Manually create a span for the fetch request to be able to trace it in Sentry. This also enables Distributed Tracing.
+    startSpan(
+        {
+            op: 'http.client',
+            name: `API Request: ${method} ${url}`,
+            attributes: {
+                'http.method': method,
+                'http.url': url,
+                type: 'fetch',
+                url,
+                method,
+            },
+        },
+        (s) => {
+            sentryTrace = spanToTraceHeader(s);
+        },
+    );
+
+    const embed = getFromInMemoryStorage<InMemoryEmbed>(EMBED_KEY);
+    return fetch(finalizeUrl(`${apiPrefix}${url}`, embed), {
+        method,
+        headers: finalizeHeaders(headers, embed, sentryTrace),
+        body,
+        signal,
+    })
+        .then((r) => {
+            if (!r.ok) {
+                return r.json().then((d) => {
+                    throw d;
+                });
+            }
+            return r;
+        })
+        .then(async (r) => {
+            const js = await r.json();
+            networkHistory.push(
+                sensitive
+                    ? {
+                          method,
+                          url,
+                          body: SENSITIVE_DATA_REDACTED,
+                          status: r.status,
+                          json: SENSITIVE_DATA_REDACTED,
+                      }
+                    : {
+                          method,
+                          url,
+                          body,
+                          status: r.status,
+                          json: JSON.stringify(js).substring(0, 500),
+                      },
+            );
+            return js;
+        })
+        .then((d: ApiResponse | ApiError) => {
+            switch (d.status) {
+                case 'ok':
+                    // make sure we return null instead of undefined
+                    // otherwise react-query will crash
+                    return (d.results ?? null) as T;
+                case 'error':
+                    throw d;
+                default:
+                    throw d;
+            }
+        })
+        .catch((err) => {
+            networkHistory.push(
+                sensitive
+                    ? {
+                          method,
+                          status: err.status,
+                          url,
+                          body: SENSITIVE_DATA_REDACTED,
+                          error: SENSITIVE_DATA_REDACTED,
+                      }
+                    : {
+                          method,
+                          status: err.status,
+                          url,
+                          body,
+                          error: JSON.stringify(err).substring(0, 500),
+                      },
+            );
+            // only store last MAX_NETWORK_HISTORY requests
+            if (networkHistory.length > MAX_NETWORK_HISTORY)
+                networkHistory.shift();
+            throw handleError(err);
+        });
+};
+
+export const lightdashApiStream = ({
+    method,
+    url,
+    body,
+    headers,
+    version = 'v1',
+    signal,
+}: LightdashApiProps) => {
+    const baseUrl = sessionStorage.getItem(
+        LIGHTDASH_SDK_INSTANCE_URL_LOCAL_STORAGE_KEY,
+    );
+    const apiPrefix = `${baseUrl ?? BASE_API_URL}api/${version}`;
+
+    let sentryTrace: string | undefined;
+    // Manually create a span for the fetch request to be able to trace it in Sentry. This also enables Distributed Tracing.
+    startSpan(
+        {
+            op: 'http.client',
+            name: `API Streaming Request: ${method} ${url}`,
+            attributes: {
+                'http.method': method,
+                'http.url': url,
+                type: 'fetch',
+                url,
+                method,
+            },
+        },
+        (s) => {
+            sentryTrace = spanToTraceHeader(s);
+        },
+    );
+
+    const embed = getFromInMemoryStorage<InMemoryEmbed>(EMBED_KEY);
+    return fetch(finalizeUrl(`${apiPrefix}${url}`, embed), {
+        method,
+        headers: finalizeHeaders(headers, embed, sentryTrace),
+        body,
+        signal,
+    }).then(async (r) => {
+        if (!r.ok) {
+            let error: unknown;
+            try {
+                error = await r.json();
+            } catch {
+                throw new Error(
+                    'We are currently unable to reach the Lightdash server. Please try again in a few moments.',
+                );
+            }
+
+            throw new Error(handleError(error).error.message);
+        }
+        return r;
+    });
+};

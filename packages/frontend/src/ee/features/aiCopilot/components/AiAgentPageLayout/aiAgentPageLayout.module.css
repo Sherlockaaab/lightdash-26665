@@ -1,0 +1,168 @@
+.panelGroup {
+    @mixin light {
+        background-color: var(--mantine-color-white);
+    }
+    @mixin dark {
+        background-color: var(--mantine-color-dark-8);
+    }
+}
+
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    overflow: hidden;
+
+    padding: var(--mantine-spacing-sm);
+    @mixin light {
+        background: var(--mantine-color-ldGray-0);
+    }
+    @mixin dark {
+        background: var(--mantine-color-ldDark-2);
+    }
+    &[data-panel-size='0.0'] {
+        min-width: 3rem;
+    }
+
+    &[data-collapsed='true'] {
+        align-items: center;
+        padding: var(--mantine-spacing-sm) rem(6px);
+    }
+}
+
+.sidebarTransition {
+    transition: all 300ms ease-in-out;
+}
+
+.sidebarHeader {
+    min-height: rem(32px);
+    margin-bottom: var(--mantine-spacing-xs);
+}
+
+.sidebarTitle {
+    letter-spacing: 0;
+}
+
+.chat {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.chatHeader {
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    min-height: rem(52px);
+    padding: rem(6px) var(--mantine-spacing-md);
+    border-bottom: 1px solid var(--mantine-color-ldGray-2);
+
+    @mixin light {
+        background-color: var(--mantine-color-white);
+    }
+
+    @mixin dark {
+        background-color: var(--mantine-color-dark-8);
+    }
+}
+
+.chatContent {
+    flex: 1;
+    overflow-y: auto;
+    background-color: light-dark(
+        var(--mantine-color-white),
+        var(--mantine-color-dark-8)
+    );
+}
+
+.deepResearchBar {
+    display: flex;
+    flex-shrink: 0;
+    justify-content: flex-end;
+    padding: var(--mantine-spacing-xs) var(--mantine-spacing-md) 0;
+}
+
+.deepResearchBar:empty {
+    display: none;
+}
+
+.resizeHandle {
+    width: 1px;
+    background-color: var(--mantine-color-ldGray-2);
+    cursor: col-resize;
+    transition: background-color 150ms ease;
+    position: relative;
+
+    &[data-resize-handle-state='hover'],
+    &[data-resize-handle-state='drag'] {
+        background-color: var(--mantine-color-ldGray-3);
+    }
+}
+
+.artifactResizeHandle {
+    flex: 0 0 0;
+    width: 0;
+    min-width: 0;
+    background-color: transparent;
+    position: relative;
+    z-index: 2;
+
+    &[data-resize-handle-state='hover'],
+    &[data-resize-handle-state='drag'] {
+        background-color: transparent;
+        box-shadow: none;
+    }
+}
+
+.artifact {
+    box-shadow: var(--mantine-shadow-lg);
+}
+
+.workspace {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    height: calc(100vh - var(--navbar-height));
+
+    @mixin light {
+        background-color: var(--mantine-color-white);
+    }
+
+    @mixin dark {
+        background-color: var(--mantine-color-dark-8);
+    }
+}
+
+/* Embed pages render without the app navbar */
+.workspaceEmbed {
+    height: 100vh;
+}
+
+.floatingArtifactRegion {
+    padding: var(--mantine-spacing-sm) var(--mantine-spacing-sm)
+        var(--mantine-spacing-sm) 0;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+
+    @mixin light {
+        background-color: var(--mantine-color-white);
+    }
+
+    @mixin dark {
+        background-color: var(--mantine-color-dark-8);
+    }
+}
+
+.floatingArtifactWrap {
+    flex: 1;
+    min-height: 0;
+    background: light-dark(
+        var(--mantine-color-white),
+        var(--mantine-color-dark-8)
+    );
+    border-radius: 12px;
+    overflow: hidden;
+}

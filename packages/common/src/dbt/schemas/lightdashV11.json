@@ -1,0 +1,94 @@
+{
+    "definitions": {
+        "LightdashNodeConfig": {
+            "allOf": [
+                {
+                    "$ref": "https://schemas.getdbt.com/dbt/manifest/v11.json#/$defs/NodeConfig"
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "meta": {
+                            "oneOf": [
+                                {
+                                    "$ref": "https://schemas.lightdash.com/lightdash/metadata.json#/definitions/LightdashModelMetadata"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "LightdashColumnInfo": {
+            "allOf": [
+                {
+                    "$ref": "https://schemas.getdbt.com/dbt/manifest/v11.json#/$defs/ColumnInfo"
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "meta": {
+                            "oneOf": [
+                                {
+                                    "$ref": "https://schemas.lightdash.com/lightdash/metadata.json#/definitions/LightdashColumnMetadata"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "LightdashCompiledModelNode": {
+            "allOf": [
+                {
+                    "$ref": "https://schemas.getdbt.com/dbt/manifest/v11.json#/$defs/ModelNode"
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "allOf": [
+                                {
+                                    "not": { "enum": ["lightdash", "ld", ""] }
+                                },
+                                {
+                                    "pattern": "^[^.]*$"
+                                }
+                            ]
+                        },
+
+                        "meta": {
+                            "oneOf": [
+                                {
+                                    "$ref": "https://schemas.lightdash.com/lightdash/metadata.json#/definitions/LightdashModelMetadata"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
+                        },
+                        "config": {
+                            "$ref": "#/definitions/LightdashNodeConfig"
+                        },
+                        "columns": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "$ref": "#/definitions/LightdashColumnInfo"
+                            },
+                            "default": {}
+                        }
+                    }
+                }
+            ]
+        }
+    },
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://schemas.lightdash.com/lightdash/v11.json"
+}

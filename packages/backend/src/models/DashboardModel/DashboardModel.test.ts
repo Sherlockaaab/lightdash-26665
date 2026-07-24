@@ -1,0 +1,944 @@
+import {
+    AnyType,
+    CreateDashboardMarkdownTile,
+    DashboardTileTypes,
+    deepEqual,
+    NotFoundError,
+} from '@lightdash/common';
+import knex from 'knex';
+import { getTracker, MockClient, RawQuery, Tracker } from 'knex-mock-client';
+import { FunctionQueryMatcher } from 'knex-mock-client/types/mock-client';
+import {
+    DashboardsTableName,
+    DashboardTabsTableName,
+    DashboardTileChartTableName,
+    DashboardTileLoomsTableName,
+    DashboardTileMarkdownsTableName,
+    DashboardTilesTableName,
+    DashboardVersionsTableName,
+    DashboardViewsTableName,
+} from '../../database/entities/dashboards';
+import { SavedChartsTableName } from '../../database/entities/savedCharts';
+import { SpaceTableName } from '../../database/entities/spaces';
+import { projectUuid } from '../ProjectModel/ProjectModel.mock';
+import { DashboardModel } from './DashboardModel';
+import {
+    addDashboardVersion,
+    addDashboardVersionWithAllTiles,
+    addDashboardVersionWithoutChart,
+    addDashboardVersionWithTileIds,
+    createDashboard,
+    dashboardEntry,
+    dashboardTileEntry,
+    dashboardTileWithSavedChartEntry,
+    dashboardVersionEntry,
+    dashboardViewEntry,
+    dashboardWithVersionEntry,
+    expectedAllDashboards,
+    expectedDashboard,
+    loomTileEntry,
+    markdownTileEntry,
+    savedChartEntry,
+    spaceEntry,
+    updateDashboard,
+    user,
+} from './DashboardModel.mock';
+
+function queryMatcher(
+    tableName: string,
+    params: AnyType[] = [],
+): FunctionQueryMatcher {
+    return ({ sql, bindings }: RawQuery) =>
+        sql.includes(tableName) &&
+        params.length === bindings.length &&
+        params.reduce(
+            (valid, arg, index) => valid && deepEqual(bindings[index], arg),
+            true,
+        );
+}
+
+describe('DashboardModel', () => {
+    const model = new DashboardModel({
+        database: knex({ client: MockClient, dialect: 'pg' }),
+    });
+
+    let tracker: Tracker;
+    beforeAll(() => {
+        tracker = getTracker();
+    });
+    afterEach(() => {
+        tracker.reset();
+    });
+
+    test('should get dashboard by uuid', async () => {
+        tracker.on
+            .select(
+                queryMatcher(DashboardsTableName, [expectedDashboard.uuid, 1]),
+            )
+            .response([
+                {
+                    ...dashboardWithVersionEntry,
+                    space_uuid: 'spaceUuid',
+                    space_name: 'space name',
+                },
+            ]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardViewsTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                ]),
+            )
+            .response([dashboardViewEntry]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardTilesTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                ]),
+            )
+            .response([
+                dashboardTileWithSavedChartEntry,
+                loomTileEntry,
+                markdownTileEntry,
+            ]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardTabsTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                    dashboardWithVersionEntry.dashboard_id,
+                ]),
+            )
+            .response([]);
+
+        const dashboard = await model.getByIdOrSlug(expectedDashboard.uuid);
+
+        expect(dashboard).toEqual(expectedDashboard);
+        expect(tracker.history.select).toHaveLength(4);
+    });
+
+    test('should order dashboard tiles by y_offset then x_offset when fetching dashboard', async () => {
+        // Create tiles with specific coordinates to test ordering
+        const tile1 = {
+            ...dashboardTileWithSavedChartEntry,
+            y_offset: 1,
+            x_offset: 1,
+            dashboard_tile_uuid: 'uuid-c',
+        };
+        const tile2 = {
+            ...loomTileEntry,
+            y_offset: 1,
+            x_offset: 2,
+            dashboard_tile_uuid: 'uuid-b',
+        };
+        const tile3 = {
+            ...markdownTileEntry,
+            y_offset: 2,
+            x_offset: 1,
+            dashboard_tile_uuid: 'uuid-a',
+        };
+
+        tracker.on
+            .select(
+                queryMatcher(DashboardsTableName, [expectedDashboard.uuid, 1]),
+            )
+            .response([
+                {
+                    ...dashboardWithVersionEntry,
+                    space_uuid: 'spaceUuid',
+                    space_name: 'space name',
+                },
+            ]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardViewsTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                ]),
+            )
+            .response([dashboardViewEntry]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardTilesTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                ]),
+            )
+            .response([tile1, tile2, tile3]); // Provide in expected sorted order: y=1,x=1 → y=1,x=2 → y=2,x=1
+        tracker.on
+            .select(
+                queryMatcher(DashboardTabsTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                    dashboardWithVersionEntry.dashboard_id,
+                ]),
+            )
+            .response([]);
+
+        // Fetch the dashboard
+        const dashboard = await model.getByIdOrSlug(expectedDashboard.uuid);
+
+        // Assert that tiles are returned in the expected order
+        // First by y_offset (ascending), then x_offset (ascending)
+        expect(dashboard.tiles.length).toBe(3);
+        expect(dashboard.tiles[0].uuid).toBe(tile1.dashboard_tile_uuid); // y=1, x=1
+        expect(dashboard.tiles[1].uuid).toBe(tile2.dashboard_tile_uuid); // y=1, x=2
+        expect(dashboard.tiles[2].uuid).toBe(tile3.dashboard_tile_uuid); // y=2, x=1
+    });
+
+    test("should error if dashboard isn't found", async () => {
+        tracker.on
+            .select(
+                queryMatcher(DashboardsTableName, [expectedDashboard.uuid, 1]),
+            )
+            .response([]);
+
+        await expect(
+            model.getByIdOrSlug(expectedDashboard.uuid),
+        ).rejects.toThrowError(NotFoundError);
+    });
+
+    test('should get all by project uuid', async () => {
+        tracker.on
+            .select(queryMatcher(DashboardsTableName, [projectUuid]))
+            .response([
+                {
+                    ...dashboardWithVersionEntry,
+                    space_uuid: 'spaceUuid',
+                    validation_errors: [],
+                },
+            ]);
+
+        tracker.on.select(queryMatcher(DashboardTilesTableName, [0])).response([
+            {
+                type: DashboardTileTypes.SAVED_CHART,
+            },
+        ]);
+
+        const dashboard = await model.getAllByProject(projectUuid);
+
+        expect(dashboard).toEqual(expectedAllDashboards);
+        expect(tracker.history.select).toHaveLength(2);
+    });
+
+    test('should check if saved chart exists in dashboard', async () => {
+        const testProjectUuid = 'test-project-uuid';
+        const testDashboardUuid = 'test-dashboard-uuid';
+        const testChartUuid = 'test-chart-uuid';
+
+        // Mock any select query that contains these parameters
+        tracker.on
+            .select(
+                ({ sql, bindings }: RawQuery) =>
+                    sql.includes('latest_dashboard_version_cte') &&
+                    bindings.includes(testDashboardUuid) &&
+                    bindings.includes(testProjectUuid) &&
+                    bindings.includes(testChartUuid),
+            )
+            .response([
+                {
+                    dashboard_uuid: testDashboardUuid,
+                },
+            ]);
+
+        const result = await model.savedChartExistsInDashboard(
+            testProjectUuid,
+            testDashboardUuid,
+            testChartUuid,
+        );
+
+        expect(result).toBe(true);
+        expect(tracker.history.select).toHaveLength(1);
+    });
+
+    test('should return false when saved chart does not exist in dashboard', async () => {
+        const testProjectUuid = 'test-project-uuid';
+        const testDashboardUuid = 'test-dashboard-uuid';
+        const testChartUuid = 'test-chart-uuid';
+
+        // Mock any select query that contains these parameters with empty response
+        tracker.on
+            .select(
+                ({ sql, bindings }: RawQuery) =>
+                    sql.includes('latest_dashboard_version_cte') &&
+                    bindings.includes(testDashboardUuid) &&
+                    bindings.includes(testProjectUuid) &&
+                    bindings.includes(testChartUuid),
+            )
+            .response([]);
+
+        const result = await model.savedChartExistsInDashboard(
+            testProjectUuid,
+            testDashboardUuid,
+            testChartUuid,
+        );
+
+        expect(result).toBe(false);
+        expect(tracker.history.select).toHaveLength(1);
+    });
+
+    test('should create dashboard with tile ids', async () => {
+        tracker.on.select(SpaceTableName).responseOnce([spaceEntry]);
+        tracker.on.insert(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on
+            .insert(DashboardVersionsTableName)
+            .responseOnce([dashboardVersionEntry]);
+        tracker.on
+            .insert(DashboardViewsTableName)
+            .responseOnce([dashboardViewEntry]);
+        tracker.on
+            .insert(DashboardTilesTableName)
+            .responseOnce([dashboardTileEntry]);
+        tracker.on.select(SavedChartsTableName).responseOnce([savedChartEntry]);
+        tracker.on.insert(DashboardTileChartTableName).responseOnce([]);
+        tracker.on.update(DashboardViewsTableName).responseOnce([]);
+        tracker.on.select(DashboardsTableName).responseOnce('slug');
+
+        vi.spyOn(model, 'getByIdOrSlug').mockImplementationOnce(() =>
+            Promise.resolve(expectedDashboard),
+        );
+        vi.spyOn(DashboardModel, 'generateUniqueSlug').mockResolvedValue(
+            createDashboard.slug,
+        );
+
+        await model.create('spaceUuid', createDashboard, user, projectUuid);
+
+        expect(tracker.history.select).toHaveLength(2);
+        expect(tracker.history.select[0].bindings).toEqual(
+            expect.arrayContaining(['spaceUuid', projectUuid]),
+        );
+        expect(tracker.history.insert).toHaveLength(5);
+        expect(tracker.history.insert[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardsTableName),
+            bindings: expect.arrayContaining([
+                createDashboard.description,
+                createDashboard.name,
+                createDashboard.slug,
+                projectUuid,
+                spaceEntry.space_id,
+            ]),
+        });
+        expect(tracker.history.insert[0].sql).toContain('"project_uuid"');
+        expect(tracker.history.insert[1]).toMatchObject({
+            sql: expect.stringContaining(DashboardVersionsTableName),
+            bindings: expect.arrayContaining([
+                dashboardEntry.dashboard_id,
+                user.userUuid,
+            ]),
+        });
+        expect(tracker.history.insert[2]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                JSON.stringify(createDashboard.filters),
+                'Default',
+            ]),
+        });
+        expect(tracker.history.insert[3]).toMatchObject({
+            sql: expect.stringContaining(DashboardTilesTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                createDashboard.tiles[0].h,
+                createDashboard.tiles[0].type,
+                createDashboard.tiles[0].w,
+                createDashboard.tiles[0].x,
+                createDashboard.tiles[0].y,
+            ]),
+        });
+        expect(tracker.history.insert[4]).toMatchObject({
+            sql: expect.stringContaining(DashboardTileChartTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                savedChartEntry.saved_query_id,
+            ]),
+        });
+        expect(tracker.history.update).toHaveLength(1);
+        expect(tracker.history.update[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                addDashboardVersionWithoutChart.filters,
+                dashboardVersionEntry.dashboard_version_id,
+            ]),
+        });
+    });
+
+    test('should update dashboard', async () => {
+        const dashboardUuid = 'dashboard uuid';
+        const getByIdOrSlugSpy = vi
+            .spyOn(model, 'getByIdOrSlug')
+            .mockResolvedValue({
+                ...expectedDashboard,
+                uuid: dashboardUuid,
+                projectUuid,
+            });
+        tracker.on.update(DashboardsTableName).response([]);
+
+        await model.update(dashboardUuid, updateDashboard);
+
+        expect(tracker.history.update).toHaveLength(1);
+        expect(tracker.history.update[0].sql).toContain('"project_uuid"');
+        expect(tracker.history.update[0].bindings).toContain(projectUuid);
+        getByIdOrSlugSpy.mockRestore();
+    });
+
+    test('rejects moving a dashboard to a space in another project', async () => {
+        const dashboardUuid = '11111111-1111-4111-8111-111111111111';
+        const targetSpaceUuid = '33333333-3333-4333-8333-333333333333';
+        const getByIdOrSlugSpy = vi
+            .spyOn(model, 'getByIdOrSlug')
+            .mockResolvedValueOnce({
+                ...expectedDashboard,
+                uuid: dashboardUuid,
+                projectUuid,
+            });
+        tracker.on.select(SpaceTableName).responseOnce([]);
+
+        await expect(
+            model.update(dashboardUuid, {
+                ...updateDashboard,
+                spaceUuid: targetSpaceUuid,
+            }),
+        ).rejects.toThrow('Space not found');
+
+        expect(tracker.history.select[0].bindings).toEqual(
+            expect.arrayContaining([targetSpaceUuid, projectUuid]),
+        );
+        expect(tracker.history.update).toHaveLength(0);
+        getByIdOrSlugSpy.mockRestore();
+    });
+
+    test('updates multiple dashboards within the requested project', async () => {
+        const dashboardUuid = '11111111-1111-4111-8111-111111111111';
+        const targetSpaceUuid = '33333333-3333-4333-8333-333333333333';
+        const targetSpaceId = 7;
+        const getByIdOrSlugSpy = vi
+            .spyOn(model, 'getByIdOrSlug')
+            .mockResolvedValueOnce({
+                ...expectedDashboard,
+                uuid: dashboardUuid,
+                projectUuid,
+            });
+        tracker.on
+            .select(SpaceTableName)
+            .responseOnce([{ space_id: targetSpaceId }]);
+        tracker.on.update(DashboardsTableName).responseOnce(1);
+
+        await model.updateMultiple(projectUuid, [
+            {
+                uuid: dashboardUuid,
+                name: updateDashboard.name,
+                description: updateDashboard.description,
+                spaceUuid: targetSpaceUuid,
+            },
+        ]);
+
+        expect(tracker.history.select[0].bindings).toEqual(
+            expect.arrayContaining([targetSpaceUuid, projectUuid]),
+        );
+        expect(tracker.history.update[0].sql).toContain('"project_uuid"');
+        expect(tracker.history.update[0].bindings).toEqual(
+            expect.arrayContaining([dashboardUuid, projectUuid, targetSpaceId]),
+        );
+        getByIdOrSlugSpy.mockRestore();
+    });
+
+    test('moves a dashboard within the requested project and writes ownership', async () => {
+        const dashboardUuid = '11111111-1111-4111-8111-111111111111';
+        const targetSpaceUuid = '33333333-3333-4333-8333-333333333333';
+        tracker.on.select(SpaceTableName).responseOnce([{ space_id: 7 }]);
+        tracker.on.update(DashboardsTableName).responseOnce(1);
+
+        await model.moveToSpace({
+            projectUuid,
+            itemUuid: dashboardUuid,
+            targetSpaceUuid,
+        });
+
+        expect(tracker.history.update[0].sql).toContain('"project_uuid"');
+        expect(tracker.history.update[0].bindings).toEqual(
+            expect.arrayContaining([dashboardUuid, projectUuid, 7]),
+        );
+    });
+
+    test('should delete dashboard', async () => {
+        const dashboardUuid = 'dashboard uuid';
+        tracker.on
+            .select(queryMatcher(DashboardsTableName, [dashboardUuid, 1]))
+            .response([dashboardWithVersionEntry]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardViewsTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                ]),
+            )
+            .response([dashboardViewEntry]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardTilesTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                ]),
+            )
+            .response([
+                dashboardTileWithSavedChartEntry,
+                loomTileEntry,
+                markdownTileEntry,
+            ]);
+        tracker.on
+            .select(
+                queryMatcher(DashboardTabsTableName, [
+                    dashboardWithVersionEntry.dashboard_version_id,
+                    dashboardWithVersionEntry.dashboard_id,
+                ]),
+            )
+            .response([]);
+        tracker.on
+            .delete(queryMatcher(DashboardsTableName, [dashboardUuid]))
+            .response([]);
+
+        await model.permanentDelete(dashboardUuid);
+        expect(tracker.history.delete).toHaveLength(1);
+    });
+
+    test("should error on create dashboard version if dashboard isn't found", async () => {
+        tracker.on
+            .select(
+                queryMatcher(DashboardsTableName, [expectedDashboard.uuid, 1]),
+            )
+            .response([]);
+
+        await expect(
+            model.addVersion(
+                expectedDashboard.uuid,
+                addDashboardVersion,
+                user,
+                projectUuid,
+            ),
+        ).rejects.toThrowError(NotFoundError);
+    });
+
+    test('should create dashboard version with all tile types', async () => {
+        tracker.on.select(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on.select(SpaceTableName).responseOnce([spaceEntry]);
+        tracker.on.insert(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on
+            .insert(DashboardVersionsTableName)
+            .responseOnce([dashboardVersionEntry]);
+        tracker.on
+            .insert(DashboardViewsTableName)
+            .responseOnce([dashboardViewEntry]);
+        tracker.on
+            .insert(DashboardTilesTableName)
+            .responseOnce([
+                dashboardTileEntry,
+                loomTileEntry,
+                markdownTileEntry,
+            ]);
+        tracker.on.select(SavedChartsTableName).responseOnce([savedChartEntry]);
+        tracker.on.insert(DashboardTileChartTableName).responseOnce([]);
+        tracker.on.insert(DashboardTileLoomsTableName).responseOnce([]);
+        tracker.on.insert(DashboardTileMarkdownsTableName).responseOnce([]);
+        tracker.on.update(DashboardViewsTableName).responseOnce([]);
+
+        vi.spyOn(model, 'getByIdOrSlug').mockImplementationOnce(() =>
+            Promise.resolve(expectedDashboard),
+        );
+
+        await model.addVersion(
+            expectedDashboard.uuid,
+            addDashboardVersionWithAllTiles,
+            user,
+            projectUuid,
+        );
+
+        expect(tracker.history.select).toHaveLength(2);
+        expect(tracker.history.insert).toHaveLength(6);
+        expect(tracker.history.insert[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardVersionsTableName),
+            bindings: expect.arrayContaining([
+                dashboardEntry.dashboard_id,
+                user.userUuid,
+            ]),
+        });
+        expect(tracker.history.insert[1]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                JSON.stringify(addDashboardVersionWithAllTiles.filters),
+                'Default',
+            ]),
+        });
+        expect(tracker.history.insert[2]).toMatchObject({
+            sql: expect.stringContaining(DashboardTilesTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                addDashboardVersionWithAllTiles.tiles[0].h,
+                addDashboardVersionWithAllTiles.tiles[0].type,
+                addDashboardVersionWithAllTiles.tiles[0].w,
+                addDashboardVersionWithAllTiles.tiles[0].x,
+                addDashboardVersionWithAllTiles.tiles[0].y,
+                addDashboardVersionWithAllTiles.tiles[1].h,
+                addDashboardVersionWithAllTiles.tiles[1].type,
+                addDashboardVersionWithAllTiles.tiles[1].w,
+                addDashboardVersionWithAllTiles.tiles[1].x,
+                addDashboardVersionWithAllTiles.tiles[1].y,
+                addDashboardVersionWithAllTiles.tiles[2].h,
+                addDashboardVersionWithAllTiles.tiles[2].type,
+                addDashboardVersionWithAllTiles.tiles[2].w,
+                addDashboardVersionWithAllTiles.tiles[2].x,
+                addDashboardVersionWithAllTiles.tiles[2].y,
+            ]),
+        });
+        expect(tracker.history.insert[3]).toMatchObject({
+            sql: expect.stringContaining(DashboardTileChartTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                savedChartEntry.saved_query_id,
+            ]),
+        });
+        expect(tracker.history.insert[4]).toMatchObject({
+            sql: expect.stringContaining(DashboardTileLoomsTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                savedChartEntry.saved_query_id,
+            ]),
+        });
+        expect(tracker.history.insert[5]).toMatchObject({
+            sql: expect.stringContaining(DashboardTileMarkdownsTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                (
+                    addDashboardVersionWithAllTiles
+                        .tiles[2] as CreateDashboardMarkdownTile
+                ).properties.content,
+                dashboardVersionEntry.dashboard_version_id,
+                (
+                    addDashboardVersionWithAllTiles
+                        .tiles[2] as CreateDashboardMarkdownTile
+                ).properties.title,
+            ]),
+        });
+        expect(tracker.history.update).toHaveLength(1);
+        expect(tracker.history.update[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                addDashboardVersionWithAllTiles.filters,
+                dashboardVersionEntry.dashboard_version_id,
+            ]),
+        });
+    });
+    test('should create dashboard version with ids', async () => {
+        tracker.on.select(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on.select(SpaceTableName).responseOnce([spaceEntry]);
+        tracker.on.insert(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on
+            .insert(DashboardVersionsTableName)
+            .responseOnce([dashboardVersionEntry]);
+        tracker.on
+            .insert(DashboardViewsTableName)
+            .responseOnce([dashboardViewEntry]);
+        tracker.on
+            .insert(DashboardTilesTableName)
+            .responseOnce([
+                dashboardTileEntry,
+                loomTileEntry,
+                markdownTileEntry,
+            ]);
+        tracker.on.select(SavedChartsTableName).responseOnce([savedChartEntry]);
+        tracker.on.insert(DashboardTileChartTableName).responseOnce([]);
+        tracker.on.update(DashboardViewsTableName).responseOnce([]);
+
+        vi.spyOn(model, 'getByIdOrSlug').mockImplementationOnce(() =>
+            Promise.resolve(expectedDashboard),
+        );
+
+        await model.addVersion(
+            expectedDashboard.uuid,
+            addDashboardVersionWithTileIds,
+            user,
+            projectUuid,
+        );
+
+        expect(tracker.history.select).toHaveLength(2);
+        expect(tracker.history.insert).toHaveLength(4);
+        expect(tracker.history.insert[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardVersionsTableName),
+            bindings: expect.arrayContaining([
+                dashboardEntry.dashboard_id,
+                user.userUuid,
+            ]),
+        });
+        expect(tracker.history.insert[1]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                JSON.stringify(addDashboardVersionWithTileIds.filters),
+                'Default',
+            ]),
+        });
+        expect(tracker.history.insert[2]).toMatchObject({
+            sql: expect.stringContaining(DashboardTilesTableName),
+            bindings: expect.arrayContaining([
+                addDashboardVersionWithTileIds.tiles[0].uuid,
+                dashboardVersionEntry.dashboard_version_id,
+                addDashboardVersionWithTileIds.tiles[0].h,
+                addDashboardVersionWithTileIds.tiles[0].type,
+                addDashboardVersionWithTileIds.tiles[0].w,
+                addDashboardVersionWithTileIds.tiles[0].x,
+                addDashboardVersionWithTileIds.tiles[0].y,
+            ]),
+        });
+        expect(tracker.history.insert[3]).toMatchObject({
+            sql: expect.stringContaining(DashboardTileChartTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                savedChartEntry.saved_query_id,
+            ]),
+        });
+        expect(tracker.history.update[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                addDashboardVersionWithTileIds.filters,
+                dashboardVersionEntry.dashboard_version_id,
+            ]),
+        });
+    });
+
+    test('should create dashboard version without a chart', async () => {
+        tracker.on.select(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on.select(SpaceTableName).responseOnce([spaceEntry]);
+        tracker.on.insert(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on
+            .insert(DashboardVersionsTableName)
+            .responseOnce([dashboardVersionEntry]);
+        tracker.on
+            .insert(DashboardViewsTableName)
+            .responseOnce([dashboardViewEntry]);
+        tracker.on
+            .insert(DashboardTilesTableName)
+            .responseOnce([
+                dashboardTileEntry,
+                loomTileEntry,
+                markdownTileEntry,
+            ]);
+        tracker.on.select(SavedChartsTableName).responseOnce([savedChartEntry]);
+        tracker.on.insert(DashboardTileChartTableName).responseOnce([]);
+        tracker.on.update(DashboardViewsTableName).responseOnce([]);
+
+        vi.spyOn(model, 'getByIdOrSlug').mockImplementationOnce(() =>
+            Promise.resolve(expectedDashboard),
+        );
+
+        await model.addVersion(
+            expectedDashboard.uuid,
+            addDashboardVersionWithoutChart,
+            user,
+            projectUuid,
+        );
+
+        expect(tracker.history.select).toHaveLength(2);
+        expect(tracker.history.insert).toHaveLength(4);
+        expect(tracker.history.insert[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardVersionsTableName),
+            bindings: expect.arrayContaining([
+                dashboardEntry.dashboard_id,
+                user.userUuid,
+            ]),
+        });
+        expect(tracker.history.insert[1]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                JSON.stringify(addDashboardVersionWithoutChart.filters),
+                'Default',
+            ]),
+        });
+        expect(tracker.history.insert[2]).toMatchObject({
+            sql: expect.stringContaining(DashboardTilesTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                addDashboardVersionWithoutChart.tiles[0].h,
+                addDashboardVersionWithoutChart.tiles[0].type,
+                addDashboardVersionWithoutChart.tiles[0].w,
+                addDashboardVersionWithoutChart.tiles[0].x,
+                addDashboardVersionWithoutChart.tiles[0].y,
+            ]),
+        });
+        expect(tracker.history.insert[3]).toMatchObject({
+            sql: expect.stringContaining(DashboardTileChartTableName),
+            bindings: expect.arrayContaining([
+                dashboardVersionEntry.dashboard_version_id,
+                null,
+            ]),
+        });
+        expect(tracker.history.update).toHaveLength(1);
+        expect(tracker.history.update[0]).toMatchObject({
+            sql: expect.stringContaining(DashboardViewsTableName),
+            bindings: expect.arrayContaining([
+                addDashboardVersionWithoutChart.filters,
+                dashboardVersionEntry.dashboard_version_id,
+            ]),
+        });
+    });
+
+    test("should error on create dashboard version if saved chart isn't found", async () => {
+        tracker.on.select(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on.select(SpaceTableName).responseOnce([spaceEntry]);
+        tracker.on.insert(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on
+            .insert(DashboardVersionsTableName)
+            .responseOnce([dashboardVersionEntry]);
+        tracker.on
+            .insert(DashboardViewsTableName)
+            .responseOnce([dashboardViewEntry]);
+        tracker.on
+            .insert(DashboardTilesTableName)
+            .responseOnce([
+                dashboardTileEntry,
+                loomTileEntry,
+                markdownTileEntry,
+            ]);
+        tracker.on.select(SavedChartsTableName).responseOnce([]); // simulate saved charts not found
+
+        await expect(
+            model.addVersion(
+                expectedDashboard.uuid,
+                addDashboardVersion,
+                user,
+                projectUuid,
+            ),
+        ).rejects.toThrowError(NotFoundError);
+    });
+
+    test('should null out tile.tabUuid that does not match any tab in this version (PROD-5905)', async () => {
+        // Simulates the bad payload that triggered the FK violation in
+        // production: tabs[] empty (or missing the tile's tab) while a tile
+        // still carries a stale tabUuid.
+        const staleTabUuid = '00000000-0000-0000-0000-000000000000';
+        const versionWithStaleTabUuid: typeof addDashboardVersion = {
+            ...addDashboardVersion,
+            tabs: [],
+            tiles: [
+                {
+                    ...addDashboardVersion.tiles[0],
+                    tabUuid: staleTabUuid,
+                },
+            ],
+        };
+
+        tracker.on.select(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on.select(SpaceTableName).responseOnce([spaceEntry]);
+        tracker.on.insert(DashboardsTableName).responseOnce([dashboardEntry]);
+        tracker.on
+            .insert(DashboardVersionsTableName)
+            .responseOnce([dashboardVersionEntry]);
+        tracker.on
+            .insert(DashboardViewsTableName)
+            .responseOnce([dashboardViewEntry]);
+        tracker.on
+            .insert(DashboardTilesTableName)
+            .responseOnce([dashboardTileEntry]);
+        tracker.on.select(SavedChartsTableName).responseOnce([savedChartEntry]);
+        tracker.on.insert(DashboardTileChartTableName).responseOnce([]);
+        tracker.on.update(DashboardViewsTableName).responseOnce([]);
+
+        vi.spyOn(model, 'getByIdOrSlug').mockImplementationOnce(() =>
+            Promise.resolve(expectedDashboard),
+        );
+
+        await expect(
+            model.addVersion(
+                expectedDashboard.uuid,
+                versionWithStaleTabUuid,
+                user,
+                projectUuid,
+            ),
+        ).resolves.not.toThrow();
+
+        const tilesInsert = tracker.history.insert.find((q) =>
+            q.sql.includes(DashboardTilesTableName),
+        );
+        expect(tilesInsert).toBeDefined();
+        // Stale uuid must have been dropped before the FK insert.
+        expect(tilesInsert!.bindings).not.toContain(staleTabUuid);
+        expect(tilesInsert!.bindings).toContain(null);
+    });
+
+    // A dashboard version may have a missing or malformed dashboard_views row
+    // (legacy or partially-written data). Reading such a version must degrade
+    // gracefully rather than throwing an unguarded `view.filters` NPE — this
+    // guards the shared filters-normalisation path used by both getByIdOrSlug
+    // and getVersionByUuid.
+    describe('reading a version degrades gracefully on malformed view data', () => {
+        const setupDashboardQueries = (viewResponse: AnyType[]) => {
+            tracker.on
+                .select(
+                    queryMatcher(DashboardsTableName, [
+                        expectedDashboard.uuid,
+                        1,
+                    ]),
+                )
+                .response([
+                    {
+                        ...dashboardWithVersionEntry,
+                        space_uuid: 'spaceUuid',
+                        space_name: 'space name',
+                    },
+                ]);
+            tracker.on
+                .select(
+                    queryMatcher(DashboardViewsTableName, [
+                        dashboardWithVersionEntry.dashboard_version_id,
+                    ]),
+                )
+                .response(viewResponse);
+            tracker.on
+                .select(
+                    queryMatcher(DashboardTilesTableName, [
+                        dashboardWithVersionEntry.dashboard_version_id,
+                    ]),
+                )
+                .response([]);
+            tracker.on
+                .select(
+                    queryMatcher(DashboardTabsTableName, [
+                        dashboardWithVersionEntry.dashboard_version_id,
+                        dashboardWithVersionEntry.dashboard_id,
+                    ]),
+                )
+                .response([]);
+        };
+
+        test('returns default filters when the version has no dashboard_views row', async () => {
+            setupDashboardQueries([]); // regression: this used to throw an NPE
+
+            const dashboard = await model.getByIdOrSlug(expectedDashboard.uuid);
+
+            expect(dashboard.filters).toEqual({
+                dimensions: [],
+                metrics: [],
+                tableCalculations: [],
+            });
+        });
+
+        it.each<[string, AnyType]>([
+            ['null filters', null],
+            ['undefined filters', undefined],
+            ['empty object filters', {}],
+            [
+                'filters missing tableCalculations',
+                { dimensions: [], metrics: [] },
+            ],
+            ['filters with only dimensions', { dimensions: [{ id: 'a' }] }],
+        ])(
+            'does not throw and always normalises tableCalculations to an array: %s',
+            async (_label, filters) => {
+                setupDashboardQueries([
+                    { ...dashboardViewEntry, filters } as AnyType,
+                ]);
+
+                const dashboard = await model.getByIdOrSlug(
+                    expectedDashboard.uuid,
+                );
+
+                expect(Array.isArray(dashboard.filters.tableCalculations)).toBe(
+                    true,
+                );
+            },
+        );
+    });
+});

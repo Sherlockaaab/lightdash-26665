@@ -1,0 +1,559 @@
+import {
+    DimensionType,
+    FeatureFlags,
+    getItemId,
+    isAdditionalMetric,
+    isCompiledMetric,
+    isCustomDimension,
+    isDimension,
+    isField,
+    isFilterableField,
+    isItemTimezoneAffected,
+    isTimeInterval,
+    MetricType,
+    timeFrameConfigs,
+    type AdditionalMetric,
+    type Dimension,
+    type FilterableField,
+    type Item,
+} from '@lightdash/common';
+import {
+    ActionIcon,
+    Group,
+    Highlight,
+    NavLink,
+    Text,
+    HoverCard,
+    Tooltip,
+} from '@mantine-8/core';
+import {
+    IconAlertTriangle,
+    IconCalendarPin,
+    IconClockPin,
+    IconFilter,
+    IconHierarchyOff,
+    IconInfoCircle,
+} from '@tabler/icons-react';
+import { memo, useCallback, useMemo, type FC } from 'react';
+import { useToggle } from 'react-use';
+import {
+    explorerActions,
+    selectIsFieldActive,
+    selectIsFieldFiltered,
+    selectTableName,
+    useExplorerDispatch,
+    useExplorerSelector,
+    type ExplorerStoreState,
+} from '../../../../../features/explorer/store';
+import { useExplore } from '../../../../../hooks/useExplore';
+import { useAddFilter } from '../../../../../hooks/useFilters';
+import { useServerFeatureFlag } from '../../../../../hooks/useServerOrClientFeatureFlag';
+import useTracking from '../../../../../providers/Tracking/useTracking';
+import { EventName } from '../../../../../types/Events';
+import {
+    getFieldColor,
+    getFieldColors,
+} from '../../../../../utils/fieldColors';
+import FieldIcon from '../../../../common/Filters/FieldIcon';
+import MantineIcon from '../../../../common/MantineIcon';
+import { ItemDetailPreview } from '../ItemDetailPreview';
+import { MAX_GROUP_DEPTH } from './constants';
+import styles from './TreeSingleNode.module.css';
+import TreeSingleNodeActions from './TreeSingleNodeActions';
+import { type Node } from './types';
+import useTableTree from './useTableTree';
+
+const NavItemIcon = ({
+    isMissing,
+    item,
+}: {
+    isMissing?: boolean;
+    item: Item | AdditionalMetric;
+}) => {
+    const { data: tzSupportFlag } = useServerFeatureFlag(
+        FeatureFlags.EnableTimezoneSupport,
+    );
+    const tzSupportEnabled = tzSupportFlag?.enabled ?? false;
+
+    const tzAffordance = useMemo(() => {
+        if (isMissing || !tzSupportEnabled || !isField(item)) return null;
+        const isDate = item.type === DimensionType.DATE;
+        const isTimestamp = item.type === DimensionType.TIMESTAMP;
+        if (!isDate && !isTimestamp) return null;
+        // TZ-sensitive dims keep the default glyph; only the tooltip flags them.
+        if (isItemTimezoneAffected(item)) {
+            return {
+                pinIcon: null,
+                tooltip: isDate
+                    ? "Calendar date, shifts with the chart's timezone"
+                    : "Timestamp, shifts with the chart's timezone",
+            };
+        }
+        // TZ-immune dims are "pinned" — a calendar/clock-pin by display type.
+        return isDate
+            ? {
+                  pinIcon: IconCalendarPin,
+                  tooltip:
+                      "Calendar date, not affected by the chart's timezone",
+              }
+            : {
+                  pinIcon: IconClockPin,
+                  tooltip:
+                      "Timestamp shown as stored, not affected by the chart's timezone",
+              };
+    }, [isMissing, tzSupportEnabled, item]);
+
+    if (isMissing) {
+        return <MantineIcon icon={IconAlertTriangle} color="ldGray.7" />;
+    }
+    if (tzAffordance) {
+        return (
+            <Tooltip
+                withinPortal
+                maw={300}
+                multiline
+                label={tzAffordance.tooltip}
+            >
+                {tzAffordance.pinIcon ? (
+                    <MantineIcon
+                        icon={tzAffordance.pinIcon}
+                        color={getFieldColor(item)}
+                        size="md"
+                    />
+                ) : (
+                    <FieldIcon
+                        item={item}
+                        color={getFieldColor(item)}
+                        size="md"
+                    />
+                )}
+            </Tooltip>
+        );
+    }
+    return <FieldIcon item={item} color={getFieldColor(item)} size="md" />;
+};
+
+NavItemIcon.displayName = 'NavItemIcon';
+
+/**
+ * Mirrors `getDefaultMetricSql` from the warehouse package so we can show the
+ * aggregated form of a custom metric in the hover preview without pulling in
+ * a warehouse client on the frontend.
+ */
+const renderAggregatedSql = (sql: string, type: MetricType): string => {
+    switch (type) {
+        case MetricType.AVERAGE:
+            return `AVG(${sql})`;
+        case MetricType.COUNT:
+            return `COUNT(${sql})`;
+        case MetricType.COUNT_DISTINCT:
+            return `COUNT(DISTINCT ${sql})`;
+        case MetricType.MAX:
+            return `MAX(${sql})`;
+        case MetricType.MIN:
+            return `MIN(${sql})`;
+        case MetricType.SUM:
+            return `SUM(${sql})`;
+        default:
+            return sql;
+    }
+};
+
+type Props = {
+    node: Node;
+};
+
+const TreeSingleNodeComponent: FC<Props> = ({ node }) => {
+    const itemsMap = useTableTree((context) => {
+        return context.itemsMap;
+    });
+    const isSearching = useTableTree((context) => context.isSearching);
+    const searchResults = useTableTree((context) => context.searchResults);
+    const searchQuery = useTableTree((context) => context.searchQuery);
+    const missingCustomMetrics = useTableTree(
+        (context) => context.missingCustomMetrics,
+    );
+    const itemsAlerts = useTableTree((context) => context.itemsAlerts);
+    const missingCustomDimensions = useTableTree(
+        (context) => context.missingCustomDimensions,
+    );
+    const onItemClick = useTableTree((context) => context.onItemClick);
+    const isVirtualized = useTableTree((context) => context.isVirtualized);
+    const depth = useTableTree((context) => context.depth);
+    const { track } = useTracking();
+
+    const addFilter = useAddFilter();
+
+    const dispatch = useExplorerDispatch();
+
+    const [isHover, toggleHover] = useToggle(false);
+    const [isMenuOpen, toggleMenu] = useToggle(false);
+
+    const isVisible = !isSearching || searchResults.includes(node.key);
+
+    const item = itemsMap[node.key];
+
+    const fieldId = useMemo(() => getItemId(item), [item]);
+
+    const selectIsFiltered = useMemo(
+        () => (state: ExplorerStoreState) =>
+            selectIsFieldFiltered(state, fieldId),
+        [fieldId],
+    );
+    const selectIsActive = useMemo(
+        () => (state: ExplorerStoreState) =>
+            selectIsFieldActive(state, fieldId),
+        [fieldId],
+    );
+
+    const isFieldFiltered = useExplorerSelector(
+        selectIsFiltered,
+        (a, b) => a === b,
+    );
+    const isSelected = useExplorerSelector(selectIsActive, (a, b) => a === b);
+
+    // Use the active explore name (base table) rather than the section's
+    // table name — for sections that represent joined tables, the section
+    // name is the join alias, which is not a valid explore identifier and
+    // would 404 the /explores/{name} endpoint.
+    const activeTableName = useExplorerSelector(selectTableName);
+    const { data: exploreData } = useExplore(activeTableName);
+
+    const metricInfo = useMemo(() => {
+        if (isCompiledMetric(item)) {
+            return {
+                type: item.type,
+                sql: item.sql,
+                compiledSql: item.compiledSql,
+                filters: item.filters,
+                table: item.table,
+                name: item.name,
+            };
+        }
+        if (isAdditionalMetric(item)) {
+            const baseDimensionCandidate =
+                item.baseDimensionName && exploreData
+                    ? exploreData.tables[item.table]?.dimensions[
+                          item.baseDimensionName
+                      ]
+                    : undefined;
+            const baseDimension: Dimension | undefined =
+                baseDimensionCandidate && isDimension(baseDimensionCandidate)
+                    ? baseDimensionCandidate
+                    : undefined;
+            const baseSql = item.sql ?? '';
+            return {
+                type: item.type,
+                sql: baseSql,
+                compiledSql: renderAggregatedSql(baseSql, item.type),
+                filters: item.filters,
+                table: item.table,
+                name: item.name,
+                baseDimension,
+            };
+        }
+        return undefined;
+    }, [item, exploreData]);
+
+    const description =
+        isField(item) || isAdditionalMetric(item)
+            ? item.description
+            : undefined;
+
+    const isMissing =
+        (isAdditionalMetric(item) &&
+            missingCustomMetrics &&
+            missingCustomMetrics.includes(item)) ||
+        (isCustomDimension(item) &&
+            missingCustomDimensions &&
+            missingCustomDimensions.includes(item));
+
+    const isHoverCardDisabled = useMemo(() => {
+        // Show metric info if either metric info or description is present
+        if (
+            (isCompiledMetric(item) || isAdditionalMetric(item)) &&
+            (!!metricInfo || !!description)
+        ) {
+            return false;
+        }
+        // Show description if it's not missing
+        if (!description && !isMissing) return true;
+
+        return false;
+    }, [description, isMissing, item, metricInfo]);
+
+    const itemColors = getFieldColors(item);
+    const alerts = itemsAlerts?.[getItemId(item)];
+    const isFiltered = isField(item) && isFieldFiltered;
+    const showFilterAction =
+        (isFiltered || isHover) &&
+        !isAdditionalMetric(item) &&
+        isFilterableField(item);
+
+    const timeIntervalLabel =
+        isDimension(item) &&
+        item.timeInterval &&
+        isTimeInterval(item.timeInterval)
+            ? (item.timeIntervalLabel ??
+              timeFrameConfigs[item.timeInterval].getLabel())
+            : undefined;
+
+    const label =
+        isField(item) || isAdditionalMetric(item)
+            ? timeIntervalLabel || item.label || item.name
+            : item.name;
+
+    const handleFilterClick = useCallback(
+        (e: React.MouseEvent<HTMLButtonElement>) => {
+            track({ name: EventName.ADD_FILTER_CLICKED });
+            if (!isFiltered) addFilter(item as FilterableField, undefined);
+            e.stopPropagation();
+        },
+        [isFiltered, addFilter, item, track],
+    );
+    const handleClick = useCallback(() => {
+        onItemClick(node.key, item);
+    }, [onItemClick, node.key, item]);
+    const handleMouseEnter = useCallback(
+        () => toggleHover(true),
+        [toggleHover],
+    );
+    const handleMouseLeave = useCallback(
+        () => toggleHover(false),
+        [toggleHover],
+    );
+    const handleDropdownClick = useCallback(
+        /**
+         * If we don't stop propagation, users may unintentionally toggle dimensions/metrics
+         * while interacting with the hovercard.
+         */
+        (e: React.MouseEvent) => e.stopPropagation(),
+        [],
+    );
+
+    const onOpenDescriptionView = useCallback(() => {
+        toggleHover(false);
+        dispatch(
+            explorerActions.openItemDetail({
+                itemType: 'field',
+                label,
+                description,
+                fieldItem: item,
+            }),
+        );
+    }, [toggleHover, dispatch, item, label, description]);
+
+    const onToggleMenu = useCallback(() => {
+        toggleHover(false);
+        toggleMenu();
+    }, [toggleHover, toggleMenu]);
+
+    const icon = useMemo(
+        () => <NavItemIcon isMissing={isMissing} item={item} />,
+        [isMissing, item],
+    );
+
+    const renderAlerts = useMemo(() => {
+        const alertTypes = [
+            { type: 'infos', alertIcon: IconInfoCircle, color: 'blue.6' },
+            {
+                type: 'warnings',
+                alertIcon: IconAlertTriangle,
+                color: 'yellow.9',
+            },
+            { type: 'errors', alertIcon: IconAlertTriangle, color: 'red.6' },
+        ];
+
+        return alertTypes.flatMap(({ type, alertIcon, color }) => {
+            const messages = alerts?.[type as keyof typeof alerts];
+            if (!messages || messages.length === 0) return [];
+
+            return (
+                <Tooltip
+                    key={type}
+                    withinPortal
+                    maw={300}
+                    multiline
+                    label={messages.map((m) => m.message).join('\n')}
+                >
+                    <MantineIcon
+                        icon={alertIcon}
+                        color={color}
+                        style={{ flexShrink: 0 }}
+                    />
+                </Tooltip>
+            );
+        });
+    }, [alerts]);
+
+    const isTruncated = useMemo(() => {
+        if (!isField(item)) return false;
+        const groups = item.groups ?? [];
+        return groups.length > MAX_GROUP_DEPTH;
+    }, [item]);
+
+    const truncatedActualDepth = useMemo(() => {
+        if (!isField(item)) return 0;
+        return (item.groups ?? []).length;
+    }, [item]);
+
+    // Apply indentation for virtualized mode only
+    // Non-virtualized mode uses NavLink's built-in nesting with childrenOffset
+    const pl = useMemo(() => {
+        if (isVirtualized) {
+            // Base padding is 12px, each nesting level adds 20px
+            return `${12 + (depth ?? 0) * 20}px`;
+        }
+        return undefined;
+    }, [depth, isVirtualized]);
+
+    if (!item || !isVisible) return null;
+
+    return (
+        <NavLink
+            component="div"
+            noWrap
+            data-selected={isSelected || undefined}
+            className={styles.root}
+            style={
+                {
+                    '--tree-node-bg': itemColors.bg,
+                    '--tree-node-hover-bg': itemColors.bgHover,
+                } as React.CSSProperties
+            }
+            leftSection={icon}
+            onClick={handleClick}
+            onMouseEnter={handleMouseEnter}
+            onMouseLeave={handleMouseLeave}
+            pl={pl}
+            label={
+                <Group wrap="nowrap" gap="xs">
+                    <HoverCard
+                        openDelay={300}
+                        keepMounted={false}
+                        shadow="subtle"
+                        withinPortal
+                        withArrow
+                        disabled={isHoverCardDisabled}
+                        position="right"
+                        radius="md"
+                        /**
+                         * Regular fields show a filter ActionIcon on hover that
+                         * eats ~28px of the row, narrowing the HoverCard target.
+                         * Custom metrics and custom dimensions never render that
+                         * icon, so their target is wider and the popover ends up
+                         * further right at the same offset. Shave ~28px off to
+                         * align both.
+                         */
+                        offset={
+                            isAdditionalMetric(item) || isCustomDimension(item)
+                                ? 36
+                                : 70
+                        }
+                    >
+                        <HoverCard.Target>
+                            <Text truncate fz="sm" style={{ flexGrow: 1 }}>
+                                <Highlight
+                                    component="span"
+                                    highlight={searchQuery || ''}
+                                    inherit
+                                >
+                                    {label}
+                                </Highlight>
+                            </Text>
+                        </HoverCard.Target>
+                        <HoverCard.Dropdown
+                            hidden={!isHover}
+                            p="xs"
+                            miw={400}
+                            mah={500}
+                            /**
+                             * Takes up space to the right, so it's OK to go fairly wide in the interest
+                             * of readability.
+                             */
+                            maw={500}
+                            className={styles.detailPreviewDropdown}
+                            onClick={handleDropdownClick}
+                        >
+                            {isMissing ? (
+                                `This field from '${item.table}' table is no longer available`
+                            ) : (
+                                <ItemDetailPreview
+                                    onViewDescription={onOpenDescriptionView}
+                                    description={description}
+                                    metricInfo={metricInfo}
+                                />
+                            )}
+                        </HoverCard.Dropdown>
+                    </HoverCard>
+                    {renderAlerts}
+                    {isTruncated && (
+                        <Tooltip
+                            withinPortal
+                            maw={300}
+                            multiline
+                            label={`Located ${truncatedActualDepth} levels deep`}
+                        >
+                            <MantineIcon
+                                icon={IconHierarchyOff}
+                                color="ldGray.6"
+                                style={{ flexShrink: 0 }}
+                            />
+                        </Tooltip>
+                    )}
+                    {showFilterAction && (
+                        <Tooltip
+                            withinPortal
+                            label={
+                                isFiltered
+                                    ? 'This field is filtered'
+                                    : 'Click here to add filter'
+                            }
+                        >
+                            <ActionIcon
+                                variant="subtle"
+                                color="gray"
+                                onClick={handleFilterClick}
+                            >
+                                <MantineIcon
+                                    icon={IconFilter}
+                                    style={{ flexShrink: 0 }}
+                                />
+                            </ActionIcon>
+                        </Tooltip>
+                    )}
+                    {isField(item) && item.hidden ? (
+                        <Tooltip
+                            withinPortal
+                            label="This field has been hidden in the dbt project. It's recommend to remove it from the query"
+                        >
+                            <MantineIcon
+                                icon={IconAlertTriangle}
+                                color="yellow.9"
+                                style={{ flexShrink: 0 }}
+                            />
+                        </Tooltip>
+                    ) : null}
+                </Group>
+            }
+            rightSection={
+                <TreeSingleNodeActions
+                    item={item}
+                    isHovered={isHover}
+                    isSelected={isSelected}
+                    isOpened={isMenuOpen}
+                    hasDescription={!!description}
+                    onViewDescription={onOpenDescriptionView}
+                    onMenuChange={onToggleMenu}
+                />
+            }
+            data-testid={`tree-single-node-${label}`}
+        />
+    );
+};
+
+const TreeSingleNode = memo(TreeSingleNodeComponent);
+
+TreeSingleNode.displayName = 'TreeSingleNode';
+
+export default TreeSingleNode;

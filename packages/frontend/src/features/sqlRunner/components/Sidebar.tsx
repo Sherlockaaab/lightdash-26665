@@ -1,0 +1,111 @@
+import { ChartKind } from '@lightdash/common';
+import {
+    ActionIcon,
+    Group,
+    ScrollArea,
+    Stack,
+    Title,
+    Tooltip,
+} from '@mantine-8/core';
+import { IconLayoutSidebarLeftCollapse, IconReload } from '@tabler/icons-react';
+import { type FC } from 'react';
+import MantineIcon from '../../../components/common/MantineIcon';
+import { VisualizationConfigPanel } from '../../../components/DataViz/VisualizationConfigPanel';
+import scrollAreaClasses from '../../../styles/ScrollArea.module.css';
+import { useRefreshTables } from '../hooks/useTables';
+import { useAppDispatch, useAppSelector } from '../store/hooks';
+import { setSelectedChartType, SidebarTabs } from '../store/sqlRunnerSlice';
+import { TablesPanel } from './TablesPanel';
+
+type Props = {
+    setSidebarOpen: (isOpen: boolean) => void;
+};
+
+export const Sidebar: FC<Props> = ({ setSidebarOpen }) => {
+    const dispatch = useAppDispatch();
+    const projectUuid = useAppSelector((state) => state.sqlRunner.projectUuid);
+
+    const {
+        mutate: updateTables,
+        isLoading,
+        error,
+    } = useRefreshTables({ projectUuid });
+
+    const selectedChartType = useAppSelector(
+        (state) => state.sqlRunner.selectedChartType,
+    );
+    const activeSidebarTab = useAppSelector(
+        (state) => state.sqlRunner.activeSidebarTab,
+    );
+    const sqlColumns = useAppSelector((state) => state.sqlRunner.sqlColumns);
+
+    return (
+        <Stack gap="xs" style={{ flex: 1, overflow: 'hidden' }}>
+            <Group justify="space-between" p="sm">
+                <Group wrap="nowrap" gap="xs">
+                    <Title order={5} fz="sm" c="ldGray.6">
+                        {activeSidebarTab === SidebarTabs.TABLES
+                            ? 'TABLES'
+                            : 'VISUALIZATION'}
+                    </Title>
+                    {activeSidebarTab === SidebarTabs.TABLES && (
+                        <Tooltip label="Refresh tables" position="right">
+                            <ActionIcon
+                                variant="subtle"
+                                color="gray"
+                                size="xs"
+                                onClick={() => updateTables()}
+                            >
+                                <MantineIcon icon={IconReload}></MantineIcon>
+                            </ActionIcon>
+                        </Tooltip>
+                    )}
+                </Group>
+                <Tooltip label="Close sidebar" position="left">
+                    <ActionIcon variant="subtle" color="gray" size="xs">
+                        <MantineIcon
+                            icon={IconLayoutSidebarLeftCollapse}
+                            onClick={() => setSidebarOpen(false)}
+                        />
+                    </ActionIcon>
+                </Tooltip>
+            </Group>
+
+            <Stack
+                display={
+                    activeSidebarTab === SidebarTabs.TABLES ? 'inherit' : 'none'
+                }
+                style={{ flex: 1, overflow: 'hidden' }}
+            >
+                <TablesPanel
+                    isLoading={isLoading}
+                    error={error?.error.message || null}
+                />
+            </Stack>
+
+            <ScrollArea
+                offsetScrollbars
+                scrollbars="y"
+                classNames={{ content: scrollAreaClasses.verticalContent }}
+                px="sm"
+                style={{
+                    flex: 1,
+                    display:
+                        activeSidebarTab === SidebarTabs.VISUALIZATION
+                            ? 'inherit'
+                            : 'none',
+                }}
+            >
+                <Stack style={{ flex: 1, overflow: 'hidden' }}>
+                    <VisualizationConfigPanel
+                        selectedChartType={selectedChartType || ChartKind.TABLE}
+                        setSelectedChartType={(value) =>
+                            dispatch(setSelectedChartType(value))
+                        }
+                        columns={sqlColumns || []}
+                    />
+                </Stack>
+            </ScrollArea>
+        </Stack>
+    );
+};

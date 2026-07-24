@@ -1,0 +1,1004 @@
+import {
+    AnyType,
+    ConditionalFormattingColorApplyTo,
+    convertFormattedValue,
+    DimensionType,
+    DownloadFileType,
+    formatItemValue,
+    formatRawValue,
+    formatRows,
+    getColorFromRange,
+    getConditionalFormattingColor,
+    getConditionalFormattingConfig,
+    getConditionalFormattingTextStyle,
+    getErrorMessage,
+    getExcelFormatExpression,
+    getReadableTextColor,
+    getRowConditionalFormattingColor,
+    getRowConditionalFormattingConfig,
+    isConditionalFormattingConfigWithColorRange,
+    isDimension,
+    isField,
+    isHexCodeColor,
+    isNumber,
+    isNumericItem,
+    ItemsMap,
+    PivotConfig,
+    pivotResultsAsCsv,
+    pivotResultsAsData,
+    ResultRow,
+    shouldShiftItemTimezone,
+    timeIntervalToExcelNumFmt,
+    toExcelWallClockDate,
+    UnexpectedServerError,
+    type ConditionalFormattingConfig,
+    type ConditionalFormattingMinMaxMap,
+    type ConditionalFormattingRowFields,
+    type PivotRowTotalsByIndex,
+    type ReadyQueryResultsPage,
+} from '@lightdash/common';
+import * as Excel from 'exceljs';
+import fs from 'fs';
+import moment from 'moment';
+import os from 'os';
+import path from 'path';
+import { Readable, Writable } from 'stream';
+import { transformAndExportResults } from '../../clients/Aws/transformAndExportResults';
+import { type FileStorageClient } from '../../clients/FileStorage/FileStorageClient';
+import { S3ResultsFileStorageClient } from '../../clients/ResultsFileStorageClients/S3ResultsFileStorageClient';
+import { LightdashConfig } from '../../config/parseConfig';
+import Logger from '../../logging/logger';
+import {
+    generateGenericFileId,
+    processFieldsForExport,
+    streamJsonlData,
+} from '../../utils/FileDownloadUtils/FileDownloadUtils';
+
+export class ExcelService {
+    private static readonly EXCEL_ROW_LIMIT = 1_000_000;
+
+    private static isTzActive(
+        timezone: string | undefined,
+    ): timezone is string {
+        return !!timezone && timezone !== 'UTC';
+    }
+
+    static convertToExcelDate(
+        value: unknown,
+        timezone?: string,
+    ): Date | unknown {
+        if (typeof value === 'string') {
+            const dateValue = moment(value, moment.ISO_8601, true);
+            if (dateValue.isValid()) {
+                // Bare date strings (no 'T') skip the shift to keep calendar values.
+                if (ExcelService.isTzActive(timezone) && value.includes('T')) {
+                    return toExcelWallClockDate(value, timezone);
+                }
+                return dateValue.toDate();
+            }
+        }
+        return value;
+    }
+
+    static generateFileId(
+        fileName: string,
+        truncated: boolean = false,
+        time: moment.Moment = moment(),
+    ): string {
+        return generateGenericFileId({
+            fileName,
+            fileExtension: DownloadFileType.XLSX,
+            truncated,
+            time,
+        });
+    }
+
+    static convertRowToExcel(
+        row: Record<string, AnyType>,
+        itemMap: ItemsMap,
+        onlyRaw: boolean,
+        sortedFieldIds: string[],
+        timezone?: string,
+    ): (string | number | Date | null)[] {
+        return sortedFieldIds.map((fieldId) => {
+            const rawValue = row[fieldId];
+
+            if (onlyRaw) {
+                const item = itemMap[fieldId];
+                // GLITCH-452/503: a day-or-coarser DATE field's raw is a bare
+                // YYYY-MM-DD in tz-aware mode (matching the API `raw`). Flag off
+                // (no timezone) keeps the passthrough — byte-identical.
+                return timezone &&
+                    isField(item) &&
+                    item.type === DimensionType.DATE
+                    ? formatRawValue(item, rawValue, timezone)
+                    : rawValue;
+            }
+
+            if (rawValue === null || rawValue === undefined) {
+                return rawValue;
+            }
+
+            const item = itemMap[fieldId];
+            const isItemField = isField(item);
+
+            if (
+                isItemField &&
+                (item.type === DimensionType.DATE ||
+                    item.type === DimensionType.TIMESTAMP)
+            ) {
+                if (
+                    ExcelService.isTzActive(timezone) &&
+                    shouldShiftItemTimezone(item)
+                ) {
+                    return toExcelWallClockDate(rawValue, timezone);
+                }
+                return moment(rawValue).toDate();
+            }
+
+            const stringValue = String(rawValue);
+
+            // If the string value is empty, return the raw value
+            if (stringValue.trim() === '') {
+                return rawValue;
+            }
+
+            // Convert string numbers to actual numbers for Excel formatting
+            // When there is a formatExpression, the formatting is applied at the column level
+            // so we need to convert the raw value to a number
+            if (isNumber(rawValue)) {
+                return Number(stringValue);
+            }
+
+            // Otherwise, use standard Lightdash formatting as there won't be a format expression
+            return formatItemValue(
+                item,
+                rawValue,
+                undefined,
+                undefined,
+                timezone,
+            );
+        });
+    }
+
+    /**
+     * Converts a CSS color (hex or the 'white'/'black' returned by
+     * getReadableTextColor) into the 'AARRGGBB' ARGB string exceljs expects.
+     * Returns undefined when the colour cannot be represented.
+     */
+    private static colorToArgb(color: string | undefined): string | undefined {
+        if (!color) return undefined;
+        if (color === 'white') return 'FFFFFFFF';
+        if (color === 'black') return 'FF000000';
+        if (!isHexCodeColor(color)) return undefined;
+
+        let hex = color.slice(1);
+        if (hex.length === 3) {
+            hex = hex
+                .split('')
+                .map((c) => c + c)
+                .join('');
+        }
+        if (hex.length === 6) {
+            return `FF${hex.toUpperCase()}`;
+        }
+        if (hex.length === 8) {
+            // colorjs.io emits #RRGGBBAA; Excel ARGB wants the alpha first
+            return `${hex.slice(6, 8)}${hex.slice(0, 6)}`.toUpperCase();
+        }
+        return undefined;
+    }
+
+    /**
+     * Streams the results file once to compute the min/max of every field
+     * targeted by a color-range conditional formatting rule that uses 'auto'
+     * bounds. Mirrors the table renderer's minMaxMap so exported color-scale
+     * fills match the UI. Returns an empty map when no scan is needed.
+     */
+    private static async buildConditionalFormattingMinMaxMap({
+        resultsStream,
+        fields,
+        conditionalFormattings,
+    }: {
+        resultsStream: Readable;
+        fields: ItemsMap;
+        conditionalFormattings: ConditionalFormattingConfig[];
+    }): Promise<ConditionalFormattingMinMaxMap> {
+        const needsScan = conditionalFormattings.some(
+            (config) =>
+                isConditionalFormattingConfigWithColorRange(config) &&
+                (config.rule.min === 'auto' || config.rule.max === 'auto'),
+        );
+
+        if (!needsScan) {
+            resultsStream.destroy();
+            return {};
+        }
+
+        const numericTargets = [
+            ...new Set(
+                conditionalFormattings
+                    .map((config) => config.target?.fieldId)
+                    .filter((fieldId): fieldId is string => !!fieldId),
+            ),
+        ].filter((fieldId) => isNumericItem(fields[fieldId]));
+
+        if (numericTargets.length === 0) {
+            resultsStream.destroy();
+            return {};
+        }
+
+        const accumulators = new Map<
+            string,
+            { min: number; max: number; hasValue: boolean }
+        >();
+        numericTargets.forEach((fieldId) =>
+            accumulators.set(fieldId, {
+                min: Infinity,
+                max: -Infinity,
+                hasValue: false,
+            }),
+        );
+
+        await streamJsonlData<void>({
+            readStream: resultsStream,
+            onRow: (parsedRow: Record<string, unknown>) => {
+                numericTargets.forEach((fieldId) => {
+                    const rawValue = parsedRow[fieldId];
+                    if (
+                        rawValue === undefined ||
+                        rawValue === null ||
+                        rawValue === ''
+                    ) {
+                        return;
+                    }
+
+                    const numValue = Number(rawValue);
+                    if (Number.isNaN(numValue)) return;
+
+                    const converted = convertFormattedValue(
+                        numValue,
+                        fields[fieldId],
+                    );
+                    if (typeof converted !== 'number') return;
+
+                    const acc = accumulators.get(fieldId)!;
+                    acc.hasValue = true;
+                    if (converted < acc.min) acc.min = converted;
+                    if (converted > acc.max) acc.max = converted;
+                });
+            },
+            maxLines: ExcelService.EXCEL_ROW_LIMIT,
+        });
+
+        const minMaxMap: ConditionalFormattingMinMaxMap = {};
+        accumulators.forEach((acc, fieldId) => {
+            if (acc.hasValue) {
+                minMaxMap[fieldId] = { min: acc.min, max: acc.max };
+            }
+        });
+        return minMaxMap;
+    }
+
+    /**
+     * Applies the chart's conditional formatting (background fills, text colour
+     * and text styling) to a single worksheet row, mirroring the results table.
+     * Handles single-color and color-range rules across cell/text/row scopes.
+     */
+    private static applyConditionalFormattingToRow({
+        excelRow,
+        parsedRow,
+        fields,
+        sortedFieldIds,
+        conditionalFormattings,
+        minMaxMap,
+    }: {
+        excelRow: Excel.Row;
+        parsedRow: Record<string, unknown>;
+        fields: ItemsMap;
+        sortedFieldIds: string[];
+        conditionalFormattings: ConditionalFormattingConfig[];
+        minMaxMap: ConditionalFormattingMinMaxMap;
+    }): void {
+        const rowFields: ConditionalFormattingRowFields = {};
+        Object.keys(fields).forEach((fieldId) => {
+            if (fieldId in parsedRow) {
+                rowFields[fieldId] = {
+                    field: fields[fieldId],
+                    value: parsedRow[fieldId],
+                };
+            }
+        });
+
+        const rowColor = getRowConditionalFormattingColor({
+            conditionalFormattings,
+            rowFields,
+            minMaxMap,
+        });
+        const rowConfig = getRowConditionalFormattingConfig({
+            conditionalFormattings,
+            rowFields,
+            minMaxMap,
+        });
+
+        sortedFieldIds.forEach((fieldId, colIndex) => {
+            const field = fields[fieldId];
+            const value = parsedRow[fieldId];
+
+            const cellConfig = getConditionalFormattingConfig({
+                field,
+                value,
+                minMaxMap,
+                conditionalFormattings,
+                rowFields,
+                applyTo: ConditionalFormattingColorApplyTo.CELL,
+            });
+            const textConfig = getConditionalFormattingConfig({
+                field,
+                value,
+                minMaxMap,
+                conditionalFormattings,
+                rowFields,
+                applyTo: ConditionalFormattingColorApplyTo.TEXT,
+            });
+
+            const cellResult = getConditionalFormattingColor({
+                field,
+                value,
+                minMaxMap,
+                config: cellConfig,
+                getColorFromRange,
+            });
+            const textResult = getConditionalFormattingColor({
+                field,
+                value,
+                minMaxMap,
+                config: textConfig,
+                getColorFromRange,
+            });
+
+            const backgroundColor = cellResult?.color ?? rowColor ?? undefined;
+
+            let fontColor: string | undefined;
+            if (textResult) {
+                fontColor = textResult.color;
+            } else if (cellResult) {
+                fontColor = getReadableTextColor(cellResult.color);
+            } else if (rowColor) {
+                fontColor = getReadableTextColor(rowColor);
+            }
+
+            const textStyle = getConditionalFormattingTextStyle([
+                cellConfig,
+                textConfig,
+                rowConfig,
+            ]);
+
+            if (!backgroundColor && !fontColor && !textStyle) return;
+
+            const cell = excelRow.getCell(colIndex + 1);
+
+            const bgArgb = ExcelService.colorToArgb(backgroundColor);
+            if (bgArgb) {
+                cell.fill = {
+                    type: 'pattern',
+                    pattern: 'solid',
+                    fgColor: { argb: bgArgb },
+                };
+            }
+
+            const fontArgb = ExcelService.colorToArgb(fontColor);
+            if (fontArgb || textStyle) {
+                cell.font = {
+                    ...cell.font,
+                    ...(fontArgb ? { color: { argb: fontArgb } } : {}),
+                    ...(textStyle?.bold ? { bold: true } : {}),
+                    ...(textStyle?.italic ? { italic: true } : {}),
+                    ...(textStyle?.underline ? { underline: true } : {}),
+                };
+            }
+        });
+    }
+
+    static async downloadPivotTableXlsx({
+        rows,
+        itemMap,
+        pivotConfig,
+        onlyRaw,
+        customLabels,
+        pivotDetails,
+        warehouseRowTotals,
+        warehouseColumnTotals,
+        warehouseGrandTotals,
+        enableImprovedExcelDates = false,
+        timezone,
+    }: {
+        rows: Record<string, AnyType>[];
+        itemMap: ItemsMap;
+        pivotConfig: PivotConfig;
+        onlyRaw: boolean;
+        customLabels: Record<string, string> | undefined;
+        pivotDetails: ReadyQueryResultsPage['pivotDetails'];
+        warehouseRowTotals?: PivotRowTotalsByIndex;
+        warehouseColumnTotals?: Record<string, number>;
+        warehouseGrandTotals?: Record<string, number>;
+        enableImprovedExcelDates?: boolean;
+        timezone?: string;
+    }): Promise<Excel.Buffer> {
+        if (!pivotDetails) {
+            throw new UnexpectedServerError(
+                'Cannot export pivot table XLSX without SQL pivot details',
+            );
+        }
+
+        const formattedRows = formatRows(
+            rows,
+            itemMap,
+            undefined,
+            undefined,
+            timezone,
+        );
+
+        if (!enableImprovedExcelDates) {
+            return ExcelService.downloadPivotTableXlsxLegacy({
+                formattedRows,
+                itemMap,
+                pivotConfig,
+                onlyRaw,
+                customLabels,
+                pivotDetails,
+                warehouseRowTotals,
+                warehouseColumnTotals,
+                warehouseGrandTotals,
+                timezone,
+            });
+        }
+
+        const pivotData = pivotResultsAsData({
+            pivotConfig,
+            rows: formattedRows,
+            itemMap,
+            customLabels,
+            onlyRaw,
+            pivotDetails,
+            warehouseRowTotals,
+            warehouseColumnTotals,
+            warehouseGrandTotals,
+        });
+
+        // Build date column metadata: for each data column, determine if
+        // it's a date/timestamp dimension and what Excel numFmt to apply.
+        const dateColumnFormats = new Map<
+            number,
+            {
+                numFmt: string;
+                shouldShift: boolean;
+            }
+        >();
+        if (!onlyRaw) {
+            const tzActive = ExcelService.isTzActive(timezone);
+            pivotData.fieldIds.forEach((fieldId, colIndex) => {
+                const field = itemMap[fieldId];
+                if (
+                    field &&
+                    isField(field) &&
+                    isDimension(field) &&
+                    (field.type === DimensionType.DATE ||
+                        field.type === DimensionType.TIMESTAMP)
+                ) {
+                    const numFmt = timeIntervalToExcelNumFmt(
+                        field.timeInterval,
+                        field.type,
+                    );
+                    if (numFmt) {
+                        const offset = pivotData.hasIndex ? 0 : 1;
+                        dateColumnFormats.set(colIndex + offset, {
+                            numFmt,
+                            shouldShift:
+                                tzActive && shouldShiftItemTimezone(field),
+                        });
+                    }
+                }
+            });
+        }
+
+        const workbook = new Excel.Workbook();
+        const worksheet = workbook.addWorksheet('Pivot Table');
+
+        // Add header rows
+        pivotData.headers.forEach((row, rowIndex) => {
+            worksheet.addRow(row);
+
+            if (rowIndex === 0) {
+                const headerRow = worksheet.getRow(1);
+                headerRow.font = { bold: true };
+                headerRow.fill = {
+                    type: 'pattern',
+                    pattern: 'solid',
+                    fgColor: { argb: 'FFE0E0E0' },
+                };
+            }
+        });
+
+        // Add data rows — use raw values for date columns, formatted for everything else
+        pivotData.dataRows.forEach((row) => {
+            const excelRow = row.map((cell, colIndex) => {
+                const dateFmt = dateColumnFormats.get(colIndex);
+                if (
+                    dateFmt &&
+                    cell.raw != null &&
+                    cell.raw !== '' &&
+                    typeof cell.raw === 'string'
+                ) {
+                    const m = moment.utc(cell.raw);
+                    if (m.isValid()) {
+                        return dateFmt.shouldShift && timezone
+                            ? toExcelWallClockDate(cell.raw, timezone)
+                            : m.toDate();
+                    }
+                }
+                return cell.formatted;
+            });
+            const wsRow = worksheet.addRow(excelRow);
+
+            // Apply numFmt to date cells in this row
+            dateColumnFormats.forEach(({ numFmt }, colIndex) => {
+                const cell = wsRow.getCell(colIndex + 1); // 1-indexed
+                if (cell.value instanceof Date) {
+                    cell.numFmt = numFmt;
+                }
+            });
+        });
+
+        // Auto-adjust column widths
+        const allRows = [
+            ...pivotData.headers,
+            ...pivotData.dataRows.map((row) => row.map((c) => c.formatted)),
+        ];
+        worksheet.columns.forEach((column, index) => {
+            if (column) {
+                let maxLength = 0;
+                allRows.forEach((row) => {
+                    if (
+                        row[index] &&
+                        row[index].toString().length > maxLength
+                    ) {
+                        maxLength = row[index].toString().length;
+                    }
+                });
+                // eslint-disable-next-line no-param-reassign
+                column.width = Math.min(Math.max(maxLength + 2, 10), 50);
+            }
+        });
+
+        // Write to buffer
+        return workbook.xlsx.writeBuffer();
+    }
+
+    private static async downloadPivotTableXlsxLegacy({
+        formattedRows,
+        itemMap,
+        pivotConfig,
+        onlyRaw,
+        customLabels,
+        pivotDetails,
+        warehouseRowTotals,
+        warehouseColumnTotals,
+        warehouseGrandTotals,
+        timezone,
+    }: {
+        formattedRows: ResultRow[];
+        itemMap: ItemsMap;
+        pivotConfig: PivotConfig;
+        onlyRaw: boolean;
+        customLabels: Record<string, string> | undefined;
+        pivotDetails: NonNullable<ReadyQueryResultsPage['pivotDetails']>;
+        warehouseRowTotals?: PivotRowTotalsByIndex;
+        warehouseColumnTotals?: Record<string, number>;
+        warehouseGrandTotals?: Record<string, number>;
+        timezone?: string;
+    }): Promise<Excel.Buffer> {
+        const csvResults = pivotResultsAsCsv({
+            pivotConfig,
+            rows: formattedRows,
+            itemMap,
+            customLabels,
+            onlyRaw,
+            pivotDetails,
+            warehouseRowTotals,
+            warehouseColumnTotals,
+            warehouseGrandTotals,
+        });
+
+        const workbook = new Excel.Workbook();
+        const worksheet = workbook.addWorksheet('Pivot Table');
+
+        csvResults.forEach((row, index) => {
+            const excelRow = row.map((value) =>
+                ExcelService.convertToExcelDate(value, timezone),
+            );
+            worksheet.addRow(excelRow);
+
+            if (index === 0) {
+                const headerRow = worksheet.getRow(1);
+                headerRow.font = { bold: true };
+                headerRow.fill = {
+                    type: 'pattern',
+                    pattern: 'solid',
+                    fgColor: { argb: 'FFE0E0E0' },
+                };
+            }
+        });
+
+        worksheet.columns.forEach((column, index) => {
+            if (column) {
+                let maxLength = 0;
+                csvResults.forEach((row) => {
+                    if (
+                        row[index] &&
+                        row[index].toString().length > maxLength
+                    ) {
+                        maxLength = row[index].toString().length;
+                    }
+                });
+                // eslint-disable-next-line no-param-reassign
+                column.width = Math.min(Math.max(maxLength + 2, 10), 50);
+            }
+        });
+
+        return workbook.xlsx.writeBuffer();
+    }
+
+    /**
+     * Downloads pivot table XLSX from async query results file
+     * Handles loading data from JSONL storage file and generating pivot Excel file
+     */
+    static async downloadAsyncPivotTableXlsx({
+        resultsFileName,
+        fields,
+        resultsStorageClient,
+        exportsStorageClient,
+        lightdashConfig,
+        options,
+        pivotDetails,
+        warehouseRowTotals,
+        warehouseColumnTotals,
+        warehouseGrandTotals,
+        timezone,
+        csvCellsLimit,
+    }: {
+        resultsFileName: string;
+        fields: ItemsMap;
+        resultsStorageClient: S3ResultsFileStorageClient;
+        exportsStorageClient: FileStorageClient;
+        lightdashConfig: LightdashConfig;
+        pivotDetails: ReadyQueryResultsPage['pivotDetails'];
+        warehouseRowTotals?: PivotRowTotalsByIndex;
+        warehouseColumnTotals?: Record<string, number>;
+        warehouseGrandTotals?: Record<string, number>;
+        options: {
+            onlyRaw: boolean;
+            showTableNames: boolean;
+            customLabels: Record<string, string>;
+            columnOrder: string[];
+            hiddenFields: string[];
+            pivotConfig: PivotConfig;
+            attachmentDownloadName?: string;
+        };
+        timezone?: string;
+        // Per-org export limit resolved by the caller; falls back to the
+        // instance default when not provided.
+        csvCellsLimit?: number;
+    }): Promise<{ fileUrl: string; truncated: boolean; s3Key: string }> {
+        const { onlyRaw, customLabels, pivotConfig, attachmentDownloadName } =
+            options;
+
+        // Load rows from the results file using shared streaming utility
+        // For pivot tables, we need to use csvCellsLimit to prevent memory issues
+        const readStream =
+            await resultsStorageClient.getDownloadStream(resultsFileName);
+
+        const fieldCount = Object.keys(fields).length;
+        const cellsLimit =
+            csvCellsLimit ?? lightdashConfig.query?.csvCellsLimit ?? 100000;
+
+        // Use standard csvCellsLimit calculation - same as original downloadPivotTableCsv
+        const maxRows = Math.floor(cellsLimit / fieldCount);
+
+        const { results: rows, truncated } = await streamJsonlData<
+            Record<string, unknown>
+        >({
+            readStream,
+            onRow: (parsedRow: Record<string, unknown>) => parsedRow, // Just collect all rows
+            maxLines: maxRows, // Use standard csvCellsLimit logic
+        });
+
+        if (rows.length === 0) {
+            throw new Error('No data found in results file');
+        }
+
+        if (truncated) {
+            Logger.warn(
+                `Pivot Excel export truncated: loaded ${rows.length} rows (csvCellsLimit: ${cellsLimit}, fieldCount: ${fieldCount})`,
+            );
+        }
+
+        const fileName = attachmentDownloadName || `pivot-${resultsFileName}`;
+        const formattedFileName = ExcelService.generateFileId(
+            fileName,
+            truncated,
+        );
+
+        const excelBuffer = await ExcelService.downloadPivotTableXlsx({
+            rows,
+            itemMap: fields,
+            pivotConfig,
+            onlyRaw,
+            customLabels,
+            pivotDetails,
+            warehouseRowTotals,
+            warehouseColumnTotals,
+            warehouseGrandTotals,
+            enableImprovedExcelDates: lightdashConfig.enableImprovedExcelDates,
+            timezone,
+        });
+
+        // Upload the Excel buffer to exports bucket using cross-bucket transform
+        return transformAndExportResults(
+            resultsFileName,
+            formattedFileName,
+            async (_, writeStream: Writable) => {
+                // We already have the buffer, so just write it directly
+                writeStream.write(Buffer.from(excelBuffer));
+                writeStream.end();
+                return { truncated };
+            },
+            {
+                resultsStorageClient,
+                exportsStorageClient,
+            },
+            {
+                fileType: DownloadFileType.XLSX,
+                attachmentDownloadName: attachmentDownloadName
+                    ? `${attachmentDownloadName}.xlsx`
+                    : undefined,
+            },
+        );
+    }
+
+    // Helper method to create temporary file path
+    private static createTempFilePath(prefix: string): string {
+        return path.join(
+            os.tmpdir(),
+            `lightdash-excel-${prefix}-${Date.now()}-${Math.random()
+                .toString(36)
+                .substring(2, 11)}.xlsx`,
+        );
+    }
+
+    // Helper method to clean up temporary files
+    private static cleanupTempFile(tempFilePath: string): void {
+        fs.unlink(tempFilePath, (err: NodeJS.ErrnoException | null) => {
+            if (err) {
+                Logger.warn(`Could not delete temp file: ${err.message}`);
+            }
+        });
+    }
+
+    // Helper method to stream JSONL data to Excel temp file
+    private static async streamJsonlToExcelFile(
+        resultsStream: Readable,
+        tempFilePath: string,
+        headers: string[],
+        fields: ItemsMap,
+        onlyRaw: boolean,
+        sortedFieldIds: string[],
+        timezone?: string,
+        conditionalFormattings?: ConditionalFormattingConfig[],
+        minMaxMap?: ConditionalFormattingMinMaxMap,
+    ): Promise<{ truncated: boolean }> {
+        // Use the same approach as our working tests - direct filename instead of stream
+        const workbook = new Excel.stream.xlsx.WorkbookWriter({
+            filename: tempFilePath,
+            useStyles: true,
+            // Inline strings avoid buffering a shared-strings table that
+            // exceeds V8's max string length (~512MB) on large exports.
+            useSharedStrings: false,
+        });
+        const worksheet = workbook.addWorksheet('Sheet1');
+
+        // Set up columns with formatting
+        worksheet.columns = headers.map((header, index) => {
+            const fieldId = sortedFieldIds[index];
+            const item = fields[fieldId];
+            const formatExpression = getExcelFormatExpression(item);
+
+            const column: Partial<Excel.Column> = {
+                header,
+                key: `col_${index}`,
+                width: 15,
+            };
+
+            // Apply number formatting at column level if available
+            if (formatExpression && !onlyRaw) {
+                column.style = { numFmt: formatExpression };
+            }
+
+            return column;
+        });
+
+        let actualRowCount = 0;
+
+        // Use streamJsonlData for clean line processing with automatic truncation
+        const { truncated } = await streamJsonlData<void>({
+            readStream: resultsStream,
+            onRow: (parsedRow: Record<string, unknown>, lineCount: number) => {
+                // Convert row data for Excel
+                const rowData = ExcelService.convertRowToExcel(
+                    parsedRow,
+                    fields,
+                    onlyRaw,
+                    sortedFieldIds,
+                    timezone,
+                );
+
+                if (Array.isArray(rowData) && rowData.length > 0) {
+                    actualRowCount += 1;
+
+                    // Stream directly to Excel temp file
+                    const rowObject: Record<
+                        string,
+                        string | number | Date | null
+                    > = {};
+                    rowData.forEach(
+                        (
+                            value: string | number | Date | null,
+                            colIndex: number,
+                        ) => {
+                            rowObject[`col_${colIndex}`] = value;
+                        },
+                    );
+
+                    const row = worksheet.addRow(rowObject);
+
+                    if (conditionalFormattings?.length) {
+                        ExcelService.applyConditionalFormattingToRow({
+                            excelRow: row,
+                            parsedRow,
+                            fields,
+                            sortedFieldIds,
+                            conditionalFormattings,
+                            minMaxMap: minMaxMap ?? {},
+                        });
+                    }
+
+                    row.commit();
+                } else {
+                    Logger.warn(
+                        `Invalid row data on row ${lineCount}, skipping`,
+                    );
+                }
+                // Return void since we're processing rows directly
+            },
+            maxLines: ExcelService.EXCEL_ROW_LIMIT,
+        });
+
+        // Commit Excel to temp file
+        worksheet.commit();
+        await workbook.commit();
+
+        return { truncated };
+    }
+
+    /**
+     * Direct Excel export using streaming to minimize memory usage
+     * Processes JSONL data row-by-row and streams directly to S3
+     */
+    static async downloadAsyncExcelDirectly(
+        resultsFileName: string,
+        fields: ItemsMap,
+        clients: {
+            resultsStorageClient: S3ResultsFileStorageClient;
+            exportsStorageClient: FileStorageClient;
+        },
+        options: {
+            onlyRaw?: boolean;
+            showTableNames?: boolean;
+            customLabels?: Record<string, string>;
+            columnOrder?: string[];
+            hiddenFields?: string[];
+            attachmentDownloadName?: string;
+            conditionalFormattings?: ConditionalFormattingConfig[];
+        } = {},
+        timezone?: string,
+    ): Promise<{ fileUrl: string; truncated: boolean; s3Key: string }> {
+        // Handle column ordering and filtering
+        const {
+            onlyRaw = false,
+            showTableNames = false,
+            customLabels = {},
+            columnOrder = [],
+            hiddenFields = [],
+            attachmentDownloadName,
+            conditionalFormattings,
+        } = options;
+
+        const { resultsStorageClient, exportsStorageClient } = clients;
+
+        // Process fields and generate headers using shared utility
+        const { sortedFieldIds, headers } = processFieldsForExport(fields, {
+            showTableNames,
+            customLabels,
+            columnOrder,
+            hiddenFields,
+        });
+
+        // Create temporary file
+        const tempFilePath = ExcelService.createTempFilePath('direct');
+
+        try {
+            // Step 1: When conditional formatting needs color-range min/max,
+            // scan the results once with a dedicated stream (it is consumed).
+            let minMaxMap: ConditionalFormattingMinMaxMap = {};
+            if (conditionalFormattings?.length) {
+                const scanStream =
+                    await resultsStorageClient.getDownloadStream(
+                        resultsFileName,
+                    );
+                minMaxMap =
+                    await ExcelService.buildConditionalFormattingMinMaxMap({
+                        resultsStream: scanStream,
+                        fields,
+                        conditionalFormattings,
+                    });
+            }
+
+            // Step 2: Get source stream
+            const resultsStream =
+                await resultsStorageClient.getDownloadStream(resultsFileName);
+
+            // Step 3: Stream JSONL data to Excel temp file
+            const { truncated } = await ExcelService.streamJsonlToExcelFile(
+                resultsStream,
+                tempFilePath,
+                headers,
+                fields,
+                onlyRaw,
+                sortedFieldIds,
+                timezone,
+                conditionalFormattings,
+                minMaxMap,
+            );
+
+            // Generate filename with truncated flag
+            const formattedFileName = ExcelService.generateFileId(
+                resultsFileName,
+                truncated,
+            );
+
+            // Step 3: Upload temp file to exports bucket (not results bucket)
+            const fileStream = fs.createReadStream(tempFilePath);
+            const fileUrl = await exportsStorageClient.uploadExcel(
+                fileStream,
+                formattedFileName,
+                attachmentDownloadName
+                    ? `${attachmentDownloadName}.xlsx`
+                    : undefined,
+            );
+
+            return {
+                fileUrl,
+                truncated,
+                s3Key: formattedFileName,
+            };
+        } catch (error) {
+            Logger.error(
+                `Direct Excel export failed: ${getErrorMessage(error)}`,
+            );
+            throw error;
+        } finally {
+            // Always clean up temp file, regardless of success or failure
+            ExcelService.cleanupTempFile(tempFilePath);
+        }
+    }
+}

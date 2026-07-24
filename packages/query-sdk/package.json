@@ -1,0 +1,45 @@
+{
+    "name": "@lightdash/query-sdk",
+    "version": "0.3472.2",
+    "private": false,
+    "type": "module",
+    "description": "SDK for building custom data apps against the Lightdash semantic layer",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/lightdash/lightdash.git"
+    },
+    "sideEffects": false,
+    "files": [
+        "dist"
+    ],
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "scripts": {
+        "build": "tsc6 --project tsconfig.build.json",
+        "build:fast": "tsc --project tsconfig.build.fast.json",
+        "typecheck": "tsc6 --noEmit",
+        "typecheck:fast": "tsc --project tsconfig.fast.json --noEmit",
+        "lint": "eslint src/",
+        "test": "vitest run",
+        "format": "oxfmt ./src --check",
+        "fix-format": "oxfmt ./src",
+        "release": "pnpm publish --no-git-checks --access public"
+    },
+    "peerDependencies": {
+        "react": "^18.x || ^19.x"
+    },
+    "devDependencies": {
+        "@types/react": "19.2.2",
+        "jsdom": "26.1.0",
+        "typescript": "npm:@typescript/typescript6@6.0.1",
+        "typescript-7": "npm:typescript@7.0.1-rc",
+        "vitest": "4.1.6"
+    }
+}

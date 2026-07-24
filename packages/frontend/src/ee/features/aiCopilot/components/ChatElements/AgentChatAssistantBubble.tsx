@@ -1,0 +1,1223 @@
+import {
+    type AiAgentToolName,
+    type AiAgentMessageAssistant,
+    type AiAgentToolCall,
+    type AiMcpServer,
+    isToolEditDbtProjectResult,
+    isToolEditRepoResult,
+    isToolSetupPreviewDeployResult,
+    type ToolEditDbtProjectOutput,
+    type ToolEditRepoOutput,
+} from '@lightdash/common';
+import {
+    ActionIcon,
+    Alert,
+    Box,
+    Button,
+    Code,
+    CopyButton,
+    Group,
+    Paper,
+    Popover,
+    Stack,
+    Text,
+    Textarea,
+    Tooltip,
+} from '@mantine-8/core';
+import { useDisclosure } from '@mantine-8/hooks';
+import {
+    IconBug,
+    IconCheck,
+    IconCopy,
+    IconExclamationCircle,
+    IconMessageX,
+    IconRefresh,
+    IconTerminal2,
+    IconTestPipe,
+    IconThumbDown,
+    IconThumbDownFilled,
+    IconThumbUp,
+    IconThumbUpFilled,
+} from '@tabler/icons-react';
+import { memo, useCallback, useMemo, useState, type FC } from 'react';
+import { Link } from 'react-router';
+import { type CustomRendererProps } from 'streamdown';
+import { AiMarkdown } from '../../../../../components/common/AiMarkdown';
+import MantineIcon from '../../../../../components/common/MantineIcon';
+import {
+    useRetryAiAgentThreadMessageMutation,
+    useUpdatePromptFeedbackMutation,
+} from '../../hooks/useProjectAiAgents';
+import { type StreamPart } from '../../store/aiAgentThreadStreamSlice';
+import { clearArtifact, setArtifact } from '../../store/aiArtifactSlice';
+import {
+    useAiAgentStoreDispatch,
+    useAiAgentStoreSelector,
+} from '../../store/hooks';
+import {
+    useAiAgentThreadMessageStreaming,
+    useAiAgentThreadStreamQuery,
+} from '../../streaming/useAiAgentThreadStreamQuery';
+import styles from './AgentChatAssistantBubble.module.css';
+import AgentChatDebugDrawer from './AgentChatDebugDrawer';
+import { AiArtifactInline } from './AiArtifactInline';
+import { AiArtifactButton } from './ArtifactButton/AiArtifactButton';
+import { ContentLink, type SqlRunnerLinkState } from './ContentLink';
+import { MessageModelIndicator } from './MessageModelIndicator';
+import { rehypeAiAgentContentLinks } from './rehypeContentLinks';
+import { AiEditDbtProjectToolCall } from './ToolCalls/AiEditDbtProjectToolCall';
+import { AiEditRepoToolCall } from './ToolCalls/AiEditRepoToolCall';
+import { ImproveContextToolCall } from './ToolCalls/ImproveContextToolCall';
+import {
+    LiveActivityCard,
+    ReasoningHistoryRow,
+    type LiveActivityToolGroup,
+} from './ToolCalls/LiveActivityCard';
+import { toReasoningTexts } from './ToolCalls/reasoningHelpers';
+import { SqlApprovalCard } from './ToolCalls/SqlApprovalCard';
+import {
+    appendToolCallToActivityGroup,
+    canAppendToolCallToActivityGroup,
+    createToolCallActivityGroup,
+    groupToolCallSummaries,
+    type ToolCallActivityGroup,
+} from './ToolCalls/utils/toolCallGrouping';
+import { type ToolCallSummary } from './ToolCalls/utils/types';
+import { TypingDots } from './TypingDots';
+
+type ToolGroup = ToolCallActivityGroup & {
+    kind: 'toolGroup';
+};
+type TextSegment = { kind: 'text'; text: string; idx: number };
+type SqlApprovalSegment = {
+    kind: 'sqlApproval';
+    toolCallId: string;
+    sql: string;
+    limit?: number;
+};
+type StreamSegment = TextSegment | ToolGroup | SqlApprovalSegment;
+
+const HIDDEN_TOOL_NAMES = new Set<AiAgentToolName>([
+    'improveContext',
+    'generateHashes',
+    'generateUuids',
+]);
+
+const segmentStreamParts = (
+    parts: StreamPart[],
+    decidedToolCallIds: string[],
+): StreamSegment[] => {
+    const segments: StreamSegment[] = [];
+    parts.forEach((part, idx) => {
+        if (part.type === 'text') {
+            segments.push({ kind: 'text', text: part.text, idx });
+            return;
+        }
+        if (HIDDEN_TOOL_NAMES.has(part.toolName)) {
+            return;
+        }
+        if (
+            part.toolName === 'runSql' &&
+            !decidedToolCallIds.includes(part.toolCallId)
+        ) {
+            const args = part.toolArgs as { sql: string; limit?: number };
+            segments.push({
+                kind: 'sqlApproval',
+                toolCallId: part.toolCallId,
+                sql: args.sql,
+                limit: args.limit,
+            });
+            return;
+        }
+        const call: ToolCallSummary = {
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            toolArgs: part.toolArgs,
+            toolOutput: part.toolResult ?? undefined,
+            isPreliminary: part.isPreliminary,
+        };
+        const last = segments[segments.length - 1];
+        if (
+            last &&
+            last.kind === 'toolGroup' &&
+            canAppendToolCallToActivityGroup(last, call)
+        ) {
+            appendToolCallToActivityGroup(last, call);
+            return;
+        }
+
+        segments.push({
+            ...createToolCallActivityGroup(call),
+            kind: 'toolGroup',
+        });
+    });
+    return segments;
+};
+
+const groupPersistedToolCalls = (
+    calls: ToolCallSummary[],
+): ToolCallActivityGroup[] => groupToolCallSummaries(calls);
+
+const getPendingPersistedSqlApprovals = (
+    message: AiAgentMessageAssistant,
+): AiAgentToolCall[] => {
+    const resolvedToolCallIds = new Set(
+        message.toolResults.map((result) => result.toolCallId),
+    );
+
+    return message.toolCalls.filter(
+        (toolCall) =>
+            toolCall.toolName === 'runSql' &&
+            !resolvedToolCallIds.has(toolCall.toolCallId),
+    );
+};
+
+const getToolOutputStatus = (toolOutput: unknown) => {
+    const metadata = (toolOutput as { metadata?: unknown } | undefined)
+        ?.metadata;
+
+    if (!metadata || typeof metadata !== 'object' || !('status' in metadata)) {
+        return undefined;
+    }
+
+    const status = (metadata as { status?: unknown }).status;
+    return typeof status === 'string' ? status : undefined;
+};
+
+const getRunSqlTimeoutErrorMessage = (
+    message: AiAgentMessageAssistant,
+): string | null => {
+    const hasRunSqlTimeout = message.toolResults.some(
+        (result) =>
+            result.toolName === 'runSql' &&
+            getToolOutputStatus(result) === 'timeout',
+    );
+
+    return hasRunSqlTimeout
+        ? 'SQL approval timed out before the query could run. Approve the SQL prompt or retry when ready.'
+        : null;
+};
+
+const getRunSqlLinkStateFromArgs = (
+    toolArgs: unknown,
+): SqlRunnerLinkState | null => {
+    if (!toolArgs || typeof toolArgs !== 'object' || !('sql' in toolArgs)) {
+        return null;
+    }
+
+    const { sql, limit } = toolArgs as { sql?: unknown; limit?: unknown };
+
+    if (typeof sql !== 'string') {
+        return null;
+    }
+
+    return typeof limit === 'number' ? { sql, limit } : { sql };
+};
+
+const getLatestSuccessfulRunSqlLinkState = ({
+    message,
+    streamParts,
+}: {
+    message: AiAgentMessageAssistant;
+    streamParts?: StreamPart[];
+}): SqlRunnerLinkState | null => {
+    if (streamParts) {
+        for (let idx = streamParts.length - 1; idx >= 0; idx -= 1) {
+            const part = streamParts[idx];
+
+            if (
+                part.type !== 'toolCall' ||
+                part.toolName !== 'runSql' ||
+                part.isPreliminary === true ||
+                getToolOutputStatus(part.toolResult) !== 'success'
+            ) {
+                continue;
+            }
+
+            const linkState = getRunSqlLinkStateFromArgs(part.toolArgs);
+            if (linkState) return linkState;
+        }
+    }
+
+    const successfulRunSqlToolCallIds = new Set(
+        message.toolResults
+            .filter(
+                (result) =>
+                    result.toolName === 'runSql' &&
+                    getToolOutputStatus(result) === 'success',
+            )
+            .map((result) => result.toolCallId),
+    );
+
+    for (let idx = message.toolCalls.length - 1; idx >= 0; idx -= 1) {
+        const toolCall = message.toolCalls[idx];
+
+        if (
+            toolCall.toolName !== 'runSql' ||
+            !successfulRunSqlToolCallIds.has(toolCall.toolCallId)
+        ) {
+            continue;
+        }
+
+        const linkState = getRunSqlLinkStateFromArgs(toolCall.toolArgs);
+        if (linkState) return linkState;
+    }
+
+    return null;
+};
+
+const SqlMarkdownCodeBlock: FC<
+    CustomRendererProps & { projectUuid: string; canOpenSqlRunner: boolean }
+> = ({ code, isIncomplete, projectUuid, canOpenSqlRunner }) => {
+    const sql = code.trim();
+    const canOpen = canOpenSqlRunner && !isIncomplete && sql.length > 0;
+
+    return (
+        <Box className={styles.sqlMarkdownCodeBlock}>
+            <Group
+                justify="space-between"
+                align="center"
+                gap="xs"
+                className={styles.sqlMarkdownCodeHeader}
+            >
+                <Text size="xs" fw={600} c="dimmed">
+                    SQL
+                </Text>
+                {canOpen ? (
+                    <Button
+                        component={Link}
+                        to={{
+                            pathname: `/projects/${projectUuid}/sql-runner`,
+                        }}
+                        state={{ sql }}
+                        data-content-link="true"
+                        size="compact-xs"
+                        variant="default"
+                        className={styles.sqlRunnerLinkButton}
+                        leftSection={
+                            <MantineIcon icon={IconTerminal2} size={12} />
+                        }
+                    >
+                        Open in SQL Runner
+                    </Button>
+                ) : null}
+            </Group>
+            <Code block className={styles.sqlMarkdownCodeBody}>
+                {code}
+            </Code>
+        </Box>
+    );
+};
+
+const AssistantBubbleContent: FC<{
+    message: AiAgentMessageAssistant;
+    projectUuid: string;
+    agentUuid: string;
+    isLastMessage: boolean;
+    mcpServers?: AiMcpServer[];
+    onDashboardLinkClick?: (url: string) => void;
+}> = ({
+    message,
+    projectUuid,
+    agentUuid,
+    isLastMessage,
+    mcpServers,
+    onDashboardLinkClick,
+}) => {
+    const threadStreamingState = useAiAgentThreadStreamQuery(
+        message.threadUuid,
+    );
+    // The thread-level streaming state is shared across all messages on the
+    // thread. We must only use it for *this* message's bubble — otherwise the
+    // previous bubble would mirror the next prompt's parts.
+    const streamingState =
+        threadStreamingState?.messageUuid === message.uuid
+            ? threadStreamingState
+            : null;
+    const isStreaming = useAiAgentThreadMessageStreaming(
+        message.threadUuid,
+        message.uuid,
+    );
+    const { mutate: handleRetry } = useRetryAiAgentThreadMessageMutation();
+
+    const isPending = message.status === 'pending';
+    const hasError = message.status === 'error';
+    const streamingError = streamingState?.error;
+    const runSqlTimeoutErrorMessage = getRunSqlTimeoutErrorMessage(message);
+    const displayErrorMessage =
+        runSqlTimeoutErrorMessage ||
+        streamingError ||
+        message.errorMessage ||
+        'Failed to generate response. Please try again.';
+    const displayErrorTitle = runSqlTimeoutErrorMessage
+        ? 'SQL approval timed out'
+        : 'Something went wrong';
+    const sqlRunnerLinkState = getLatestSuccessfulRunSqlLinkState({
+        message,
+        streamParts: streamingState?.parts,
+    });
+    const canOpenSqlRunner = !!sqlRunnerLinkState;
+    const markdownPlugins = useMemo(
+        () => ({
+            renderers: [
+                {
+                    language: ['sql', 'postgresql', 'bigquery', 'snowflake'],
+                    component: (props: CustomRendererProps) => (
+                        <SqlMarkdownCodeBlock
+                            {...props}
+                            projectUuid={projectUuid}
+                            canOpenSqlRunner={canOpenSqlRunner}
+                        />
+                    ),
+                },
+            ],
+        }),
+        [canOpenSqlRunner, projectUuid],
+    );
+    // After streaming ends there's a brief window where the client has
+    // refetched the thread but the persisted message.message hasn't landed
+    // yet. The streamed content stays in redux keyed to this message, so we
+    // keep it as a fallback to avoid flashing an empty bubble (and a spurious
+    // "No response" notice) until the persisted text arrives.
+    const streamedContent = streamingState?.content ?? '';
+    const hasNoResponse =
+        !isStreaming &&
+        !streamingError &&
+        !message.message &&
+        !streamedContent &&
+        !isPending &&
+        !message.interrupted;
+    const shouldShowRetry = hasError || hasNoResponse || !!streamingError;
+
+    const isBenignEmptyResponse = hasNoResponse && !hasError && !streamingError;
+    const noticeTitle = isBenignEmptyResponse
+        ? 'No response'
+        : displayErrorTitle;
+    const noticeMessage = isBenignEmptyResponse
+        ? 'The agent finished without a response. You can try again.'
+        : displayErrorMessage;
+
+    const baseMessageContent =
+        isStreaming && streamingState
+            ? streamingState.content
+            : message.message || streamedContent;
+
+    const referencedArtifactsMarkdown =
+        !isStreaming &&
+        !isPending &&
+        message.referencedArtifacts &&
+        message.referencedArtifacts.length > 0
+            ? `\n\nReferenced answers: ${message.referencedArtifacts
+                  .map(
+                      (artifact) =>
+                          `[${artifact.title}](#artifact-link#artifact-uuid-${artifact.artifactUuid}#version-uuid-${artifact.versionUuid}#artifact-type-${artifact.artifactType})`,
+                  )
+                  .join(', ')}`
+            : '';
+
+    const messageContent = baseMessageContent + referencedArtifactsMarkdown;
+
+    // Writeback PR card metadata. The editDbtProject tool result instructs
+    // the LLM not to print the PR URL inline (we surface it via a dedicated
+    // button instead), so we have to source it from the tool result ourselves.
+    //   - Persisted view: pull it from message.toolResults via the existing
+    //     isToolEditDbtProjectResult type predicate.
+    //   - Live streaming: pull it from streamingState.parts. The streaming
+    //     slice mirrors AI SDK output-available chunks into each part's
+    //     toolResult, which is the full tool return shape {result,metadata}.
+    //     We re-shape to the structured `metadata` the card expects.
+    const editDbtProjectResult: {
+        metadata: ToolEditDbtProjectOutput['metadata'];
+        // setupPreviewDeploy reuses this card but its PR only adds the preview
+        // workflow — it never previews itself, so the card hides the preview
+        // affordance when this is true.
+        isPreviewDeploySetup: boolean;
+    } | null = (() => {
+        // setupPreviewDeploy shares editDbtProject's output shape and the
+        // same PR-button card, so resolve either tool's result here.
+        const writebackResult = message.toolResults.find(
+            isToolEditDbtProjectResult,
+        );
+        if (writebackResult)
+            return {
+                metadata: writebackResult.metadata,
+                isPreviewDeploySetup: false,
+            };
+        const setupResult = message.toolResults.find(
+            isToolSetupPreviewDeployResult,
+        );
+        if (setupResult)
+            return {
+                metadata: setupResult.metadata,
+                isPreviewDeploySetup: true,
+            };
+
+        const livePart = streamingState?.parts.find(
+            (p): p is Extract<StreamPart, { type: 'toolCall' }> =>
+                p.type === 'toolCall' &&
+                (p.toolName === 'editDbtProject' ||
+                    p.toolName === 'setupPreviewDeploy') &&
+                p.toolResult !== null &&
+                p.isPreliminary !== true,
+        );
+        const liveOutput = livePart?.toolResult as
+            | ToolEditDbtProjectOutput
+            | undefined;
+        if (!liveOutput?.metadata) return null;
+        return {
+            metadata: liveOutput.metadata,
+            isPreviewDeploySetup: livePart?.toolName === 'setupPreviewDeploy',
+        };
+    })();
+
+    // General coding-agent (editRepo) PR card metadata — resolved the same way
+    // as editDbtProject (persisted result, then live streaming part), but kept
+    // separate since it has no preview / post-merge migration.
+    const editRepoMetadata: ToolEditRepoOutput['metadata'] | null = (() => {
+        const persisted = message.toolResults.find(isToolEditRepoResult);
+        if (persisted) return persisted.metadata;
+        const livePart = streamingState?.parts.find(
+            (p): p is Extract<StreamPart, { type: 'toolCall' }> =>
+                p.type === 'toolCall' &&
+                p.toolName === 'editRepo' &&
+                p.toolResult !== null &&
+                p.isPreliminary !== true,
+        );
+        const liveOutput = livePart?.toolResult as
+            | ToolEditRepoOutput
+            | undefined;
+        return liveOutput?.metadata ?? null;
+    })();
+
+    return (
+        <>
+            {shouldShowRetry && (
+                <Paper
+                    variant="dotted"
+                    radius="md"
+                    pr="md"
+                    shadow="none"
+                    bg="ldGray.0"
+                >
+                    <Group gap="xs" align="center" justify="space-between">
+                        <Alert
+                            icon={
+                                <MantineIcon
+                                    icon={IconExclamationCircle}
+                                    color="gray"
+                                    size="md"
+                                />
+                            }
+                            color="ldGray.0"
+                            variant="outline"
+                            radius="md"
+                            w="80%"
+                        >
+                            <Stack gap={4}>
+                                <Text size="sm" fw={500} c="dimmed">
+                                    {noticeTitle}
+                                </Text>
+                                <Text size="xs" c="dimmed">
+                                    {noticeMessage}
+                                </Text>
+                            </Stack>
+                        </Alert>
+                        {/* Retry re-runs the thread's latest prompt, so only
+                            offer it on the message it would actually re-run */}
+                        {isLastMessage && (
+                            <Button
+                                size="xs"
+                                variant="default"
+                                color="ldDark.5"
+                                leftSection={
+                                    <MantineIcon
+                                        icon={IconRefresh}
+                                        size="sm"
+                                        color="ldGray.7"
+                                    />
+                                }
+                                onClick={() =>
+                                    handleRetry({
+                                        projectUuid,
+                                        agentUuid,
+                                        threadUuid: message.threadUuid,
+                                        messageUuid: message.uuid,
+                                    })
+                                }
+                            >
+                                Try again
+                            </Button>
+                        )}
+                    </Group>
+                </Paper>
+            )}
+
+            {/* Reasoning lives inside the LiveActivityCard at all times, so
+             *  there is one unified bento for the agent's process. */}
+            {(() => {
+                const segments = streamingState?.parts
+                    ? segmentStreamParts(
+                          streamingState.parts,
+                          streamingState.decidedToolCallIds,
+                      )
+                    : [];
+
+                if (segments.length > 0) {
+                    // Tool segments are extracted into a single LiveActivityCard
+                    // pinned below the texts. Texts keep their interleaved order
+                    // with intermediates collapsed; the latest text stays open.
+                    const liveToolGroups: LiveActivityToolGroup[] = segments
+                        .filter(
+                            (
+                                s,
+                            ): s is Extract<typeof s, { kind: 'toolGroup' }> =>
+                                s.kind === 'toolGroup',
+                        )
+                        .map((s) => ({
+                            toolName: s.toolName,
+                            calls: s.calls,
+                            keyId: s.keyId,
+                            display: s.display,
+                        }));
+                    const sqlApprovals = segments.filter(
+                        (s): s is Extract<typeof s, { kind: 'sqlApproval' }> =>
+                            s.kind === 'sqlApproval',
+                    );
+                    const textSegments = segments.filter(
+                        (s): s is Extract<typeof s, { kind: 'text' }> =>
+                            s.kind === 'text',
+                    );
+                    const latestTextSeg = textSegments[textSegments.length - 1];
+                    // bridges the gap between artifact landing and closing text.
+                    const showFinishingUp =
+                        isStreaming &&
+                        !!message.artifacts?.length &&
+                        segments[segments.length - 1]?.kind !== 'text';
+                    const finalAnswerMd = latestTextSeg ? (
+                        <AiMarkdown
+                            isStreaming={isStreaming}
+                            className={
+                                isStreaming
+                                    ? styles.streamingNarration
+                                    : undefined
+                            }
+                            rehypePlugins={[rehypeAiAgentContentLinks]}
+                            plugins={markdownPlugins}
+                            components={{
+                                a: ({ node, children, ...props }) => {
+                                    const contentType =
+                                        'data-content-type' in props &&
+                                        typeof props['data-content-type'] ===
+                                            'string'
+                                            ? props['data-content-type']
+                                            : undefined;
+                                    return (
+                                        <ContentLink
+                                            contentType={contentType}
+                                            props={props}
+                                            message={message}
+                                            projectUuid={projectUuid}
+                                            agentUuid={agentUuid}
+                                            sqlRunnerLinkState={
+                                                sqlRunnerLinkState
+                                            }
+                                            onDashboardLinkClick={
+                                                onDashboardLinkClick
+                                            }
+                                        >
+                                            {children}
+                                        </ContentLink>
+                                    );
+                                },
+                            }}
+                        >
+                            {latestTextSeg.text}
+                        </AiMarkdown>
+                    ) : null;
+                    const pendingApprovalContent =
+                        sqlApprovals.length > 0 ? (
+                            <Stack gap={6}>
+                                {sqlApprovals.map((seg) => (
+                                    <SqlApprovalCard
+                                        key={seg.toolCallId}
+                                        projectUuid={projectUuid}
+                                        agentUuid={agentUuid}
+                                        threadUuid={message.threadUuid}
+                                        toolCallId={seg.toolCallId}
+                                        toolArgs={{
+                                            sql: seg.sql,
+                                            limit: seg.limit,
+                                        }}
+                                    />
+                                ))}
+                            </Stack>
+                        ) : null;
+                    return (
+                        <Stack gap={4} pt="xs">
+                            {/* Activity card sits ABOVE the rolling preview /
+                             *  final answer so tool work reads top-to-bottom:
+                             *  what was done → the answer. After streaming we
+                             *  fold reasoning into the activity card so the
+                             *  answer remains the focal point. SQL approvals
+                             *  drop into the card's body, auto-expanded. */}
+                            {(() => {
+                                const reasoningTexts = toReasoningTexts(
+                                    !isStreaming
+                                        ? message.reasoning
+                                        : undefined,
+                                    isStreaming
+                                        ? streamingState?.reasoning
+                                        : undefined,
+                                );
+                                return reasoningTexts.length > 0 ? (
+                                    <ReasoningHistoryRow
+                                        texts={reasoningTexts}
+                                        isLive={isStreaming}
+                                    />
+                                ) : null;
+                            })()}
+                            {(liveToolGroups.length > 0 ||
+                                pendingApprovalContent) && (
+                                <LiveActivityCard
+                                    toolGroups={liveToolGroups}
+                                    isLive={isStreaming}
+                                    toolResults={message.toolResults}
+                                    toolCalls={message.toolCalls}
+                                    mcpServers={mcpServers}
+                                    pendingContent={pendingApprovalContent}
+                                    stepProgressMessages={
+                                        streamingState?.stepProgressMessages ??
+                                        []
+                                    }
+                                />
+                            )}
+                            {latestTextSeg ? (
+                                <Box className={styles.streamPart}>
+                                    {finalAnswerMd}
+                                </Box>
+                            ) : null}
+                            {/* Progress events ("Starting sandbox", "Cloning
+                                project", …) render inside the
+                                LiveActivityCard above as nested steps under
+                                the active tool — see renderInlineLiveStepProgress
+                                in that component. Here we just keep the
+                                "Finishing up" pulse for the brief gap
+                                between an artifact landing and the closing
+                                text. */}
+                            {showFinishingUp && (
+                                <Box className={styles.streamPart} pl={7}>
+                                    <TypingDots label="Finishing up" />
+                                </Box>
+                            )}
+                        </Stack>
+                    );
+                }
+
+                // Fallback (page reload, no streamingState): activity card ON
+                // TOP showing what the agent did + reasoning folded in, then
+                // the final markdown answer below as the hero.
+                const renderableToolCalls = message.toolCalls.filter(
+                    (tc) =>
+                        !HIDDEN_TOOL_NAMES.has(tc.toolName) &&
+                        // Subagent children render nested under their parent's row, not as top-level siblings.
+                        tc.parentToolCallId === null,
+                );
+                const persistedToolGroups: LiveActivityToolGroup[] =
+                    groupPersistedToolCalls(renderableToolCalls);
+                const persistedSqlApprovals =
+                    getPendingPersistedSqlApprovals(message);
+                const pendingApprovalContent =
+                    persistedSqlApprovals.length > 0 ? (
+                        <Stack gap={6}>
+                            {persistedSqlApprovals.map((toolCall) => (
+                                <SqlApprovalCard
+                                    key={toolCall.toolCallId}
+                                    projectUuid={projectUuid}
+                                    agentUuid={agentUuid}
+                                    threadUuid={message.threadUuid}
+                                    toolCallId={toolCall.toolCallId}
+                                    toolArgs={
+                                        toolCall.toolArgs as {
+                                            sql: string;
+                                            limit?: number;
+                                        }
+                                    }
+                                />
+                            ))}
+                        </Stack>
+                    ) : null;
+                return (
+                    <>
+                        <ImproveContextToolCall
+                            projectUuid={projectUuid}
+                            agentUuid={agentUuid}
+                            threadUuid={message.threadUuid}
+                            promptUuid={message.uuid}
+                        />
+                        {persistedToolGroups.length > 0 && (
+                            <LiveActivityCard
+                                toolGroups={persistedToolGroups}
+                                isLive={isStreaming || isPending}
+                                toolResults={message.toolResults}
+                                toolCalls={message.toolCalls}
+                                mcpServers={mcpServers}
+                                pendingContent={pendingApprovalContent}
+                            />
+                        )}
+                        {persistedToolGroups.length === 0 &&
+                            pendingApprovalContent && (
+                                <LiveActivityCard
+                                    toolGroups={[]}
+                                    isLive={isStreaming || isPending}
+                                    toolResults={message.toolResults}
+                                    toolCalls={message.toolCalls}
+                                    mcpServers={mcpServers}
+                                    pendingContent={pendingApprovalContent}
+                                />
+                            )}
+                        {message.reasoning && message.reasoning.length > 0 && (
+                            <ReasoningHistoryRow
+                                texts={toReasoningTexts(
+                                    message.reasoning,
+                                    undefined,
+                                )}
+                                isLive={false}
+                            />
+                        )}
+                        {messageContent.length > 0 ? (
+                            <AiMarkdown
+                                className={styles.persistedAnswer}
+                                rehypePlugins={[rehypeAiAgentContentLinks]}
+                                plugins={markdownPlugins}
+                                components={{
+                                    a: ({ node, children, ...props }) => {
+                                        const contentType =
+                                            'data-content-type' in props &&
+                                            typeof props[
+                                                'data-content-type'
+                                            ] === 'string'
+                                                ? props['data-content-type']
+                                                : undefined;
+
+                                        return (
+                                            <ContentLink
+                                                contentType={contentType}
+                                                props={props}
+                                                message={message}
+                                                projectUuid={projectUuid}
+                                                agentUuid={agentUuid}
+                                                sqlRunnerLinkState={
+                                                    sqlRunnerLinkState
+                                                }
+                                                onDashboardLinkClick={
+                                                    onDashboardLinkClick
+                                                }
+                                            >
+                                                {children}
+                                            </ContentLink>
+                                        );
+                                    },
+                                }}
+                            >
+                                {messageContent}
+                            </AiMarkdown>
+                        ) : null}
+                    </>
+                );
+            })()}
+            {/* TypingDots fill the gap until the first visible output lands —
+             *  any tool call or text part. Reasoning alone doesn't count: it
+             *  collapses by default and would otherwise leave the bubble silent.
+             *  Once a part exists, the bento + rolling preview take over. The
+             *  optional label shows in-flight progress (e.g. "Starting
+             *  sandbox…") so this gap isn't silent for long-setup tools. */}
+            {(isStreaming || (isPending && !streamingError)) &&
+                (streamingState?.parts?.length ?? 0) === 0 && (
+                    <Box className={styles.streamPart} pl={7}>
+                        <TypingDots />
+                    </Box>
+                )}
+            {editDbtProjectResult && (
+                <AiEditDbtProjectToolCall
+                    metadata={editDbtProjectResult.metadata}
+                    projectUuid={projectUuid}
+                    isPreviewDeploySetup={
+                        editDbtProjectResult.isPreviewDeploySetup
+                    }
+                    agentUuid={agentUuid}
+                    threadUuid={message.threadUuid}
+                />
+            )}
+            {editRepoMetadata && (
+                <AiEditRepoToolCall
+                    metadata={editRepoMetadata}
+                    projectUuid={projectUuid}
+                />
+            )}
+        </>
+    );
+};
+
+type Props = {
+    message: AiAgentMessageAssistant;
+    isLastMessage: boolean;
+    isActive?: boolean;
+    debug?: boolean;
+    projectUuid: string;
+    agentUuid: string;
+    onAddToEvals?: (promptUuid: string) => void;
+    renderArtifactsInline?: boolean;
+    showAddToEvalsButton?: boolean;
+    mcpServers?: AiMcpServer[];
+    onDashboardLinkClick?: (url: string) => void;
+};
+
+export const AssistantBubble: FC<Props> = memo(
+    ({
+        message,
+        isLastMessage,
+        isActive = false,
+        debug = false,
+        projectUuid,
+        agentUuid,
+        onAddToEvals,
+        renderArtifactsInline = false,
+        showAddToEvalsButton = false,
+        mcpServers,
+        onDashboardLinkClick,
+    }) => {
+        const artifact = useAiAgentStoreSelector(
+            (state) => state.aiArtifact.artifact,
+        );
+        const dispatch = useAiAgentStoreDispatch();
+
+        if (!projectUuid) throw new Error(`Project Uuid not found`);
+        if (!agentUuid) throw new Error(`Agent Uuid not found`);
+
+        const [isDrawerOpen, { open: openDrawer, close: closeDrawer }] =
+            useDisclosure(debug);
+
+        const updateFeedbackMutation = useUpdatePromptFeedbackMutation(
+            projectUuid,
+            agentUuid,
+            message.threadUuid,
+        );
+
+        const upVoted = message.humanScore === 1;
+        const downVoted = message.humanScore === -1;
+        const hasRating = upVoted || downVoted;
+
+        const [popoverOpened, { open: openPopover, close: closePopover }] =
+            useDisclosure(false);
+        const [feedbackText, setFeedbackText] = useState('');
+
+        const handleUpvote = useCallback(() => {
+            updateFeedbackMutation.mutate({
+                messageUuid: message.uuid,
+                humanScore: upVoted ? 0 : 1,
+            });
+        }, [updateFeedbackMutation, message.uuid, upVoted]);
+
+        const handleDownvote = useCallback(() => {
+            if (downVoted) {
+                updateFeedbackMutation.mutate({
+                    messageUuid: message.uuid,
+                    humanScore: 0,
+                });
+            } else {
+                updateFeedbackMutation.mutate({
+                    messageUuid: message.uuid,
+                    humanScore: -1,
+                });
+                openPopover();
+            }
+        }, [updateFeedbackMutation, message.uuid, downVoted, openPopover]);
+
+        const handleSubmitFeedback = useCallback(() => {
+            if (feedbackText.trim().length !== 0) {
+                updateFeedbackMutation.mutate({
+                    messageUuid: message.uuid,
+                    humanScore: -1,
+                    humanFeedback: feedbackText.trim(),
+                });
+            }
+            closePopover();
+            setFeedbackText('');
+        }, [updateFeedbackMutation, message.uuid, feedbackText, closePopover]);
+
+        const handleCancelFeedback = useCallback(() => {
+            closePopover();
+            setFeedbackText('');
+        }, [closePopover]);
+
+        const isPending = message.status === 'pending';
+        const isLoading =
+            useAiAgentThreadMessageStreaming(
+                message.threadUuid,
+                message.uuid,
+            ) || isPending;
+
+        // status flips to 'idle' only at stream end; artifacts land earlier.
+        const isArtifactAvailable = !!(
+            message.artifacts && message.artifacts.length > 0
+        );
+
+        return (
+            <Stack
+                pos="relative"
+                w="100%"
+                gap="xs"
+                bg={isActive ? 'ldGray.0' : 'transparent'}
+                style={{
+                    overflow: 'unset',
+                    borderStartStartRadius: '0px',
+                }}
+            >
+                <AssistantBubbleContent
+                    message={message}
+                    projectUuid={projectUuid}
+                    agentUuid={agentUuid}
+                    isLastMessage={isLastMessage}
+                    mcpServers={mcpServers}
+                    onDashboardLinkClick={onDashboardLinkClick}
+                />
+
+                {isArtifactAvailable && projectUuid && agentUuid && (
+                    <Stack gap="xs">
+                        {renderArtifactsInline
+                            ? // Render artifacts inline directly
+                              message.artifacts!.map((messageArtifact) => (
+                                  <AiArtifactInline
+                                      key={`${messageArtifact.artifactUuid}-${messageArtifact.versionUuid}`}
+                                      artifact={messageArtifact}
+                                      message={message}
+                                      projectUuid={projectUuid}
+                                      agentUuid={agentUuid}
+                                  />
+                              ))
+                            : // Render artifact buttons that open modals
+                              message.artifacts!.map((messageArtifact) => (
+                                  <AiArtifactButton
+                                      key={`${messageArtifact.artifactUuid}-${messageArtifact.versionUuid}`}
+                                      onClick={() => {
+                                          const isThisArtifactOpen =
+                                              artifact?.artifactUuid ===
+                                                  messageArtifact.artifactUuid &&
+                                              artifact?.versionUuid ===
+                                                  messageArtifact.versionUuid;
+                                          if (isThisArtifactOpen) {
+                                              dispatch(clearArtifact());
+                                              return;
+                                          }
+                                          dispatch(
+                                              setArtifact({
+                                                  artifactUuid:
+                                                      messageArtifact.artifactUuid,
+                                                  versionUuid:
+                                                      messageArtifact.versionUuid,
+                                                  messageUuid: message.uuid,
+                                                  threadUuid:
+                                                      message.threadUuid,
+                                                  projectUuid: projectUuid,
+                                                  agentUuid: agentUuid,
+                                              }),
+                                          );
+                                      }}
+                                      isArtifactOpen={
+                                          artifact?.artifactUuid ===
+                                              messageArtifact.artifactUuid &&
+                                          artifact?.versionUuid ===
+                                              messageArtifact.versionUuid
+                                      }
+                                      artifact={messageArtifact}
+                                  />
+                              ))}
+                    </Stack>
+                )}
+                {!popoverOpened && downVoted && message.humanFeedback && (
+                    <Paper p="xs" mt="xs" radius="md" withBorder>
+                        <Stack gap="xs">
+                            <Group gap="xs">
+                                <MantineIcon
+                                    icon={IconMessageX}
+                                    size={16}
+                                    color="ldGray.7"
+                                />
+                                <Text size="xs" c="dimmed" fw={600}>
+                                    User feedback
+                                </Text>
+                            </Group>
+                            <Text size="sm" c="dimmed" fw={500}>
+                                {message.humanFeedback}
+                            </Text>
+                        </Stack>
+                    </Paper>
+                )}
+                {isLoading ? null : (
+                    <Group gap={0}>
+                        <CopyButton value={message.message ?? ''}>
+                            {({ copied, copy }) => (
+                                <ActionIcon
+                                    variant="subtle"
+                                    color="ldGray.9"
+                                    aria-label="copy"
+                                    onClick={copy}
+                                >
+                                    <MantineIcon
+                                        icon={copied ? IconCheck : IconCopy}
+                                    />
+                                </ActionIcon>
+                            )}
+                        </CopyButton>
+
+                        {(!hasRating || upVoted) && (
+                            <ActionIcon
+                                variant="subtle"
+                                color="ldGray.9"
+                                aria-label="upvote"
+                                onClick={handleUpvote}
+                            >
+                                <Tooltip
+                                    label="Feedback sent"
+                                    position="top"
+                                    withinPortal
+                                    withArrow
+                                    // Hack to only render tooltip (on hover) when `hasRating` is false
+                                    opened={hasRating ? undefined : false}
+                                >
+                                    <MantineIcon
+                                        icon={
+                                            upVoted
+                                                ? IconThumbUpFilled
+                                                : IconThumbUp
+                                        }
+                                    />
+                                </Tooltip>
+                            </ActionIcon>
+                        )}
+
+                        {(!hasRating || downVoted) && (
+                            <Popover
+                                width={500}
+                                position="top-start"
+                                trapFocus
+                                opened={popoverOpened}
+                                onChange={() => {
+                                    closePopover();
+                                    setFeedbackText('');
+                                }}
+                                withArrow
+                            >
+                                <Popover.Target>
+                                    <ActionIcon
+                                        variant="subtle"
+                                        color="ldGray.9"
+                                        aria-label="downvote"
+                                        onClick={handleDownvote}
+                                    >
+                                        <MantineIcon
+                                            icon={
+                                                downVoted
+                                                    ? IconThumbDownFilled
+                                                    : IconThumbDown
+                                            }
+                                        />
+                                    </ActionIcon>
+                                </Popover.Target>
+                                <Popover.Dropdown>
+                                    <form
+                                        onSubmit={(e) => {
+                                            e.preventDefault();
+                                            handleSubmitFeedback();
+                                        }}
+                                    >
+                                        <Stack gap="xs">
+                                            <Textarea
+                                                autoFocus
+                                                classNames={{
+                                                    input: styles.feedbackInput,
+                                                }}
+                                                placeholder="Tell us what went wrong, feedback will be added to agent context (optional)"
+                                                value={feedbackText}
+                                                onChange={(e) =>
+                                                    setFeedbackText(
+                                                        e.currentTarget.value,
+                                                    )
+                                                }
+                                                minRows={3}
+                                                maxRows={5}
+                                                radius="md"
+                                                resize="vertical"
+                                            />
+                                            <Group gap="xs">
+                                                <Button
+                                                    type="submit"
+                                                    size="xs"
+                                                    color="ldDark.5"
+                                                >
+                                                    Submit
+                                                </Button>
+                                                <Button
+                                                    type="button"
+                                                    size="xs"
+                                                    variant="subtle"
+                                                    onClick={
+                                                        handleCancelFeedback
+                                                    }
+                                                >
+                                                    Cancel
+                                                </Button>
+                                            </Group>
+                                        </Stack>
+                                    </form>
+                                </Popover.Dropdown>
+                            </Popover>
+                        )}
+
+                        {showAddToEvalsButton && onAddToEvals && (
+                            <Tooltip label="Add this response to evals">
+                                <ActionIcon
+                                    variant="subtle"
+                                    color="ldGray.9"
+                                    aria-label="Add to evaluation set"
+                                    onClick={() => onAddToEvals(message.uuid)}
+                                >
+                                    <MantineIcon icon={IconTestPipe} />
+                                </ActionIcon>
+                            </Tooltip>
+                        )}
+
+                        {isArtifactAvailable && (
+                            <ActionIcon
+                                variant="subtle"
+                                color="ldGray.9"
+                                aria-label="Debug information"
+                                onClick={openDrawer}
+                            >
+                                <MantineIcon icon={IconBug} />
+                            </ActionIcon>
+                        )}
+
+                        <MessageModelIndicator
+                            projectUuid={projectUuid}
+                            agentUuid={agentUuid}
+                            modelConfig={message.modelConfig}
+                            totalTokens={message.tokenUsage?.totalTokens}
+                        />
+                    </Group>
+                )}
+
+                <AgentChatDebugDrawer
+                    agentUuid={agentUuid}
+                    projectUuid={projectUuid}
+                    artifacts={message.artifacts}
+                    toolCalls={message.toolCalls}
+                    toolResults={message.toolResults}
+                    isVisualizationAvailable={isArtifactAvailable}
+                    isDrawerOpen={isDrawerOpen}
+                    onClose={closeDrawer}
+                />
+            </Stack>
+        );
+    },
+);

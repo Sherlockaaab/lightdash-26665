@@ -1,0 +1,3896 @@
+import { GetRoleCredentialsCommand, SSOClient } from '@aws-sdk/client-sso';
+import {
+    CreateTokenCommand,
+    RegisterClientCommand,
+    SSOOIDCClient,
+    StartDeviceAuthorizationCommand,
+} from '@aws-sdk/client-sso-oidc';
+import { subject } from '@casl/ability';
+import {
+    ActivateUser,
+    AnyType,
+    ArgumentsOf,
+    assertUnreachable,
+    AuthorizationError,
+    BigqueryAuthenticationType,
+    CompleteUserArgs,
+    CreateInviteLink,
+    CreatePasswordResetLink,
+    CreateUserArgs,
+    DatabricksAuthenticationType,
+    DeactivatedAccountError,
+    DeleteOpenIdentity,
+    EmailStatus,
+    EmailStatusExpiring,
+    ExpiredError,
+    FeatureFlags,
+    ForbiddenError,
+    getEmailDomain,
+    getUserAvatarUrl,
+    hasInviteCode,
+    hasProperty,
+    InviteLink,
+    InviteLinkPurpose,
+    isOpenIdIdentityIssuerType,
+    isOpenIdUser,
+    isUserAvatarColorValue,
+    isUserWithOrg,
+    isValidTimezone,
+    LightdashMode,
+    LightdashUser,
+    LocalIssuerTypes,
+    LoginOptions,
+    LoginOptionTypes,
+    MissingConfigError,
+    NotFoundError,
+    NotImplementedError,
+    OpenIdIdentityIssuerType,
+    OpenIdIdentitySummary,
+    OpenIdUser,
+    OrganizationMemberRole,
+    ParameterError,
+    PasswordReset,
+    ProjectMemberRole,
+    RedshiftAuthenticationType,
+    RedshiftAwsSsoCompleteRequest,
+    RedshiftAwsSsoCompleteResults,
+    RedshiftAwsSsoStartRequest,
+    RedshiftAwsSsoStartResults,
+    RegisterOrActivateUser,
+    resolveEffectiveOrganizationSettings,
+    ServiceAccount,
+    SessionUser,
+    SnowflakeAuthenticationType,
+    SpaceMemberRole,
+    UpdateUserArgs,
+    UpsertUserWarehouseCredentials,
+    UserAllowedOrganization,
+    validateEmail,
+    validateOrganizationEmailDomains,
+    validateOrganizationNameOrThrow,
+    WarehouseTypes,
+    type RegisteredAccount,
+} from '@lightdash/common';
+import { randomInt } from 'crypto';
+import { uniq } from 'lodash';
+import { nanoid } from 'nanoid';
+import refresh from 'passport-oauth2-refresh';
+import {
+    LightdashAnalytics,
+    type OnboardingFlow,
+    type OneTimePasscodeFailureReason,
+    type OneTimePasscodePurpose,
+} from '../analytics/LightdashAnalytics';
+import * as AccountFactory from '../auth/account';
+import EmailClient from '../clients/EmailClient/EmailClient';
+import { LightdashConfig } from '../config/parseConfig';
+import { UserOAuthGrantProvider } from '../database/entities/userOAuthGrants';
+import {
+    createAuditLogEvent,
+    createUnknownAuthActor,
+    type AuditActor,
+    type AuditResource,
+    type AuditStatusType,
+} from '../logging/auditLog';
+import {
+    createActorFromUser,
+    type AuditableUser,
+} from '../logging/caslAuditWrapper';
+import Logger from '../logging/logger';
+import { logAuditEvent } from '../logging/winston';
+import { PersonalAccessTokenModel } from '../models/DashboardModel/PersonalAccessTokenModel';
+import { EmailModel } from '../models/EmailModel';
+import { FeatureFlagModel } from '../models/FeatureFlagModel/FeatureFlagModel';
+import { GroupsModel } from '../models/GroupsModel';
+import { InviteLinkModel } from '../models/InviteLinkModel';
+import { OpenIdIdentityModel } from '../models/OpenIdIdentitiesModel';
+import { OrganizationAllowedEmailDomainsModel } from '../models/OrganizationAllowedEmailDomainsModel';
+import { OrganizationMemberProfileModel } from '../models/OrganizationMemberProfileModel';
+import { OrganizationModel } from '../models/OrganizationModel';
+import { OrganizationSettingsModel } from '../models/OrganizationSettingsModel';
+import { OrganizationSsoModel } from '../models/OrganizationSsoModel';
+import { PasswordResetLinkModel } from '../models/PasswordResetLinkModel';
+import { ProjectModel } from '../models/ProjectModel/ProjectModel';
+import { SessionModel } from '../models/SessionModel';
+import { UserAvatarModel } from '../models/UserAvatarModel';
+import { CreatePasswordlessUserArgs, UserModel } from '../models/UserModel';
+import { UserOAuthGrantsModel } from '../models/UserOAuthGrantsModel';
+import { UserWarehouseCredentialsModel } from '../models/UserWarehouseCredentials/UserWarehouseCredentialsModel';
+import { WarehouseAvailableTablesModel } from '../models/WarehouseAvailableTablesModel/WarehouseAvailableTablesModel';
+import { wrapSentryTransaction } from '../utils';
+import { processAvatarImage } from '../utils/processAvatarImage';
+import { BaseService } from './BaseService';
+import { getOrganizationSettingsInstanceDefaults } from './OrganizationSettingsService/getInstanceDefaults';
+
+const AWS_SSO_DEVICE_GRANT_TYPE =
+    'urn:ietf:params:oauth:grant-type:device_code';
+
+type RedshiftAwsSsoSession = {
+    clientId: string;
+    clientSecret: string;
+    deviceCode: string;
+    region: string;
+    startUrl: string;
+    expiresAt: number;
+};
+
+type UserServiceArguments = {
+    lightdashConfig: LightdashConfig;
+    analytics: LightdashAnalytics;
+    inviteLinkModel: InviteLinkModel;
+    userModel: UserModel;
+    userOAuthGrantsModel: UserOAuthGrantsModel;
+    groupsModel: GroupsModel;
+    sessionModel: SessionModel;
+    emailModel: EmailModel;
+    openIdIdentityModel: OpenIdIdentityModel;
+    passwordResetLinkModel: PasswordResetLinkModel;
+    emailClient: EmailClient;
+    organizationMemberProfileModel: OrganizationMemberProfileModel;
+    organizationModel: OrganizationModel;
+    personalAccessTokenModel: PersonalAccessTokenModel;
+    organizationAllowedEmailDomainsModel: OrganizationAllowedEmailDomainsModel;
+    organizationSsoModel: OrganizationSsoModel;
+    organizationSettingsModel: OrganizationSettingsModel;
+    userWarehouseCredentialsModel: UserWarehouseCredentialsModel;
+    warehouseAvailableTablesModel: WarehouseAvailableTablesModel;
+    projectModel: ProjectModel;
+    featureFlagModel: FeatureFlagModel;
+    userAvatarModel: UserAvatarModel;
+};
+
+function isSameMinute(a: Date | null, b: Date): boolean {
+    if (!a) return false;
+    return Math.floor(a.getTime() / 60000) === Math.floor(b.getTime() / 60000);
+}
+
+export type AuthAuditContext = {
+    ip?: string;
+    userAgent?: string;
+    requestId?: string;
+};
+
+type LoginWithOpenIdOptions = {
+    isLinkFlow?: boolean;
+};
+
+const emitAuthAuditEvent = ({
+    actor,
+    action,
+    resourceType,
+    status,
+    reason,
+    organizationUuid,
+    metadata,
+    context,
+}: {
+    actor: AuditActor;
+    action:
+        | 'login'
+        | 'logout'
+        | 'impersonation_start'
+        | 'impersonation_stop'
+        | 'leave_organization';
+    resourceType:
+        | 'Session'
+        | 'PersonalAccessToken'
+        | 'ServiceAccount'
+        | 'EmbedJwt'
+        | 'User'
+        | 'OrganizationMembership';
+    status: AuditStatusType;
+    reason?: string;
+    organizationUuid?: string;
+    metadata?: Record<string, unknown>;
+    context?: AuthAuditContext;
+}): void => {
+    try {
+        const resource: AuditResource = {
+            type: resourceType,
+            organizationUuid: organizationUuid ?? 'unknown',
+            metadata,
+        };
+        const event = createAuditLogEvent(
+            actor,
+            action,
+            resource,
+            {
+                ip: context?.ip,
+                userAgent: context?.userAgent,
+                requestId: context?.requestId,
+            },
+            status,
+            reason,
+        );
+        logAuditEvent(event);
+    } catch (err) {
+        Logger.warn('Failed to log auth audit event', {
+            error: err instanceof Error ? err.message : String(err),
+            action,
+            resourceType,
+        });
+    }
+};
+
+export class UserService extends BaseService {
+    private readonly lightdashConfig: LightdashConfig;
+
+    private readonly analytics: LightdashAnalytics;
+
+    private readonly inviteLinkModel: InviteLinkModel;
+
+    private readonly userModel: UserModel;
+
+    private readonly userOAuthGrantsModel: UserOAuthGrantsModel;
+
+    private readonly userAvatarModel: UserAvatarModel;
+
+    private readonly groupsModel: GroupsModel;
+
+    private readonly sessionModel: SessionModel;
+
+    private readonly emailModel: EmailModel;
+
+    private readonly openIdIdentityModel: OpenIdIdentityModel;
+
+    private readonly passwordResetLinkModel: PasswordResetLinkModel;
+
+    private readonly emailClient: EmailClient;
+
+    private readonly organizationMemberProfileModel;
+
+    private readonly organizationModel: OrganizationModel;
+
+    private readonly personalAccessTokenModel: PersonalAccessTokenModel;
+
+    private readonly organizationAllowedEmailDomainsModel: OrganizationAllowedEmailDomainsModel;
+
+    private readonly organizationSsoModel: OrganizationSsoModel;
+
+    private readonly organizationSettingsModel: OrganizationSettingsModel;
+
+    private readonly userWarehouseCredentialsModel: UserWarehouseCredentialsModel;
+
+    private readonly warehouseAvailableTablesModel: WarehouseAvailableTablesModel;
+
+    private readonly projectModel: ProjectModel;
+
+    private readonly featureFlagModel: FeatureFlagModel;
+
+    private readonly emailOneTimePasscodeExpirySeconds = 60 * 15;
+
+    private readonly emailOneTimePasscodeMaxAttempts = 5;
+
+    constructor({
+        lightdashConfig,
+        analytics,
+        inviteLinkModel,
+        userModel,
+        userOAuthGrantsModel,
+        groupsModel,
+        sessionModel,
+        emailModel,
+        openIdIdentityModel,
+        emailClient,
+        passwordResetLinkModel,
+        organizationModel,
+        organizationMemberProfileModel,
+        personalAccessTokenModel,
+        organizationAllowedEmailDomainsModel,
+        organizationSsoModel,
+        organizationSettingsModel,
+        userWarehouseCredentialsModel,
+        warehouseAvailableTablesModel,
+        projectModel,
+        featureFlagModel,
+        userAvatarModel,
+    }: UserServiceArguments) {
+        super();
+        this.lightdashConfig = lightdashConfig;
+        this.analytics = analytics;
+        this.inviteLinkModel = inviteLinkModel;
+        this.userModel = userModel;
+        this.userOAuthGrantsModel = userOAuthGrantsModel;
+        this.groupsModel = groupsModel;
+        this.sessionModel = sessionModel;
+        this.emailModel = emailModel;
+        this.openIdIdentityModel = openIdIdentityModel;
+        this.passwordResetLinkModel = passwordResetLinkModel;
+        this.emailClient = emailClient;
+        this.organizationModel = organizationModel;
+        this.organizationMemberProfileModel = organizationMemberProfileModel;
+        this.personalAccessTokenModel = personalAccessTokenModel;
+        this.organizationAllowedEmailDomainsModel =
+            organizationAllowedEmailDomainsModel;
+        this.organizationSsoModel = organizationSsoModel;
+        this.organizationSettingsModel = organizationSettingsModel;
+        this.userWarehouseCredentialsModel = userWarehouseCredentialsModel;
+        this.warehouseAvailableTablesModel = warehouseAvailableTablesModel;
+        this.projectModel = projectModel;
+        this.featureFlagModel = featureFlagModel;
+        this.userAvatarModel = userAvatarModel;
+    }
+
+    private identifyUser(
+        user: LightdashUser & { isMarketingOptedIn?: boolean },
+    ): void {
+        if (this.lightdashConfig.mode === LightdashMode.DEMO) {
+            return;
+        }
+        this.analytics.identify({
+            userId: user.userUuid,
+            traits: user.isTrackingAnonymized
+                ? { is_tracking_anonymized: user.isTrackingAnonymized }
+                : {
+                      email: user.email,
+                      first_name: user.firstName,
+                      last_name: user.lastName,
+                      is_tracking_anonymized: user.isTrackingAnonymized,
+                      is_marketing_opted_in: user.isMarketingOptedIn,
+                  },
+        });
+
+        if (user.organizationUuid) {
+            this.analytics.group({
+                userId: user.userUuid,
+                groupId: user.organizationUuid,
+                traits: {
+                    name: user.organizationName,
+                },
+            });
+        }
+    }
+
+    private async getOnboardingFlow(
+        user?: Pick<LightdashUser, 'userUuid' | 'organizationUuid'>,
+    ): Promise<OnboardingFlow> {
+        const { enabled } = await this.featureFlagModel.get({
+            user,
+            featureFlagId: FeatureFlags.NewOnboarding,
+        });
+        return enabled ? 'new' : 'legacy';
+    }
+
+    private async tryVerifyUserEmail(
+        user: LightdashUser,
+        email: string,
+        method: 'otp' | 'link' | 'sso',
+    ): Promise<void> {
+        const updatedEmails = await this.emailModel.verifyUserEmailIfExists(
+            user.userUuid,
+            email,
+        );
+        if (updatedEmails.length > 0) {
+            const onboardingFlow = await this.getOnboardingFlow(user);
+            this.analytics.track({
+                userId: user.userUuid,
+                event: 'user.verified',
+                properties: {
+                    email,
+                    location: user.isSetupComplete ? 'settings' : 'onboarding',
+                    isTrackingAnonymized: user.isTrackingAnonymized,
+                    method,
+                    onboardingFlow,
+                },
+            });
+            this.analytics.track({
+                userId: user.userUuid,
+                event: 'onboarding.step_completed',
+                properties: {
+                    step: 'verified',
+                    stepIndex: 2,
+                    onboardingFlow,
+                    organizationId: user.organizationUuid,
+                },
+            });
+        }
+    }
+
+    async activateUserFromInvite(
+        inviteCode: string,
+        activateUser: ActivateUser | OpenIdUser,
+    ): Promise<LightdashUser> {
+        const inviteLink = await this.inviteLinkModel.getByCode(inviteCode);
+        return this.activateUserFromInviteLink(inviteLink, activateUser);
+    }
+
+    async activateUserFromInviteWithoutPassword(
+        inviteCode: string,
+    ): Promise<SessionUser> {
+        const inviteLink = await this.getInviteLink(inviteCode);
+        const user = await this.activateUserFromInviteLink(inviteLink);
+        // The invite link was delivered to this address, so opening it proves
+        // mailbox ownership — same trust as OpenID email verification.
+        await this.tryVerifyUserEmail(user, inviteLink.email, 'link');
+        return this.userModel.findSessionUserByUUID(user.userUuid);
+    }
+
+    private async activateUserFromInviteLink(
+        inviteLink: InviteLink,
+        activateUser?: ActivateUser | OpenIdUser,
+    ): Promise<LightdashUser> {
+        const userEmail =
+            activateUser && isOpenIdUser(activateUser)
+                ? activateUser.openId.email
+                : inviteLink.email;
+
+        if (activateUser && isOpenIdUser(activateUser)) {
+            if (
+                (await this.isLoginMethodAllowed(
+                    userEmail,
+                    activateUser.openId.issuerType,
+                )) === false
+            ) {
+                throw new ForbiddenError(
+                    `User with email ${userEmail} is not allowed to login with ${activateUser.openId.issuerType}`,
+                );
+            }
+        } else if (
+            (await this.isLoginMethodAllowed(
+                userEmail,
+                LocalIssuerTypes.EMAIL,
+            )) === false
+        ) {
+            throw new ForbiddenError(
+                `User with email ${userEmail} is not allowed to login with password`,
+            );
+        }
+
+        if (inviteLink.email.toLowerCase() !== userEmail.toLowerCase()) {
+            this.logger.error(
+                `User accepted invite with wrong email ${userEmail} when the invited email was ${inviteLink.email}`,
+            );
+            throw new AuthorizationError(
+                `Provided email ${userEmail} does not match the invited email.`,
+            );
+        }
+        const user = activateUser
+            ? await this.userModel.activateUser(
+                  inviteLink.userUuid,
+                  activateUser,
+              )
+            : await this.userModel.activateUserWithoutPassword(
+                  inviteLink.userUuid,
+              );
+        await this.inviteLinkModel.deleteByCode(inviteLink.inviteCode);
+
+        // Apply default project memberships from allowed email domains config.
+        // Wrapped in try-catch because the user is already activated and the
+        // invite link is deleted — a failure here must not break activation.
+        try {
+            if (
+                user.organizationUuid &&
+                user.role === OrganizationMemberRole.MEMBER
+            ) {
+                const allowedEmailDomains =
+                    await this.organizationAllowedEmailDomainsModel.findAllowedEmailDomains(
+                        user.organizationUuid,
+                    );
+                if (allowedEmailDomains) {
+                    const emailDomain = getEmailDomain(userEmail);
+                    if (
+                        allowedEmailDomains.emailDomains.some(
+                            (domain) => domain.toLowerCase() === emailDomain,
+                        ) &&
+                        allowedEmailDomains.projects.length > 0
+                    ) {
+                        const projectMemberships =
+                            allowedEmailDomains.projects.reduce<
+                                Record<string, ProjectMemberRole>
+                            >(
+                                (acc, project) => ({
+                                    ...acc,
+                                    [project.projectUuid]: project.role,
+                                }),
+                                {},
+                            );
+                        await this.userModel.addProjectMemberships(
+                            user.userUuid,
+                            projectMemberships,
+                        );
+                    }
+                }
+            }
+        } catch (e) {
+            this.logger.warn(
+                `Failed to apply default project memberships for invited user ${user.userUuid}: ${e}`,
+            );
+        }
+
+        this.identifyUser(user);
+        let userConnectionType:
+            | 'email_only'
+            | 'password'
+            | OpenIdIdentityIssuerType;
+        if (!activateUser) {
+            userConnectionType = 'email_only';
+        } else if (isOpenIdUser(activateUser)) {
+            userConnectionType = activateUser.openId.issuerType;
+        } else {
+            userConnectionType = 'password';
+        }
+        const onboardingFlow = await this.getOnboardingFlow(user);
+        this.analytics.track({
+            event: 'user.created',
+            userId: user.userUuid,
+            properties: {
+                context: 'accept_invite',
+                createdUserId: user.userUuid,
+                organizationId: user.organizationUuid,
+                userConnectionType,
+                onboardingFlow,
+                isOrganizationCreator: false,
+            },
+        });
+        this.analytics.track({
+            event: 'user.logged_in',
+            userId: user.userUuid,
+            properties: {
+                loginProvider:
+                    userConnectionType === 'email_only'
+                        ? 'invite_link'
+                        : userConnectionType,
+            },
+        });
+        if (inviteLink.purpose === InviteLinkPurpose.Setup) {
+            this.analytics.track({
+                event: 'setup_invite.accepted',
+                userId: user.userUuid,
+                properties: {
+                    organizationId: inviteLink.organizationUuid,
+                    invitePurpose: InviteLinkPurpose.Setup,
+                    onboardingFlow,
+                },
+            });
+        }
+        if (activateUser && !isOpenIdUser(activateUser)) {
+            await this.sendOneTimePasscodeToPrimaryEmail(
+                user,
+                'signup_verification',
+            );
+        }
+        return user;
+    }
+
+    /**
+     * Destroys a user's sessions, their `users` row (cascading every
+     * user-scoped table — sessions, personal_access_tokens, schedulers,
+     * project_memberships, space_user_access, …), and emits the
+     * `user.deleted` analytics event with the supplied context.
+     *
+     * Shared by the admin-remove path (`delete`) and the self-serve leave
+     * path (`leaveOrganization`); each owns its own authorization + business
+     * rule checks and calls this helper once it has decided the user is
+     * going to be removed.
+     */
+    private async destroyUser({
+        actor,
+        userToDelete,
+        context,
+    }: {
+        actor: SessionUser;
+        userToDelete: NonNullable<
+            Awaited<ReturnType<UserModel['getUserDetailsByUuid']>>
+        >;
+        context: 'delete_self' | 'delete_org_member' | 'leave_organization';
+    }): Promise<void> {
+        await this.sessionModel.deleteAllByUserUuid(userToDelete.userUuid);
+        await this.userModel.delete(userToDelete.userUuid);
+        this.analytics.track({
+            event: 'user.deleted',
+            userId: actor.userUuid,
+            properties: {
+                context,
+                firstName: userToDelete.firstName,
+                lastName: userToDelete.lastName,
+                email: userToDelete.email,
+                organizationId: userToDelete.organizationUuid,
+                deletedUserId: userToDelete.userUuid,
+            },
+        });
+    }
+
+    async delete(user: SessionUser, userUuidToDelete: string): Promise<void> {
+        const auditedAbility = this.createAuditedAbility(user);
+        const userToDelete =
+            await this.userModel.getUserDetailsByUuid(userUuidToDelete);
+        // The user might not have an org yet
+        // This is expected on the "Cancel registration" flow on single org instances.
+        if (userToDelete?.organizationUuid) {
+            // We assume only one org per user
+
+            if (
+                auditedAbility.cannot(
+                    'delete',
+                    subject('OrganizationMemberProfile', {
+                        organizationUuid: userToDelete.organizationUuid,
+                        metadata: { userUuid: userUuidToDelete },
+                    }),
+                )
+            ) {
+                throw new ForbiddenError();
+            }
+
+            // Race condition between check and delete
+            const [admin, ...remainingAdmins] =
+                await this.organizationMemberProfileModel.getOrganizationAdmins(
+                    userToDelete.organizationUuid,
+                );
+            if (
+                remainingAdmins.length === 0 &&
+                admin?.userUuid === userUuidToDelete
+            ) {
+                throw new ForbiddenError(
+                    'Organization must have at least one admin',
+                );
+            }
+        } else if (userToDelete && user.userUuid !== userUuidToDelete) {
+            // There is no org to scope a permission check against, so only
+            // the account owner can remove it (e.g. "Cancel registration").
+            throw new ForbiddenError();
+        }
+
+        if (!userToDelete) {
+            // Pre-org "Cancel registration" path: there is no org-scoped state
+            // to clean up, just remove the row. Fall back to a direct delete.
+            await this.sessionModel.deleteAllByUserUuid(userUuidToDelete);
+            await this.userModel.delete(userUuidToDelete);
+            return;
+        }
+
+        await this.destroyUser({
+            actor: user,
+            userToDelete,
+            context:
+                user.userUuid !== userUuidToDelete
+                    ? 'delete_org_member'
+                    : 'delete_self',
+        });
+    }
+
+    async createPendingUserAndInviteLink(
+        user: SessionUser,
+        createInviteLink: CreateInviteLink,
+    ): Promise<InviteLink> {
+        const auditedAbility = this.createAuditedAbility(user);
+        // We assume users can only have one org
+        const { organizationUuid } = user;
+
+        if (
+            auditedAbility.cannot(
+                'create',
+                subject('InviteLink', { organizationUuid: organizationUuid! }),
+            )
+        ) {
+            throw new ForbiddenError();
+        }
+        const { email, role } = createInviteLink;
+        const purpose = createInviteLink.purpose ?? InviteLinkPurpose.Member;
+        // Same default expiry as the invite modal in the frontend
+        const expiresAt =
+            createInviteLink.expiresAt ??
+            new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+        const inviteCode = nanoid(30);
+        if (organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+
+        const existingUserWithEmail =
+            await this.userModel.findUserByEmail(email);
+        if (existingUserWithEmail && existingUserWithEmail.organizationUuid) {
+            if (existingUserWithEmail.organizationUuid !== organizationUuid) {
+                throw new ParameterError(
+                    'Email is already used by a user in another organization. Ask them to leave their organisation before inviting them.',
+                );
+            } else if (!existingUserWithEmail.isPending) {
+                throw new ParameterError(
+                    'Email is already used by a user in your organization',
+                );
+            }
+        }
+
+        let userUuid: string;
+        const canGrantRoles = auditedAbility.can(
+            'manage',
+            subject('OrganizationMemberProfile', { organizationUuid }),
+        );
+        let userRole: OrganizationMemberRole;
+        switch (purpose) {
+            case InviteLinkPurpose.Member:
+                userRole = canGrantRoles
+                    ? role || OrganizationMemberRole.MEMBER
+                    : OrganizationMemberRole.MEMBER;
+                break;
+            case InviteLinkPurpose.Setup:
+                if (!canGrantRoles) {
+                    throw new ForbiddenError(
+                        'A setup invite requires permission to grant the admin role',
+                    );
+                }
+                userRole = OrganizationMemberRole.ADMIN;
+                break;
+            default:
+                return assertUnreachable(
+                    purpose,
+                    `Unknown invite link purpose: ${purpose}`,
+                );
+        }
+        if (!existingUserWithEmail) {
+            const onboardingFlow = await this.getOnboardingFlow(user);
+            const pendingUser = await this.userModel.createPendingUser(
+                organizationUuid,
+                {
+                    email,
+                    firstName: '',
+                    lastName: '',
+                    role: userRole,
+                },
+                true,
+                onboardingFlow === 'new' ? false : undefined,
+            );
+            userUuid = pendingUser.userUuid;
+        } else {
+            userUuid = existingUserWithEmail.userUuid;
+        }
+
+        if (existingUserWithEmail && !existingUserWithEmail?.organizationUuid) {
+            Logger.warn(
+                `User with email ${email} already exists but has no org, so we invite them to join`,
+            );
+            await this.userModel.joinOrg(
+                existingUserWithEmail.userUuid,
+                organizationUuid,
+                userRole,
+                undefined,
+            );
+        } else if (
+            existingUserWithEmail &&
+            purpose === InviteLinkPurpose.Setup
+        ) {
+            await this.organizationMemberProfileModel.updateOrganizationMember(
+                organizationUuid,
+                existingUserWithEmail.userUuid,
+                { role: OrganizationMemberRole.ADMIN },
+            );
+        }
+
+        const inviteLink = await this.inviteLinkModel.upsert(
+            inviteCode,
+            expiresAt,
+            organizationUuid,
+            userUuid,
+            purpose,
+        );
+        await this.emailClient.sendInviteEmail(user, inviteLink);
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'invite_link.created',
+        });
+
+        const organization = await this.organizationModel.get(organizationUuid);
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'permission.updated',
+            properties: {
+                userId: user.userUuid,
+                userIdUpdated: userUuid,
+                organizationPermissions: userRole,
+                projectPermissions: {
+                    name: organization.name,
+                    userRole,
+                },
+                newUser: existingUserWithEmail === undefined,
+                generatedInvite: true,
+            },
+        });
+
+        return inviteLink;
+    }
+
+    async revokeAllInviteLinks(user: SessionUser) {
+        const auditedAbility = this.createAuditedAbility(user);
+        // We assume users can only have one org
+        const { organizationUuid } = user;
+
+        if (
+            auditedAbility.cannot(
+                'delete',
+                subject('InviteLink', { organizationUuid: organizationUuid! }),
+            )
+        ) {
+            throw new ForbiddenError();
+        }
+        if (organizationUuid === undefined) {
+            throw new NotFoundError('Organization not found');
+        }
+        await this.inviteLinkModel.deleteByOrganization(organizationUuid);
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'invite_link.all_revoked',
+        });
+    }
+
+    /**
+     * @deprecated Group Sync is deprecated. https://github.com/lightdash/lightdash/issues/12430
+     */
+    private async tryAddUserToGroups(
+        ...data: ArgumentsOf<GroupsModel['addUserToGroupsIfExist']>
+    ) {
+        const updatedGroups = await this.groupsModel.addUserToGroupsIfExist(
+            ...data,
+        );
+        if (updatedGroups) {
+            await Promise.all(
+                updatedGroups.map(async (groupUuid) => {
+                    const updatedGroup =
+                        await this.groupsModel.getGroupWithMembers(groupUuid);
+                    this.analytics.track({
+                        event: 'group.updated',
+                        userId: data[0].userUuid,
+                        properties: {
+                            viaSso: true,
+                            organizationId: updatedGroup.organizationUuid,
+                            groupId: updatedGroup.uuid,
+                            name: updatedGroup.name,
+                            countUsersInGroup: updatedGroup.memberUuids.length,
+                            context: 'add_member_via_sso',
+                        },
+                    });
+                }),
+            );
+        }
+    }
+
+    /**
+     * In this method we check if the user is allowed to register in this instance before registerUser happens.
+     * If the instance is a single org, and there are already users and orgs,
+     * and the user's email domain is allowed in the org whitelisted,
+     * we throw a ForbiddenError.
+     * @param inviteCode invite code
+     * @param email email for the user registering
+     */
+    async checkNewUserRegistrationAllowed(
+        inviteCode: string | undefined,
+        email: string,
+    ) {
+        if (
+            inviteCode === undefined &&
+            !this.lightdashConfig.allowMultiOrgs &&
+            (await this.userModel.hasUsers()) &&
+            (await this.organizationModel.hasOrgs()) &&
+            (
+                await this.organizationModel.getAllowedOrgsForDomain(
+                    getEmailDomain(email),
+                )
+            ).length < 1
+        ) {
+            throw new ForbiddenError(
+                `You can't register a new user with email ${email} on this instance. Please contact your organization administrator and ask for an invite`,
+            );
+        }
+    }
+
+    async loginWithOpenId(
+        openIdUser: OpenIdUser,
+        authenticatedUser: SessionUser | undefined,
+        inviteCode: string | undefined,
+        refreshToken?: string,
+        context?: AuthAuditContext,
+        options?: LoginWithOpenIdOptions,
+    ): Promise<SessionUser> {
+        this.logger.info(
+            `Starting loginWithOpenId - Email: ${
+                openIdUser.openId.email
+            }, Issuer: ${
+                openIdUser.openId.issuerType
+            }, Has invite code: ${!!inviteCode}, Is authenticated: ${!!authenticatedUser}`,
+        );
+
+        try {
+            const loggedInUser = await this.loginWithOpenIdInner(
+                openIdUser,
+                authenticatedUser,
+                inviteCode,
+                refreshToken,
+                options,
+            );
+            emitAuthAuditEvent({
+                actor: createActorFromUser(loggedInUser),
+                action: 'login',
+                resourceType: 'Session',
+                status: 'allowed',
+                organizationUuid: loggedInUser.organizationUuid,
+                metadata: { loginProvider: openIdUser.openId.issuerType },
+                context,
+            });
+            return loggedInUser;
+        } catch (e) {
+            emitAuthAuditEvent({
+                actor: createUnknownAuthActor(openIdUser.openId.email),
+                action: 'login',
+                resourceType: 'Session',
+                status: 'denied',
+                reason: e instanceof Error ? e.message : 'OpenID login failure',
+                metadata: {
+                    loginProvider: openIdUser.openId.issuerType,
+                },
+                context,
+            });
+            throw e;
+        }
+    }
+
+    /**
+     * Whether auto-linking a new OIDC identity to an existing user (matched by
+     * a shared OIDC email) is allowed for the target user's org. The per-org
+     * `organization_settings.oidc_linking_enabled` takes priority; when it's
+     * unset (null) we fall back to the instance `AUTH_ENABLE_OIDC_LINKING`.
+     */
+    private async isOidcLinkingEnabledForOrg(
+        organizationUuid: string | undefined,
+    ): Promise<boolean> {
+        const raw = organizationUuid
+            ? await this.organizationSettingsModel.get(organizationUuid)
+            : {};
+        return (
+            resolveEffectiveOrganizationSettings(
+                raw,
+                getOrganizationSettingsInstanceDefaults(this.lightdashConfig),
+            ).oidcLinkingEnabled ?? false
+        );
+    }
+
+    /**
+     * Whether auto-linking an OIDC identity to an existing user matched by
+     * verified primary email is allowed for the target user's org. The per-org
+     * `organization_settings.oidc_to_email_linking_enabled` takes priority;
+     * when unset (null) we fall back to `AUTH_ENABLE_OIDC_TO_EMAIL_LINKING`.
+     */
+    private async isOidcToEmailLinkingEnabledForOrg(
+        organizationUuid: string | undefined,
+    ): Promise<boolean> {
+        const raw = organizationUuid
+            ? await this.organizationSettingsModel.get(organizationUuid)
+            : {};
+        return (
+            resolveEffectiveOrganizationSettings(
+                raw,
+                getOrganizationSettingsInstanceDefaults(this.lightdashConfig),
+            ).oidcToEmailLinkingEnabled ?? false
+        );
+    }
+
+    private async loginWithOpenIdInner(
+        openIdUser: OpenIdUser,
+        authenticatedUser: SessionUser | undefined,
+        inviteCode: string | undefined,
+        refreshToken: string | undefined,
+        options: LoginWithOpenIdOptions | undefined,
+    ): Promise<SessionUser> {
+        if (options?.isLinkFlow && !authenticatedUser) {
+            throw new AuthorizationError(
+                'You must be logged in to connect a Google account',
+            );
+        }
+
+        const openIdSession = await this.userModel.findSessionUserByOpenId(
+            openIdUser.openId.issuer,
+            openIdUser.openId.subject,
+        );
+        this.logger.info(
+            `Existing OpenID session found: ${!!openIdSession}, Is active: ${
+                openIdSession?.isActive
+            }`,
+        );
+
+        if (
+            (await this.isLoginMethodAllowed(
+                openIdUser.openId.email,
+                openIdUser.openId.issuerType,
+            )) === false
+        ) {
+            this.logger.info(
+                `Login method ${openIdUser.openId.issuerType} not allowed for email ${openIdUser.openId.email}`,
+            );
+            throw new ForbiddenError(
+                `User with email ${openIdUser.openId.email} is not allowed to login with ${openIdUser.openId.issuerType}`,
+            );
+        }
+        this.logger.info(
+            `Logging with OpenId email ${openIdUser.openId.email} and groups ${
+                openIdUser.openId.groups
+            }, is authenticated: ${authenticatedUser !== undefined}`,
+        );
+        // Identity already exists. Update the identity attributes and login the user
+        if (openIdSession) {
+            if (
+                options?.isLinkFlow &&
+                openIdSession.userUuid !== authenticatedUser?.userUuid
+            ) {
+                throw new ForbiddenError(
+                    'This Google account is already connected to another Lightdash user',
+                );
+            }
+
+            if (!openIdSession.isActive) {
+                this.logger.info(
+                    `User ${openIdSession.userUuid} account is deactivated`,
+                );
+                throw new DeactivatedAccountError();
+            }
+
+            const organization = this.loginToOrganization(
+                openIdSession?.userUuid,
+                openIdUser.openId.issuerType,
+            );
+            const loginUser: SessionUser = {
+                ...openIdSession,
+                ...organization,
+            };
+
+            if (inviteCode) {
+                const inviteLink =
+                    await this.inviteLinkModel.getByCode(inviteCode);
+                this.logger.info(
+                    `Checking invite code - Invite email: ${inviteLink.email}, User email: ${loginUser.email}`,
+                );
+                if (
+                    loginUser.email &&
+                    inviteLink.email.toLowerCase() !==
+                        loginUser.email.toLowerCase()
+                ) {
+                    this.logger.error(
+                        `User accepted invite with wrong email ${loginUser.email} when the invited email was ${inviteLink.email}`,
+                    );
+                    throw new AuthorizationError(
+                        `Provided email ${loginUser.email} does not match the invited email.`,
+                    );
+                }
+            }
+
+            await this.openIdIdentityModel.updateIdentityByOpenId({
+                ...openIdUser.openId,
+                refreshToken,
+            });
+            await this.tryVerifyUserEmail(
+                loginUser,
+                openIdUser.openId.email,
+                'sso',
+            );
+            this.identifyUser(loginUser);
+            this.analytics.track({
+                userId: loginUser.userUuid,
+                event: 'user.logged_in',
+                properties: {
+                    loginProvider: openIdUser.openId.issuerType,
+                },
+            });
+
+            if (
+                this.lightdashConfig.groups.enabled === true &&
+                this.lightdashConfig.auth.enableGroupSync === true &&
+                Array.isArray(openIdUser.openId.groups) &&
+                openIdUser.openId.groups.length &&
+                loginUser.organizationUuid
+            ) {
+                this.logger.info(
+                    `Syncing groups for user ${
+                        loginUser.userUuid
+                    } - Groups: ${openIdUser.openId.groups.join(', ')}`,
+                );
+                await this.tryAddUserToGroups({
+                    userUuid: loginUser.userUuid,
+                    groups: openIdUser.openId.groups,
+                    organizationUuid: loginUser.organizationUuid,
+                });
+            }
+
+            return loginUser;
+        }
+
+        // Link the new openid identity to an existing user if they already
+        // have another OIDC with the same email. Allowed instance-wide via env
+        // OR per-org via organization_settings — so we resolve the candidate
+        // user first, then check the effective toggle for their org.
+        if (!authenticatedUser) {
+            const identities =
+                await this.openIdIdentityModel.findIdentitiesByEmail(
+                    openIdUser.openId.email,
+                );
+            const identitiesUsers = uniq(
+                identities.map((identity) => identity.userUuid),
+            );
+            this.logger.info(
+                `OIDC account-linking check for ${openIdUser.openId.email} — found ${identities.length} existing identities (linking decided per-org)`,
+            );
+            if (identitiesUsers.length > 1) {
+                this.logger.warn(
+                    `Multiple openid identities found with the same email ${openIdUser.openId.email}`,
+                );
+            } else if (identitiesUsers.length === 1) {
+                const sessionUser = await this.userModel.findSessionUserByUUID(
+                    identitiesUsers[0],
+                );
+
+                if (
+                    await this.isOidcLinkingEnabledForOrg(
+                        sessionUser.organizationUuid,
+                    )
+                ) {
+                    this.logger.info(
+                        `Linking new OpenID identity to existing user ${sessionUser.userUuid}`,
+                    );
+
+                    if (
+                        this.lightdashConfig.groups.enabled === true &&
+                        this.lightdashConfig.auth.enableGroupSync === true &&
+                        Array.isArray(openIdUser.openId.groups) &&
+                        openIdUser.openId.groups.length &&
+                        sessionUser.organizationUuid
+                    ) {
+                        this.logger.info(
+                            `Syncing groups for existing user ${
+                                sessionUser.userUuid
+                            } - Groups: ${openIdUser.openId.groups.join(', ')}`,
+                        );
+                        await this.tryAddUserToGroups({
+                            userUuid: sessionUser.userUuid,
+                            groups: openIdUser.openId.groups,
+                            organizationUuid: sessionUser.organizationUuid,
+                        });
+                    }
+
+                    return this.linkOpenIdIdentityToUser(
+                        sessionUser,
+                        openIdUser,
+                        refreshToken,
+                    );
+                }
+            }
+        }
+
+        // Link the new openid identity to an existing user if they already
+        // have the same verified primary email. Allowed instance-wide via env
+        // OR per-org via organization_settings — resolve the candidate user,
+        // then check the effective toggle for their org.
+        if (!authenticatedUser) {
+            const userWithSameEmail =
+                await this.userModel.findSessionUserByPrimaryEmail(
+                    openIdUser.openId.email,
+                );
+
+            if (
+                userWithSameEmail &&
+                (await this.isOidcToEmailLinkingEnabledForOrg(
+                    userWithSameEmail.organizationUuid,
+                ))
+            ) {
+                const emailStatus = await this.emailModel.getPrimaryEmailStatus(
+                    userWithSameEmail.userUuid,
+                );
+                this.logger.info(
+                    `Email status for user ${userWithSameEmail.userUuid} - Is verified: ${emailStatus.isVerified}`,
+                );
+
+                if (emailStatus.isVerified) {
+                    if (
+                        this.lightdashConfig.groups.enabled === true &&
+                        this.lightdashConfig.auth.enableGroupSync === true &&
+                        Array.isArray(openIdUser.openId.groups) &&
+                        openIdUser.openId.groups.length &&
+                        userWithSameEmail.organizationUuid
+                    ) {
+                        this.logger.info(
+                            `Syncing groups for email-linked user ${
+                                userWithSameEmail.userUuid
+                            } - Groups: ${openIdUser.openId.groups.join(', ')}`,
+                        );
+                        await this.tryAddUserToGroups({
+                            userUuid: userWithSameEmail.userUuid,
+                            groups: openIdUser.openId.groups,
+                            organizationUuid:
+                                userWithSameEmail.organizationUuid,
+                        });
+                    }
+
+                    return this.linkOpenIdIdentityToUser(
+                        userWithSameEmail,
+                        openIdUser,
+                        refreshToken,
+                    );
+                }
+            }
+        }
+
+        // Link openid identity to currently logged in user
+        if (authenticatedUser) {
+            this.logger.info(
+                `Linking OpenID identity to authenticated user ${authenticatedUser.userUuid}`,
+            );
+            if (
+                this.lightdashConfig.groups.enabled === true &&
+                this.lightdashConfig.auth.enableGroupSync === true &&
+                Array.isArray(openIdUser.openId.groups) &&
+                openIdUser.openId.groups.length &&
+                authenticatedUser.organizationUuid
+            ) {
+                this.logger.info(
+                    `Syncing groups for authenticated user ${
+                        authenticatedUser.userUuid
+                    } - Groups: ${openIdUser.openId.groups.join(', ')}`,
+                );
+                await this.tryAddUserToGroups({
+                    userUuid: authenticatedUser.userUuid,
+                    groups: openIdUser.openId.groups,
+                    organizationUuid: authenticatedUser.organizationUuid,
+                });
+            }
+
+            return this.linkOpenIdIdentityToUser(
+                authenticatedUser,
+                openIdUser,
+                refreshToken,
+            );
+        }
+
+        // Create user
+        this.logger.info(
+            `Creating new user with OpenID - Email: ${openIdUser.openId.email}`,
+        );
+        await this.checkNewUserRegistrationAllowed(
+            inviteCode,
+            openIdUser.openId.email,
+        );
+        const createdUser = await this.activateUserWithOpenId(
+            openIdUser,
+            inviteCode,
+        );
+        await this.tryVerifyUserEmail(
+            createdUser,
+            openIdUser.openId.email,
+            'sso',
+        );
+        const allowedOrgs =
+            await this.organizationModel.getAllowedOrgsForDomain(
+                getEmailDomain(openIdUser.openId.email),
+            );
+        this.logger.info(
+            `Found ${
+                allowedOrgs.length
+            } allowed organizations for domain ${getEmailDomain(
+                openIdUser.openId.email,
+            )}`,
+        );
+
+        const hasGroups =
+            this.lightdashConfig.groups.enabled === true &&
+            this.lightdashConfig.auth.enableGroupSync === true &&
+            Array.isArray(openIdUser.openId.groups) &&
+            openIdUser.openId.groups.length;
+        let { organizationUuid } = createdUser;
+        if (
+            !organizationUuid &&
+            !inviteCode &&
+            hasGroups &&
+            allowedOrgs.length === 1
+        ) {
+            organizationUuid = allowedOrgs[0].organizationUuid;
+            this.logger.info(
+                `Automatically joining user '${createdUser.email}' to whitelisted organization ${organizationUuid}`,
+            );
+            await this.joinOrg(createdUser, organizationUuid); // Join automatically the whitelisted org so we can apply groups
+        }
+
+        if (hasGroups && organizationUuid) {
+            this.logger.info(
+                `Syncing groups for new user ${
+                    createdUser.userUuid
+                } - Groups: ${openIdUser.openId.groups!.join(', ')}`,
+            );
+            await this.tryAddUserToGroups({
+                userUuid: createdUser.userUuid,
+                groups: openIdUser.openId.groups!,
+                organizationUuid,
+            });
+        }
+
+        return {
+            ...createdUser,
+            organizationUuid,
+        };
+    }
+
+    private async activateUserWithOpenId(
+        openIdUser: OpenIdUser,
+        inviteCode: string | undefined,
+    ): Promise<SessionUser> {
+        if (inviteCode) {
+            const user = await this.activateUserFromInvite(
+                inviteCode,
+                openIdUser,
+            );
+            return this.userModel.findSessionUserByUUID(user.userUuid);
+        }
+        const user = await this.registerUser(
+            openIdUser,
+            await this.getOnboardingFlow(),
+        );
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'user.logged_in',
+            properties: {
+                loginProvider: openIdUser.openId.issuerType,
+            },
+        });
+        return this.userModel.findSessionUserByUUID(user.userUuid);
+    }
+
+    async linkOpenIdIdentityToUser(
+        sessionUser: SessionUser,
+        openIdUser: OpenIdUser,
+        refreshToken?: string,
+    ): Promise<SessionUser> {
+        await this.openIdIdentityModel.createIdentity({
+            userId: sessionUser.userId,
+            issuer: openIdUser.openId.issuer,
+            subject: openIdUser.openId.subject,
+            email: openIdUser.openId.email,
+            issuerType: openIdUser.openId.issuerType,
+            refreshToken,
+            teamId: openIdUser.openId.teamId,
+        });
+        await this.tryVerifyUserEmail(
+            sessionUser,
+            openIdUser.openId.email,
+            'sso',
+        );
+        this.analytics.track({
+            userId: sessionUser.userUuid,
+            event: 'user.identity_linked',
+            properties: {
+                loginProvider: openIdUser.openId.issuerType,
+            },
+        });
+
+        if (
+            this.lightdashConfig.groups.enabled &&
+            this.lightdashConfig.auth.enableGroupSync &&
+            Array.isArray(openIdUser.openId.groups) &&
+            openIdUser.openId.groups.length &&
+            sessionUser.organizationUuid
+        ) {
+            await this.tryAddUserToGroups({
+                userUuid: sessionUser.userUuid,
+                groups: openIdUser.openId.groups,
+                organizationUuid: sessionUser.organizationUuid,
+            });
+        }
+
+        return sessionUser;
+    }
+
+    async completeUserSetup(
+        user: SessionUser,
+        {
+            organizationName,
+            jobTitle,
+            isTrackingAnonymized,
+            isMarketingOptedIn,
+            enableEmailDomainAccess,
+        }: CompleteUserArgs,
+    ): Promise<LightdashUser> {
+        if (!isUserWithOrg(user)) {
+            throw new ForbiddenError('User is not part of an organization');
+        }
+        const auditedAbility = this.createAuditedAbility(user);
+        if (organizationName) {
+            if (
+                auditedAbility.cannot(
+                    'update',
+                    subject('Organization', {
+                        organizationUuid: user.organizationUuid,
+                    }),
+                )
+            ) {
+                throw new ForbiddenError();
+            }
+
+            validateOrganizationNameOrThrow(organizationName);
+
+            await this.organizationModel.update(user.organizationUuid, {
+                name: organizationName,
+            });
+            this.analytics.track({
+                userId: user.userUuid,
+                event: 'organization.updated',
+                properties: {
+                    type:
+                        this.lightdashConfig.mode === LightdashMode.CLOUD_BETA
+                            ? 'cloud'
+                            : 'self-hosted',
+                    organizationId: user.organizationUuid,
+                    organizationName,
+                    defaultProjectUuid: undefined,
+                    defaultColourPaletteUpdated: false,
+                    defaultProjectUuidUpdated: false,
+                },
+            });
+            if (enableEmailDomainAccess && user.email) {
+                const emailDomain = getEmailDomain(user.email);
+
+                const error = validateOrganizationEmailDomains([emailDomain]);
+                if (error) {
+                    throw new ParameterError(error);
+                }
+                await this.organizationAllowedEmailDomainsModel.upsertAllowedEmailDomains(
+                    {
+                        organizationUuid: user.organizationUuid,
+                        emailDomains: [emailDomain],
+                        role: OrganizationMemberRole.VIEWER,
+                        projects: [],
+                    },
+                );
+            }
+        }
+        const completeUser = await this.userModel.updateUser(
+            user.userUuid,
+            undefined,
+            {
+                isSetupComplete: true,
+                isTrackingAnonymized,
+                isMarketingOptedIn,
+            },
+        );
+
+        this.identifyUser(completeUser);
+        this.analytics.track({
+            event: 'user.updated',
+            userId: completeUser.userUuid,
+            properties: {
+                ...completeUser,
+                updatedUserId: completeUser.userUuid,
+                organizationId: completeUser.organizationUuid,
+                jobTitle,
+                context: 'complete_setup',
+            },
+        });
+        return completeUser;
+    }
+
+    async getLinkedIdentities({
+        userId,
+    }: Pick<SessionUser, 'userId'>): Promise<
+        Record<OpenIdIdentitySummary['issuerType'], OpenIdIdentitySummary[]>
+    > {
+        return this.openIdIdentityModel.getIdentitiesByUserId(userId);
+    }
+
+    async deleteLinkedIdentity(
+        user: SessionUser,
+        openIdentity: DeleteOpenIdentity,
+    ): Promise<void> {
+        const userIdentity = await this.openIdIdentityModel.getIdentity(
+            user.userId,
+            openIdentity.issuer,
+            openIdentity.email,
+        );
+        await this.openIdIdentityModel.deleteIdentity(
+            user.userId,
+            openIdentity.issuer,
+            openIdentity.email,
+        );
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'user.identity_removed',
+            properties: {
+                loginProvider: userIdentity.issuerType,
+            },
+        });
+    }
+
+    async getInviteLink(inviteCode: string): Promise<InviteLink> {
+        const inviteLink = await this.inviteLinkModel.getByCode(inviteCode);
+        const now = new Date();
+        if (inviteLink.expiresAt <= now) {
+            try {
+                await this.inviteLinkModel.deleteByCode(inviteLink.inviteCode);
+            } catch (e) {
+                throw new NotFoundError('Invite link not found');
+            }
+            throw new ExpiredError('Invite link expired');
+        }
+        return inviteLink;
+    }
+
+    async loginWithPassword(
+        email: string,
+        password: string,
+        context?: AuthAuditContext,
+    ): Promise<LightdashUser> {
+        const emitFailure = (reason: string) =>
+            emitAuthAuditEvent({
+                actor: createUnknownAuthActor(email),
+                action: 'login',
+                resourceType: 'Session',
+                status: 'denied',
+                reason,
+                metadata: { loginProvider: 'password' },
+                context,
+            });
+
+        if (
+            (await this.isLoginMethodAllowed(email, LocalIssuerTypes.EMAIL)) ===
+            false
+        ) {
+            emitFailure(
+                `User with email ${email} is not allowed to login with password`,
+            );
+            throw new ForbiddenError(
+                `User with email ${email} is not allowed to login with password`,
+            );
+        }
+
+        try {
+            if (this.lightdashConfig.auth.disablePasswordAuthentication) {
+                throw new ForbiddenError(
+                    'Password credentials are not allowed',
+                );
+            }
+            // TODO: move to authorization service layer
+            // TODO we should probably remove the organization from the model
+            const user = await this.userModel.getUserByPrimaryEmailAndPassword(
+                email,
+                password,
+            );
+            if (!user.isActive) {
+                throw new DeactivatedAccountError();
+            }
+            const userOrganization = this.loginToOrganization(
+                user.userUuid,
+                LocalIssuerTypes.EMAIL,
+            );
+            const userWithOrganization = {
+                ...user,
+                ...userOrganization,
+            };
+            this.identifyUser(userWithOrganization);
+            this.analytics.track({
+                userId: user.userUuid,
+                event: 'user.logged_in',
+                properties: {
+                    loginProvider: 'password',
+                },
+            });
+            emitAuthAuditEvent({
+                actor: createActorFromUser(userWithOrganization),
+                action: 'login',
+                resourceType: 'Session',
+                status: 'allowed',
+                organizationUuid: userWithOrganization.organizationUuid,
+                metadata: { loginProvider: 'password' },
+                context,
+            });
+            return user;
+        } catch (e) {
+            if (e instanceof NotFoundError) {
+                emitFailure('Email and password not recognized');
+                throw new AuthorizationError(
+                    'Email and password not recognized',
+                );
+            }
+            if (e instanceof DeactivatedAccountError) {
+                emitFailure('Account is deactivated');
+            } else if (e instanceof AuthorizationError) {
+                emitFailure('Email and password not recognized');
+            } else if (e instanceof ForbiddenError) {
+                emitFailure('Login not permitted for this account');
+            } else {
+                emitFailure('Login failed');
+            }
+            throw e;
+        }
+    }
+
+    async hasPassword(user: SessionUser): Promise<boolean> {
+        return this.userModel.hasPassword(user.userUuid);
+    }
+
+    async updatePassword(
+        user: SessionUser,
+        data: { password: string; newPassword: string },
+    ): Promise<void> {
+        const hasPassword = await this.userModel.hasPassword(user.userUuid);
+        if (hasPassword) {
+            // confirm old password
+            await this.userModel.getUserByUuidAndPassword(
+                user.userUuid,
+                data.password,
+            );
+            await this.userModel.updatePassword(
+                user.userUuid,
+                data.newPassword,
+            );
+        } else {
+            await this.userModel.createPassword(user.userId, data.newPassword);
+        }
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'password.updated',
+        });
+    }
+
+    async updateUser(
+        user: SessionUser,
+        data: Partial<UpdateUserArgs>,
+    ): Promise<LightdashUser> {
+        const emailChanged = data.email && user.email !== data.email;
+
+        if (data.email !== undefined && !validateEmail(data.email)) {
+            throw new ParameterError(`Invalid email: ${data.email}`);
+        }
+
+        if (
+            data.timezone !== undefined &&
+            data.timezone !== null &&
+            !isValidTimezone(data.timezone)
+        ) {
+            throw new ParameterError(`Invalid timezone: ${data.timezone}`);
+        }
+
+        if (
+            data.avatarGradient !== undefined &&
+            data.avatarGradient !== null &&
+            !isUserAvatarColorValue(data.avatarGradient)
+        ) {
+            throw new ParameterError(
+                `Invalid avatar gradient: ${data.avatarGradient}`,
+            );
+        }
+
+        const updatedUser = await this.userModel.updateUser(
+            user.userUuid,
+            user.email,
+            {
+                firstName: data.firstName,
+                lastName: data.lastName,
+                email: data.email,
+                isMarketingOptedIn: data.isMarketingOptedIn,
+                isTrackingAnonymized: data.isTrackingAnonymized,
+                timezone: data.timezone,
+                avatarGradient: data.avatarGradient,
+            },
+        );
+        this.identifyUser(updatedUser);
+        this.analytics.track({
+            userId: updatedUser.userUuid,
+            event: 'user.updated',
+            properties: {
+                ...updatedUser,
+                updatedUserId: updatedUser.userUuid,
+                organizationId: updatedUser.organizationUuid,
+                context: 'update_self',
+            },
+        });
+
+        if (emailChanged) {
+            await this.sendOneTimePasscodeToPrimaryEmail(
+                updatedUser,
+                'email_change',
+            );
+        }
+
+        return updatedUser;
+    }
+
+    async updateAvatar(
+        user: SessionUser,
+        body: Buffer,
+    ): Promise<{ avatarUrl: string }> {
+        const { image, contentHash } = await processAvatarImage(body);
+        await this.userAvatarModel.upsert(user.userUuid, image, contentHash);
+        this.userModel.invalidateSessionUserCache(user.userUuid);
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'user_avatar.updated',
+            properties: {
+                organizationId: user.organizationUuid,
+            },
+        });
+        return { avatarUrl: getUserAvatarUrl(user.userUuid, contentHash) };
+    }
+
+    async deleteAvatar(user: SessionUser): Promise<void> {
+        await this.userAvatarModel.delete(user.userUuid);
+        this.userModel.invalidateSessionUserCache(user.userUuid);
+    }
+
+    async getAvatarImage(
+        actor: SessionUser,
+        userUuid: string,
+        contentHash: string,
+    ): Promise<Buffer> {
+        const target = await this.userModel.getUserDetailsByUuid(userUuid);
+        if (
+            !actor.organizationUuid ||
+            actor.organizationUuid !== target.organizationUuid
+        ) {
+            throw new ForbiddenError();
+        }
+        return this.userAvatarModel.getImage(userUuid, contentHash);
+    }
+
+    async registerOrActivateUser(
+        user: RegisterOrActivateUser,
+    ): Promise<SessionUser> {
+        let lightdashUser;
+        if (hasInviteCode(user)) {
+            lightdashUser = await this.activateUserFromInvite(user.inviteCode, {
+                firstName: user.firstName,
+                lastName: user.lastName,
+                password: user.password,
+            });
+        } else if ('password' in user) {
+            const onboardingFlow = await this.getOnboardingFlow();
+            await this.checkNewUserRegistrationAllowed(undefined, user.email);
+
+            lightdashUser = await this.registerUser(
+                {
+                    firstName: user.firstName,
+                    lastName: user.lastName,
+                    email: user.email,
+                    password: user.password,
+                },
+                onboardingFlow,
+            );
+        } else {
+            const onboardingFlow = await this.getOnboardingFlow();
+            if (onboardingFlow !== 'new') {
+                throw new ForbiddenError('Email-only signup is not enabled');
+            }
+            if (!this.lightdashConfig.smtp) {
+                throw new ForbiddenError(
+                    'Email-only signup requires an email server to be configured',
+                );
+            }
+
+            await this.checkNewUserRegistrationAllowed(undefined, user.email);
+
+            lightdashUser = await this.registerUser(
+                {
+                    firstName: '',
+                    lastName: '',
+                    email: user.email,
+                },
+                onboardingFlow,
+            );
+            // The register endpoint calls req.login on the returned session
+            // user, so signup establishes the first (passwordless) session.
+            this.analytics.track({
+                event: 'user.logged_in',
+                userId: lightdashUser.userUuid,
+                properties: {
+                    loginProvider: 'email_otp',
+                },
+            });
+        }
+
+        return this.userModel.findSessionUserByUUID(lightdashUser.userUuid);
+    }
+
+    private async registerUser(
+        createUser: CreateUserArgs | CreatePasswordlessUserArgs | OpenIdUser,
+        onboardingFlow: OnboardingFlow,
+    ) {
+        if (isOpenIdUser(createUser)) {
+            if (
+                (await this.isLoginMethodAllowed(
+                    createUser.openId.email,
+                    createUser.openId.issuerType,
+                )) === false
+            ) {
+                throw new ForbiddenError(
+                    `User with email ${createUser.openId.email} is not allowed to login with ${createUser.openId.issuerType}`,
+                );
+            }
+        } else if (
+            (await this.isLoginMethodAllowed(
+                createUser.email,
+                LocalIssuerTypes.EMAIL,
+            )) === false
+        ) {
+            throw new ForbiddenError(
+                `User with email ${createUser.email} is not allowed to login with password`,
+            );
+        }
+
+        let userConnectionType:
+            | 'password'
+            | 'email_only'
+            | OpenIdIdentityIssuerType;
+        if (isOpenIdUser(createUser)) {
+            userConnectionType = createUser.openId.issuerType;
+        } else if ('password' in createUser) {
+            userConnectionType = 'password';
+        } else {
+            userConnectionType = 'email_only';
+        }
+
+        const user = await this.userModel.createUser(
+            createUser,
+            true,
+            onboardingFlow === 'new' ? false : undefined,
+        );
+        this.identifyUser({
+            ...user,
+            isMarketingOptedIn: user.isMarketingOptedIn,
+        });
+        this.analytics.track({
+            event: 'user.created',
+            userId: user.userUuid,
+            properties: {
+                context: 'registration',
+                createdUserId: user.userUuid,
+                organizationId: user.organizationUuid,
+                userConnectionType,
+                onboardingFlow,
+                isOrganizationCreator: true,
+            },
+        });
+        this.analytics.track({
+            event: 'onboarding.step_completed',
+            userId: user.userUuid,
+            properties: {
+                step: 'signup',
+                stepIndex: 1,
+                onboardingFlow,
+                organizationId: user.organizationUuid,
+            },
+        });
+        if (isOpenIdUser(createUser)) {
+            this.analytics.track({
+                userId: user.userUuid,
+                event: 'user.identity_linked',
+                properties: {
+                    loginProvider: createUser.openId.issuerType,
+                },
+            });
+        } else {
+            await this.sendOneTimePasscodeToPrimaryEmail(
+                user,
+                'signup_verification',
+            );
+        }
+        return user;
+    }
+
+    async verifyPasswordResetLink(code: string): Promise<void> {
+        const link = await this.passwordResetLinkModel.getByCode(code);
+        if (link.isExpired) {
+            try {
+                await this.passwordResetLinkModel.deleteByCode(link.code);
+            } catch (e) {
+                throw new NotFoundError('Password reset link not found');
+            }
+            throw new NotFoundError('Password reset link expired');
+        }
+    }
+
+    async recoverPassword(data: CreatePasswordResetLink): Promise<void> {
+        const user = await this.userModel.findUserByEmail(data.email);
+        if (user) {
+            const code = nanoid(30);
+            const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // expires in 1 day
+            const link = await this.passwordResetLinkModel.create(
+                code,
+                expiresAt,
+                data.email,
+            );
+            this.analytics.track({
+                userId: user.userUuid,
+                event: 'password_reset_link.created',
+            });
+            await this.emailClient.sendPasswordRecoveryEmail(link);
+        }
+    }
+
+    async resetPassword(data: PasswordReset): Promise<void> {
+        const link = await this.passwordResetLinkModel.getByCode(data.code);
+        if (link.isExpired) {
+            throw new NotFoundError('Password reset link expired');
+        }
+        const user = await this.userModel.findUserByEmail(link.email);
+        if (user) {
+            await this.userModel.upsertPassword(
+                user.userUuid,
+                data.newPassword,
+            );
+            await this.passwordResetLinkModel.deleteByCode(link.code);
+            this.analytics.track({
+                userId: user.userUuid,
+                event: 'password_reset_link.used',
+            });
+        }
+    }
+
+    async loginWithPersonalAccessToken(
+        token: string,
+        context?: AuthAuditContext,
+    ): Promise<SessionUser> {
+        const emitDenied = (reason: string, user?: AuditableUser) =>
+            emitAuthAuditEvent({
+                actor: user
+                    ? createActorFromUser(user)
+                    : createUnknownAuthActor(),
+                action: 'login',
+                resourceType: 'PersonalAccessToken',
+                status: 'denied',
+                reason,
+                organizationUuid: user?.organizationUuid,
+                context,
+            });
+
+        const results = await wrapSentryTransaction(
+            'UserService.findSessionUserByPersonalAccessToken',
+            {},
+            async (span) => {
+                const lookup =
+                    await this.userModel.findSessionUserByPersonalAccessToken(
+                        token,
+                    );
+                span.setAttribute('cacheHit', lookup?.cacheHit ?? false);
+                return lookup;
+            },
+        );
+        if (results === undefined) {
+            emitDenied('Personal access token not recognized');
+            throw new AuthorizationError();
+        }
+        const {
+            data: { user, personalAccessToken },
+            cacheHit,
+        } = results;
+        if (!user.isActive) {
+            emitDenied('Account is deactivated', user);
+            throw new DeactivatedAccountError();
+        }
+        const auditedAbility = this.createAuditedAbility(user);
+        if (
+            auditedAbility.cannot(
+                'view',
+                subject('PersonalAccessToken', {
+                    organizationUuid: user.organizationUuid!,
+                    metadata: {
+                        personalAccessTokenUuid: personalAccessToken.uuid,
+                    },
+                }),
+            )
+        ) {
+            emitDenied(
+                'User lacks permission to login with personal access tokens',
+                user,
+            );
+            throw new ForbiddenError(
+                'You do not have permission to login with personal access tokens',
+            );
+        }
+        const organization = this.loginToOrganization(
+            user.userUuid,
+            LocalIssuerTypes.API_TOKEN,
+        );
+        const userWithOrganization: SessionUser = { ...user, ...organization };
+
+        const now = new Date();
+        if (
+            personalAccessToken.expiresAt &&
+            personalAccessToken.expiresAt <= now
+        ) {
+            if (personalAccessToken.uuid) {
+                await this.personalAccessTokenModel.delete(
+                    personalAccessToken.uuid,
+                );
+            }
+            emitDenied('Personal access token expired', user);
+            throw new AuthorizationError();
+        }
+        // Update last used date (throttled to once per minute).
+        // Skip on cache hits so bursts don't fire many concurrent UPDATEs.
+        if (!cacheHit && !isSameMinute(personalAccessToken.lastUsedAt, now)) {
+            await this.personalAccessTokenModel.updateUsedDate(
+                personalAccessToken.uuid,
+            );
+        }
+        return userWithOrganization;
+    }
+
+    async getSessionByUserUuid(userUuid: string): Promise<SessionUser> {
+        return this.userModel.findSessionUserByUUID(userUuid);
+    }
+
+    async getSessionByUserUuidAndOrg(
+        userUuid: string,
+        organizationUuid: string,
+    ): Promise<SessionUser> {
+        return this.userModel.findSessionUserAndOrgByUuid(
+            userUuid,
+            organizationUuid,
+        );
+    }
+
+    async getAccountByUserUuid(userUuid: string): Promise<RegisteredAccount> {
+        const sessionUser = await this.getSessionByUserUuid(userUuid);
+
+        if (!this.lightdashConfig.serviceAccount.enabled) {
+            return AccountFactory.fromSession(sessionUser);
+        }
+
+        const serviceAccount =
+            await this.userModel.findServiceAccountByUserUuid(userUuid);
+
+        if (serviceAccount) {
+            return AccountFactory.fromServiceAccount(
+                {
+                    ...sessionUser,
+                    serviceAccount: {
+                        uuid: serviceAccount.uuid,
+                        description: serviceAccount.description,
+                    },
+                },
+                '',
+            );
+        }
+
+        return AccountFactory.fromSession(sessionUser);
+    }
+
+    private otpExpirationDate(createdAt: Date) {
+        return new Date(
+            createdAt.getTime() + this.emailOneTimePasscodeExpirySeconds * 1000,
+        );
+    }
+
+    async sendOneTimePasscodeToPrimaryEmail(
+        user: Pick<SessionUser, 'userUuid' | 'organizationUuid'>,
+        purpose: OneTimePasscodePurpose,
+    ): Promise<EmailStatusExpiring> {
+        const currentEmailStatus = await this.emailModel.getPrimaryEmailStatus(
+            user.userUuid,
+        );
+        const isResend = Boolean(
+            currentEmailStatus.otp &&
+            !this.isOtpExpired(currentEmailStatus.otp.createdAt),
+        );
+        const passcode =
+            this.lightdashConfig.mode === LightdashMode.PR ||
+            this.lightdashConfig.mode === LightdashMode.DEV
+                ? '000000'
+                : randomInt(999999).toString().padStart(6, '0');
+        const emailStatus = await this.emailModel.createPrimaryEmailOtp({
+            passcode,
+            userUuid: user.userUuid,
+        });
+        await this.emailClient.sendOneTimePasscodeEmail({
+            recipient: emailStatus.email,
+            passcode,
+        });
+        const onboardingFlow = await this.getOnboardingFlow(user);
+        this.analytics.track({
+            event: 'one_time_passcode.sent',
+            userId: user.userUuid,
+            properties: {
+                purpose,
+                isResend,
+                onboardingFlow,
+            },
+        });
+        return {
+            ...emailStatus,
+            otp: emailStatus.otp && {
+                ...emailStatus.otp,
+                expiresAt: this.otpExpirationDate(emailStatus.otp.createdAt),
+                isExpired: this.isOtpExpired(emailStatus.otp.createdAt),
+                isMaxAttempts: this.isOtpMaxAttempts(
+                    emailStatus.otp.numberOfAttempts,
+                ),
+            },
+        };
+    }
+
+    private async trackOneTimePasscodeFailed(
+        user: Pick<SessionUser, 'userUuid' | 'organizationUuid'>,
+        purpose: OneTimePasscodePurpose,
+        reason: OneTimePasscodeFailureReason,
+    ): Promise<void> {
+        const onboardingFlow = await this.getOnboardingFlow(user);
+        this.analytics.track({
+            event: 'one_time_passcode.failed',
+            userId: user.userUuid,
+            properties: {
+                purpose,
+                reason,
+                onboardingFlow,
+            },
+        });
+    }
+
+    private async isStrictlyPasswordlessUser(
+        user: LightdashUser,
+        email: string,
+    ): Promise<boolean> {
+        const [hasPassword, hasOpenIdIdentity, isEmailLoginAllowed] =
+            await Promise.all([
+                this.userModel.hasPassword(user.userUuid),
+                this.userModel.hasOpenIdIdentity(user.userUuid),
+                this.isLoginMethodAllowed(email, LocalIssuerTypes.EMAIL_OTP),
+            ]);
+        return !hasPassword && !hasOpenIdIdentity && isEmailLoginAllowed;
+    }
+
+    // OTP login is deliberately NOT gated on the NewOnboarding flag: accounts
+    // enrolled as strictly passwordless have no other way to sign in, so a
+    // flag rollback must not strand them. The flag gates enrollment only.
+    async requestEmailOtpLogin(email: string): Promise<void> {
+        const normalizedEmail = email.toLowerCase();
+        const user = await this.userModel.findUserByEmail(normalizedEmail);
+        if (
+            !user ||
+            !user.isActive ||
+            !(await this.isStrictlyPasswordlessUser(user, normalizedEmail))
+        ) {
+            return;
+        }
+        await this.sendOneTimePasscodeToPrimaryEmail(user, 'login');
+    }
+
+    async loginWithEmailOtp(
+        email: string,
+        passcode: string,
+        context?: AuthAuditContext,
+    ): Promise<SessionUser> {
+        const normalizedEmail = email.toLowerCase();
+        const invalidCode = () => {
+            emitAuthAuditEvent({
+                actor: createUnknownAuthActor(normalizedEmail),
+                action: 'login',
+                resourceType: 'Session',
+                status: 'denied',
+                reason: 'Invalid or expired code',
+                metadata: { loginProvider: 'email_otp' },
+                context,
+            });
+            return new AuthorizationError('Invalid or expired code');
+        };
+
+        const user = await this.userModel.findUserByEmail(normalizedEmail);
+        if (
+            !user ||
+            !user.isActive ||
+            !(await this.isStrictlyPasswordlessUser(user, normalizedEmail))
+        ) {
+            throw invalidCode();
+        }
+
+        let emailStatus: EmailStatus;
+        try {
+            emailStatus = await this.emailModel.getPrimaryEmailStatus(
+                user.userUuid,
+            );
+        } catch (error) {
+            if (error instanceof NotFoundError) {
+                await this.trackOneTimePasscodeFailed(user, 'login', 'invalid');
+                throw invalidCode();
+            }
+            throw error;
+        }
+
+        if (!emailStatus.otp) {
+            await this.trackOneTimePasscodeFailed(user, 'login', 'invalid');
+            throw invalidCode();
+        }
+        if (this.isOtpMaxAttempts(emailStatus.otp.numberOfAttempts)) {
+            await this.trackOneTimePasscodeFailed(
+                user,
+                'login',
+                'max_attempts',
+            );
+            throw invalidCode();
+        }
+        if (this.isOtpExpired(emailStatus.otp.createdAt)) {
+            await this.trackOneTimePasscodeFailed(user, 'login', 'expired');
+            throw invalidCode();
+        }
+
+        try {
+            await this.emailModel.getPrimaryEmailStatusByUserAndOtp({
+                userUuid: user.userUuid,
+                passcode,
+            });
+        } catch (error) {
+            if (error instanceof NotFoundError) {
+                await this.emailModel.incrementPrimaryEmailOtpAttempts(
+                    user.userUuid,
+                );
+                await this.trackOneTimePasscodeFailed(user, 'login', 'invalid');
+                throw invalidCode();
+            }
+            throw error;
+        }
+
+        let sessionUser: SessionUser;
+        try {
+            sessionUser = await this.userModel.findSessionUserByUUID(
+                user.userUuid,
+            );
+        } catch (error) {
+            if (error instanceof NotFoundError) {
+                throw invalidCode();
+            }
+            throw error;
+        }
+        await this.tryVerifyUserEmail(sessionUser, emailStatus.email, 'otp');
+        await this.emailModel.deleteEmailOtp(
+            sessionUser.userUuid,
+            emailStatus.email,
+        );
+        this.identifyUser(sessionUser);
+        this.analytics.track({
+            userId: sessionUser.userUuid,
+            event: 'user.logged_in',
+            properties: {
+                loginProvider: 'email_otp',
+            },
+        });
+        emitAuthAuditEvent({
+            actor: createActorFromUser(sessionUser),
+            action: 'login',
+            resourceType: 'Session',
+            status: 'allowed',
+            organizationUuid: sessionUser.organizationUuid,
+            metadata: { loginProvider: 'email_otp' },
+            context,
+        });
+        return sessionUser;
+    }
+
+    private isOtpExpired(createdAt: Date) {
+        return this.otpExpirationDate(createdAt) < new Date();
+    }
+
+    private isOtpMaxAttempts(attempts: number) {
+        return attempts >= this.emailOneTimePasscodeMaxAttempts;
+    }
+
+    async getPrimaryEmailStatus(
+        user: SessionUser,
+        passcode?: string,
+    ): Promise<EmailStatusExpiring> {
+        // Attempt to verify the passcode if it's provided
+        if (passcode) {
+            const purpose = user.isSetupComplete
+                ? 'email_change'
+                : 'signup_verification';
+            try {
+                const emailStatus =
+                    await this.emailModel.getPrimaryEmailStatusByUserAndOtp({
+                        userUuid: user.userUuid,
+                        passcode,
+                    });
+                if (
+                    emailStatus.otp &&
+                    !this.isOtpMaxAttempts(emailStatus.otp.numberOfAttempts) &&
+                    !this.isOtpExpired(emailStatus.otp.createdAt)
+                ) {
+                    await this.tryVerifyUserEmail(
+                        user,
+                        emailStatus.email,
+                        'otp',
+                    );
+                    await this.emailModel.deleteEmailOtp(
+                        user.userUuid,
+                        emailStatus.email,
+                    );
+                } else {
+                    let reason: OneTimePasscodeFailureReason = 'invalid';
+                    if (
+                        emailStatus.otp &&
+                        this.isOtpMaxAttempts(emailStatus.otp.numberOfAttempts)
+                    ) {
+                        reason = 'max_attempts';
+                    } else if (emailStatus.otp) {
+                        reason = 'expired';
+                    }
+                    await this.trackOneTimePasscodeFailed(
+                        user,
+                        purpose,
+                        reason,
+                    );
+                }
+            } catch (e) {
+                // Attempt to find an email+passcode combo failed, increment the number of attempts
+                if (e instanceof NotFoundError) {
+                    await this.emailModel.incrementPrimaryEmailOtpAttempts(
+                        user.userUuid,
+                    );
+                    await this.trackOneTimePasscodeFailed(
+                        user,
+                        purpose,
+                        'invalid',
+                    );
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        const emailStatus = await this.emailModel.getPrimaryEmailStatus(
+            user.userUuid,
+        );
+        const emailStatusExpiring = {
+            ...emailStatus,
+            otp: emailStatus.otp && {
+                ...emailStatus.otp,
+                expiresAt: this.otpExpirationDate(emailStatus.otp.createdAt),
+                isMaxAttempts: this.isOtpMaxAttempts(
+                    emailStatus.otp.numberOfAttempts,
+                ),
+                isExpired: this.isOtpExpired(emailStatus.otp.createdAt),
+            },
+        };
+        return emailStatusExpiring;
+    }
+
+    async getAllowedOrganizations(
+        user: SessionUser,
+    ): Promise<UserAllowedOrganization[]> {
+        const emailStatus = await this.emailModel.getPrimaryEmailStatus(
+            user.userUuid,
+        );
+        if (emailStatus.isVerified) {
+            return this.organizationModel.getAllowedOrgsForDomain(
+                getEmailDomain(emailStatus.email),
+            );
+        }
+        return [];
+    }
+
+    async joinOrg(user: SessionUser, orgUuid: string): Promise<void> {
+        if (isUserWithOrg(user)) {
+            throw new ForbiddenError('User already has an organization');
+        }
+        const emailStatus = await this.emailModel.getPrimaryEmailStatus(
+            user.userUuid,
+        );
+        if (!emailStatus.isVerified) {
+            throw new ForbiddenError('User has not verified their email');
+        }
+        const allowedEmailDomains =
+            await this.organizationAllowedEmailDomainsModel.getAllowedEmailDomains(
+                orgUuid,
+            );
+        if (
+            !allowedEmailDomains.emailDomains.some(
+                (domain) =>
+                    domain.toLowerCase() === getEmailDomain(emailStatus.email),
+            )
+        ) {
+            throw new ForbiddenError(
+                'User is not allowed to join this organization',
+            );
+        }
+        await this.userModel.joinOrg(
+            user.userUuid,
+            orgUuid,
+            allowedEmailDomains.role,
+            allowedEmailDomains.role === OrganizationMemberRole.MEMBER
+                ? allowedEmailDomains.projects.reduce(
+                      (acc, project) => ({
+                          ...acc,
+                          [project.projectUuid]: project.role,
+                      }),
+                      {},
+                  )
+                : undefined,
+        );
+
+        await this.analytics.track({
+            userId: user.userUuid,
+            event: 'user.joined_organization',
+            properties: {
+                organizationId: orgUuid,
+                role: allowedEmailDomains.role,
+                projectIds: allowedEmailDomains.projects.map(
+                    (project) => project.projectUuid,
+                ),
+            },
+        });
+    }
+
+    async leaveOrganization(
+        user: SessionUser,
+        context?: AuthAuditContext,
+    ): Promise<void> {
+        if (!isUserWithOrg(user)) {
+            throw new ForbiddenError('User does not belong to an organization');
+        }
+        const { organizationUuid } = user;
+        const actor = createActorFromUser(user);
+
+        const flag = await this.featureFlagModel.get({
+            user,
+            featureFlagId: FeatureFlags.LeaveOrganization,
+        });
+        if (!flag.enabled) {
+            this.logger.warn('Leave organization denied: feature disabled', {
+                userUuid: user.userUuid,
+                organizationUuid,
+            });
+            emitAuthAuditEvent({
+                actor,
+                action: 'leave_organization',
+                resourceType: 'OrganizationMembership',
+                status: 'denied',
+                reason: 'Feature disabled',
+                organizationUuid,
+                context,
+            });
+            throw new ForbiddenError(
+                'Leaving the organization is not enabled for this instance',
+            );
+        }
+
+        const member =
+            await this.organizationMemberProfileModel.getOrganizationMemberByUuid(
+                organizationUuid,
+                user.userUuid,
+            );
+
+        this.logger.info('User attempting to leave organization', {
+            userUuid: user.userUuid,
+            organizationUuid,
+            role: member.role,
+        });
+
+        // Race condition between check and delete is acceptable here — worst
+        // case the last admin slips out concurrently, matching the same trade-off
+        // accepted in `delete()` above.
+        const admins =
+            await this.organizationMemberProfileModel.getOrganizationAdmins(
+                organizationUuid,
+            );
+        if (
+            member.role === OrganizationMemberRole.ADMIN &&
+            admins.length === 1 &&
+            admins[0].userUuid === user.userUuid
+        ) {
+            const reason = 'Last admin in organization';
+            this.logger.warn('Leave organization denied: last admin', {
+                userUuid: user.userUuid,
+                organizationUuid,
+            });
+            emitAuthAuditEvent({
+                actor,
+                action: 'leave_organization',
+                resourceType: 'OrganizationMembership',
+                status: 'denied',
+                reason,
+                organizationUuid,
+                metadata: { role: member.role },
+                context,
+            });
+            throw new ForbiddenError(
+                'You are the only admin in this organization. Promote another member to admin before leaving.',
+            );
+        }
+
+        // Leaving an organization deletes the user record entirely. The
+        // single-org-per-user invariant means there is no other org for the
+        // user to remain a member of, and deleting the `users` row CASCADEs
+        // through every user-scoped table — matching the cleanup that admin
+        // remove-user already performs. If the leaver is later invited
+        // again, the invite flow creates a fresh `users` row.
+        const userToDelete = await this.userModel.getUserDetailsByUuid(
+            user.userUuid,
+        );
+        if (!userToDelete) {
+            throw new NotFoundError(`User ${user.userUuid} not found`);
+        }
+        await this.destroyUser({
+            actor: user,
+            userToDelete,
+            context: 'leave_organization',
+        });
+        this.analytics.track({
+            event: 'user.left_organization',
+            userId: user.userUuid,
+            properties: {
+                organizationId: organizationUuid,
+                wasOrganizationAdmin:
+                    member.role === OrganizationMemberRole.ADMIN,
+            },
+        });
+
+        this.logger.info('User left organization', {
+            userUuid: user.userUuid,
+            organizationUuid,
+            role: member.role,
+        });
+
+        emitAuthAuditEvent({
+            actor,
+            action: 'leave_organization',
+            resourceType: 'OrganizationMembership',
+            status: 'allowed',
+            organizationUuid,
+            metadata: { role: member.role },
+            context,
+        });
+    }
+
+    async loginToOrganization(
+        userUuid: string,
+        loginMethod: LoginOptionTypes,
+    ): Promise<
+        Pick<
+            LightdashUser,
+            'organizationUuid' | 'organizationCreatedAt' | 'organizationName'
+        >
+    > {
+        const organizations =
+            await this.userModel.getOrganizationsForUser(userUuid);
+        if (organizations.length === 0) {
+            throw new NotFoundError('User not part of any organization');
+        } else if (organizations.length > 1) {
+            throw new ForbiddenError('User is part of multiple organizations');
+        }
+        // TODO check valid login methods allowed in org
+        // const organization = await this.organizationModel.get(organizations[0].organization_uuid)
+        return organizations[0];
+    }
+
+    async findSessionUser(passportUser: { id: string; organization: string }) {
+        return wrapSentryTransaction(
+            'Passport.deserializeUser',
+            {},
+            async (span) => {
+                const { sessionUser, cacheHit } =
+                    await this.userModel.getSessionUserFromCacheOrDB(
+                        passportUser.id,
+                        passportUser.organization,
+                    );
+                span.setAttribute('cacheHit', cacheHit);
+
+                return sessionUser;
+            },
+        );
+    }
+
+    async onLogin(user: {
+        userUuid: string;
+        organizationUuid?: string;
+    }): Promise<void> {
+        if (!user.organizationUuid) return;
+
+        const sessionUser = await this.findSessionUser({
+            id: user.userUuid,
+            organization: user.organizationUuid,
+        });
+        await this.ensureDefaultUserSpaces(sessionUser);
+    }
+
+    private async ensureDefaultUserSpaces(
+        sessionUser: SessionUser,
+    ): Promise<void> {
+        if (!sessionUser.organizationUuid) return;
+
+        const auditedAbility = this.createAuditedAbility(sessionUser);
+
+        const projects =
+            await this.projectModel.getProjectsWithDefaultUserSpaces(
+                sessionUser.organizationUuid,
+            );
+
+        if (projects.length === 0) return;
+
+        await Promise.all(
+            projects.map(async (project) => {
+                if (
+                    auditedAbility.cannot(
+                        'manage',
+                        subject('SavedChart', {
+                            projectUuid: project.projectUuid,
+                            organizationUuid: sessionUser.organizationUuid!,
+                            access: [
+                                {
+                                    userUuid: sessionUser.userUuid,
+                                    // We already know that we'll assign ADMIN permissions
+                                    // for the user in their default space
+                                    role: SpaceMemberRole.ADMIN,
+                                },
+                            ],
+                        }),
+                    ) ||
+                    auditedAbility.cannot(
+                        'manage',
+                        subject('Explore', {
+                            projectUuid: project.projectUuid,
+                            organizationUuid: sessionUser.organizationUuid!,
+                        }),
+                    )
+                )
+                    return;
+
+                await this.projectModel.ensureDefaultUserSpace(
+                    project.projectId,
+                    project.parentSpaceUuid,
+                    project.parentPath,
+                    {
+                        userId: sessionUser.userId,
+                        userUuid: sessionUser.userUuid,
+                        firstName: sessionUser.firstName,
+                        lastName: sessionUser.lastName,
+                    },
+                );
+            }),
+        );
+    }
+
+    /**
+     * Resolves the session user, handling impersonation if active.
+     * When impersonation is active, validates that the admin still has
+     * permission to impersonate and the target user is still valid,
+     * then returns the target user. Calls clearImpersonation if the
+     * session is no longer valid.
+     */
+    async resolveSessionUser(
+        passportUser: { id: string; organization: string },
+        impersonation:
+            | {
+                  adminUserUuid: string;
+                  adminEmail: string;
+                  adminFirstName?: string;
+                  adminLastName?: string;
+                  adminRole: string;
+                  targetUserUuid: string;
+                  startedAt: string;
+              }
+            | undefined,
+        clearImpersonation: () => void,
+    ): Promise<SessionUser> {
+        const requestUser = await this.findSessionUser(passportUser);
+
+        if (!impersonation) {
+            return requestUser;
+        }
+
+        // Check if impersonation has exceeded TTL (15 minutes)
+        const IMPERSONATION_TTL_MS = 15 * 60 * 1000;
+        const elapsed =
+            Date.now() - new Date(impersonation.startedAt).getTime();
+        if (elapsed > IMPERSONATION_TTL_MS) {
+            this.logger.info(
+                `Impersonation TTL exceeded for admin ${passportUser.id} (elapsed: ${Math.round(elapsed / 1000)}s), clearing impersonation`,
+            );
+            clearImpersonation();
+            return requestUser;
+        }
+
+        // If feature flag is off, clear any active impersonation
+        if (!(await this.isImpersonationEnabled(requestUser))) {
+            this.logger.warn(
+                `Impersonation feature flag is disabled, clearing impersonation for admin ${passportUser.id}`,
+            );
+            clearImpersonation();
+            return requestUser;
+        }
+
+        // Validate admin can still impersonate
+        const auditedAbility = this.createAuditedAbility(requestUser);
+        if (
+            !requestUser.isActive ||
+            auditedAbility.cannot(
+                'impersonate',
+                subject('User', {
+                    organizationUuid: requestUser.organizationUuid!,
+                    isActive: requestUser.isActive,
+                }),
+            )
+        ) {
+            this.logger.warn(
+                `Impersonation admin ${passportUser.id} is no longer authorized, clearing impersonation`,
+            );
+            clearImpersonation();
+            return requestUser;
+        }
+
+        // Load the impersonated user
+        const targetUser = await this.getSessionByUserUuid(
+            impersonation.targetUserUuid,
+        );
+
+        if (
+            !targetUser.isActive ||
+            targetUser.organizationUuid !== requestUser.organizationUuid
+        ) {
+            this.logger.warn(
+                `Impersonation target ${impersonation.targetUserUuid} is no longer valid, clearing impersonation`,
+            );
+            clearImpersonation();
+            return requestUser;
+        }
+
+        return {
+            ...targetUser,
+            impersonation: {
+                adminId: impersonation.adminUserUuid,
+                adminEmail: impersonation.adminEmail,
+                adminFirstName: impersonation.adminFirstName,
+                adminLastName: impersonation.adminLastName,
+                adminRole: impersonation.adminRole,
+            },
+        };
+    }
+
+    static async generateGoogleAccessToken(
+        refreshToken: string,
+        type: 'gdrive' | 'bigquery' = 'gdrive',
+    ): Promise<string> {
+        return new Promise((resolve, reject) => {
+            refresh.requestNewAccessToken(
+                'google',
+                refreshToken,
+                (err: AnyType, accessToken: string, _refreshToken, result) => {
+                    if (err || !accessToken) {
+                        // Make sure you are passing a google's refresh token, and not a snowflake refresh token by mistake
+                        // othwerise this will throw a `invalid_grant` error
+                        const lastFourDigits = refreshToken.slice(-4);
+
+                        // Extract meaningful error message from the error object
+                        const errorMessage =
+                            err?.data?.error ||
+                            err?.message ||
+                            err?.error ||
+                            'Unknown error';
+
+                        console.error(
+                            `Unable to get google "${type}" access token for "xxxx${lastFourDigits}": "${errorMessage}"`,
+                            err,
+                        );
+                        reject(
+                            new AuthorizationError(
+                                `Authentication failed with Google: ${errorMessage}`,
+                            ),
+                        );
+                        return;
+                    }
+                    const scopes: string[] = hasProperty<string>(
+                        result,
+                        'scope',
+                    )
+                        ? result.scope.split(' ')
+                        : [];
+
+                    if (type === 'gdrive') {
+                        if (
+                            scopes.includes(
+                                'https://www.googleapis.com/auth/drive.file',
+                            )
+                            // This scope is now optional
+                            // Not grating this scope will prevent users from overwritting
+                            // existing sheets that were not created by this app, throwing GoogleSheetsScopeError on scheduler
+                            /* scopes.includes(
+                                'https://www.googleapis.com/auth/spreadsheets',
+                            ) */
+                        ) {
+                            resolve(accessToken);
+                        }
+                        reject(
+                            new AuthorizationError(
+                                'Missing authorization to access Google Drive',
+                            ),
+                        );
+                    } else if (type === 'bigquery') {
+                        if (
+                            scopes.includes(
+                                'https://www.googleapis.com/auth/bigquery',
+                            )
+                        ) {
+                            resolve(accessToken);
+                        }
+                        reject(
+                            new AuthorizationError(
+                                'Missing authorization to access BigQuery',
+                            ),
+                        );
+                    }
+                },
+            );
+        });
+    }
+
+    /**
+     * This method returns an access token for different sso providers, like snowflake, databricks or google
+     * this is used on the gdrive API to get the accessToken for listing files on the user's drive
+     * @param user
+     * @returns accessToken
+     */
+    async getAccessToken(
+        user: SessionUser,
+        type: 'gdrive' | 'bigquery' | 'snowflake' | 'databricks' = 'gdrive',
+    ): Promise<string> {
+        if (type === 'snowflake') {
+            if (this.lightdashConfig.auth.snowflake.clientId === undefined) {
+                // If snowflake oauth is not configured, refresh strategy will not be loaded
+                throw new MissingConfigError(
+                    'Snowflake client is not configured',
+                );
+            }
+            const refreshToken =
+                await this.userOAuthGrantsModel.getRefreshToken(
+                    user.userUuid,
+                    OpenIdIdentityIssuerType.SNOWFLAKE,
+                );
+            const { accessToken } =
+                await UserService.generateSnowflakeAccessToken(refreshToken);
+            return accessToken;
+        }
+        if (type === 'databricks') {
+            if (this.lightdashConfig.auth.databricks.clientId === undefined) {
+                // If databricks oauth is not configured, refresh strategy will not be loaded
+                throw new MissingConfigError(
+                    'Databricks client is not configured',
+                );
+            }
+            const refreshToken =
+                await this.userOAuthGrantsModel.getRefreshToken(
+                    user.userUuid,
+                    OpenIdIdentityIssuerType.DATABRICKS,
+                );
+            const accessToken =
+                await UserService.generateDatabricksAccessToken(refreshToken);
+            return accessToken;
+        }
+        const refreshToken = await this.userOAuthGrantsModel.getRefreshToken(
+            user.userUuid,
+            OpenIdIdentityIssuerType.GOOGLE,
+        );
+        const accessToken = await UserService.generateGoogleAccessToken(
+            refreshToken,
+            type,
+        );
+        return accessToken;
+    }
+
+    static async generateSnowflakeAccessToken(
+        refreshToken: string,
+    ): Promise<{ accessToken: string; refreshToken: string }> {
+        return new Promise((resolve, reject) => {
+            refresh.requestNewAccessToken(
+                'snowflake',
+                refreshToken,
+                (
+                    err: AnyType,
+                    accessToken: string,
+                    newRefreshToken: string | undefined,
+                ) => {
+                    if (err || !accessToken) {
+                        reject(err);
+                        return;
+                    }
+                    resolve({
+                        accessToken,
+                        refreshToken: newRefreshToken || refreshToken,
+                    });
+                },
+            );
+        });
+    }
+
+    static async generateDatabricksAccessToken(
+        refreshToken: string,
+    ): Promise<string> {
+        return new Promise((resolve, reject) => {
+            refresh.requestNewAccessToken(
+                'databricks',
+                refreshToken,
+                (err: AnyType, accessToken: string, _refreshToken, result) => {
+                    if (err || !accessToken) {
+                        reject(err);
+                        return;
+                    }
+                    resolve(accessToken);
+                },
+            );
+        });
+    }
+
+    /**
+     * Whether Google sign-in is disabled for the given email's domain by the
+     * owning organization. Google is enabled by default (shared instance OAuth
+     * app); a per-org `google` policy row with enabled=false opts out. For
+     * existing users we only honour policies from orgs they belong to — same
+     * domain-hijack guard as getLoginOptions.
+     */
+    private async isGoogleDisabledForEmail(email: string): Promise<boolean> {
+        const domain = email?.split('@')[1]?.toLowerCase();
+        if (!domain) return false;
+        const googleMethods =
+            await this.organizationSsoModel.findGoogleMethodsForEmailDomain(
+                domain,
+            );
+        if (googleMethods.length === 0) return false;
+
+        const existingUser = await this.userModel.findUserByEmail(email);
+        if (!existingUser) {
+            return googleMethods.some((m) => !m.enabled);
+        }
+        const userOrgs = await this.userModel.getOrganizationsForUser(
+            existingUser.userUuid,
+        );
+        const userOrgUuids = new Set(userOrgs.map((o) => o.organizationUuid));
+        return googleMethods
+            .filter((m) => userOrgUuids.has(m.organizationUuid))
+            .some((m) => !m.enabled);
+    }
+
+    async isLoginMethodAllowed(email: string, loginMethod: LoginOptionTypes) {
+        switch (loginMethod) {
+            case LocalIssuerTypes.EMAIL:
+            case LocalIssuerTypes.EMAIL_OTP:
+                return !this.lightdashConfig.auth.disablePasswordAuthentication;
+            case OpenIdIdentityIssuerType.GOOGLE:
+                // Enabled by default, but an org can disable Google sign-in
+                // for its domains via a per-org policy.
+                return !(await this.isGoogleDisabledForEmail(email));
+            case LocalIssuerTypes.API_TOKEN:
+            case OpenIdIdentityIssuerType.OKTA:
+            case OpenIdIdentityIssuerType.ONELOGIN:
+            case OpenIdIdentityIssuerType.AZUREAD:
+            case OpenIdIdentityIssuerType.GENERIC_OIDC:
+            case OpenIdIdentityIssuerType.SNOWFLAKE:
+            case OpenIdIdentityIssuerType.DATABRICKS:
+                return true;
+            case OpenIdIdentityIssuerType.SLACK:
+                return false;
+            default:
+                assertUnreachable(
+                    loginMethod,
+                    `Invalid login method ${loginMethod} provided.`,
+                );
+        }
+        return true;
+    }
+
+    /**
+     * This method is used on the scheduler to perform the actions on Google Drive for that user
+     * @param user
+     * @returns accessToken
+     */
+    async storeOAuthGrant(
+        user: SessionUser,
+        provider: UserOAuthGrantProvider,
+        refreshToken: string,
+        scopes: string[],
+        profile: Pick<OpenIdUser['openId'], 'subject' | 'email'>,
+    ): Promise<void> {
+        await this.userOAuthGrantsModel.upsertGrant({
+            userUuid: user.userUuid,
+            provider,
+            subject: profile.subject,
+            email: profile.email,
+            scopes,
+            refreshToken,
+        });
+    }
+
+    async getRefreshToken(userUuid: string): Promise<string> {
+        return this.userOAuthGrantsModel.getRefreshToken(
+            userUuid,
+            OpenIdIdentityIssuerType.GOOGLE,
+        );
+    }
+
+    async getWarehouseCredentials(user: SessionUser) {
+        return this.userWarehouseCredentialsModel.getAllByUserUuid(
+            user.userUuid,
+        );
+    }
+
+    async hasDatabricksOAuthCredentialForHost(
+        user: SessionUser,
+        serverHostName: string,
+    ): Promise<boolean> {
+        const credential =
+            await this.userWarehouseCredentialsModel.findDatabricksOauthU2mForHostWithSecrets(
+                user.userUuid,
+                serverHostName,
+            );
+        return credential !== undefined;
+    }
+
+    async createBigqueryWarehouseCredentials(
+        user: SessionUser,
+        refreshToken: string,
+    ) {
+        // Remove old BigQuery credentials to prevent duplicates on re-authentication
+        await this.userWarehouseCredentialsModel.deleteAllByUserAndWarehouseType(
+            user.userUuid,
+            WarehouseTypes.BIGQUERY,
+        );
+
+        const bigqueryCredentials: UpsertUserWarehouseCredentials = {
+            name: 'Default',
+            credentials: {
+                type: WarehouseTypes.BIGQUERY,
+                authenticationType: BigqueryAuthenticationType.SSO,
+                keyfileContents: {
+                    type: 'authorized_user',
+                    client_id: this.lightdashConfig.auth.google.oauth2ClientId!,
+                    client_secret:
+                        this.lightdashConfig.auth.google.oauth2ClientSecret!,
+                    refresh_token: refreshToken,
+                },
+            },
+        };
+        await this.createWarehouseCredentials(user, bigqueryCredentials);
+    }
+
+    async createSnowflakeWarehouseCredentials(
+        user: SessionUser,
+        refreshToken: string,
+    ) {
+        // Remove old Snowflake credentials to prevent duplicates on re-authentication
+        await this.userWarehouseCredentialsModel.deleteAllByUserAndWarehouseType(
+            user.userUuid,
+            WarehouseTypes.SNOWFLAKE,
+        );
+
+        const snowflakeCredentials: UpsertUserWarehouseCredentials = {
+            name: 'Default',
+            credentials: {
+                user: user.userUuid,
+                type: WarehouseTypes.SNOWFLAKE,
+                authenticationType: SnowflakeAuthenticationType.SSO,
+                refreshToken,
+            },
+        };
+        await this.createWarehouseCredentials(user, snowflakeCredentials);
+    }
+
+    async createDatabricksWarehouseCredentials(
+        user: SessionUser,
+        refreshToken: string,
+        options?: {
+            projectUuid?: string;
+            projectName?: string;
+            serverHostName?: string;
+            credentialsName?: string;
+            oauthClientId?: string;
+        },
+    ) {
+        const credentialsNameFromOptions = options?.credentialsName?.trim();
+        const projectName = options?.projectName?.trim();
+        const serverHostName = options?.serverHostName?.trim();
+        let credentialsName = 'Default';
+        if (credentialsNameFromOptions) {
+            credentialsName = credentialsNameFromOptions;
+        } else if (serverHostName) {
+            credentialsName = `Databricks (${serverHostName})`;
+        }
+        const databricksCredentials: UpsertUserWarehouseCredentials = {
+            name: credentialsName,
+            credentials: {
+                type: WarehouseTypes.DATABRICKS,
+                authenticationType: DatabricksAuthenticationType.OAUTH_U2M,
+                refreshToken,
+                serverHostName,
+                oauthClientId: options?.oauthClientId,
+            },
+        };
+
+        if (options?.projectUuid) {
+            if (serverHostName) {
+                const matchingCredential =
+                    await this.userWarehouseCredentialsModel.findDatabricksOauthU2mForHostWithSecrets(
+                        user.userUuid,
+                        serverHostName,
+                        {
+                            projectUuid: options.projectUuid,
+                        },
+                    );
+                if (matchingCredential) {
+                    return this.updateWarehouseCredentials(
+                        user,
+                        matchingCredential.uuid,
+                        databricksCredentials,
+                    );
+                }
+            }
+
+            const existingCredentials =
+                await this.userWarehouseCredentialsModel.findForProject(
+                    options.projectUuid,
+                    user.userUuid,
+                    WarehouseTypes.DATABRICKS,
+                );
+            if (existingCredentials) {
+                return this.updateWarehouseCredentials(
+                    user,
+                    existingCredentials.uuid,
+                    databricksCredentials,
+                );
+            }
+
+            return this.createWarehouseCredentials(
+                user,
+                databricksCredentials,
+                options.projectUuid,
+            );
+        }
+
+        if (serverHostName) {
+            const existingCredentials =
+                await this.userWarehouseCredentialsModel.findDatabricksOauthU2mForHostWithSecrets(
+                    user.userUuid,
+                    serverHostName,
+                    {
+                        includeProjectScoped: false,
+                    },
+                );
+            if (existingCredentials) {
+                return this.updateWarehouseCredentials(
+                    user,
+                    existingCredentials.uuid,
+                    databricksCredentials,
+                );
+            }
+        }
+
+        return this.createWarehouseCredentials(user, databricksCredentials);
+    }
+
+    static isAwsSsoAuthorizationPending(error: unknown): boolean {
+        const errorName = (error as { name?: string })?.name;
+        return (
+            errorName === 'AuthorizationPendingException' ||
+            errorName === 'SlowDownException'
+        );
+    }
+
+    private static validateRedshiftAwsSsoStartRequest(
+        data: RedshiftAwsSsoStartRequest,
+    ) {
+        try {
+            if (!data.startUrl) {
+                throw new Error('Missing start URL');
+            }
+            const startUrl = new URL(data.startUrl);
+            if (startUrl.protocol !== 'https:') {
+                throw new Error('Invalid protocol');
+            }
+        } catch {
+            throw new ParameterError('AWS access portal URL must be valid.');
+        }
+
+        if (!data.region?.trim()) {
+            throw new ParameterError(
+                'AWS IAM Identity Center region is required.',
+            );
+        }
+    }
+
+    private static validateRedshiftAwsSsoCompleteRequest(
+        data: RedshiftAwsSsoCompleteRequest,
+    ) {
+        if (!data.accountId || !/^\d{12}$/.test(data.accountId.trim())) {
+            throw new ParameterError(
+                'AWS account ID must be a 12 digit number.',
+            );
+        }
+
+        if (!data.roleName?.trim()) {
+            throw new ParameterError('AWS role name is required.');
+        }
+    }
+
+    async startRedshiftAwsSsoDeviceAuthorization(
+        data: RedshiftAwsSsoStartRequest,
+    ): Promise<{
+        session: RedshiftAwsSsoSession;
+        results: RedshiftAwsSsoStartResults;
+    }> {
+        UserService.validateRedshiftAwsSsoStartRequest(data);
+
+        const region = data.region!.trim();
+        const startUrl = data.startUrl!.trim();
+        this.logger.info('Starting Redshift AWS SSO device authorization', {
+            region,
+        });
+        const client = new SSOOIDCClient({ region });
+        const registeredClient = await client.send(
+            new RegisterClientCommand({
+                clientName: 'Lightdash Redshift AWS SSO',
+                clientType: 'public',
+            }),
+        );
+
+        if (!registeredClient.clientId || !registeredClient.clientSecret) {
+            throw new ParameterError(
+                'AWS IAM Identity Center did not return client registration details.',
+            );
+        }
+
+        const authorization = await client.send(
+            new StartDeviceAuthorizationCommand({
+                clientId: registeredClient.clientId,
+                clientSecret: registeredClient.clientSecret,
+                startUrl,
+            }),
+        );
+
+        if (
+            !authorization.deviceCode ||
+            !authorization.verificationUri ||
+            !authorization.verificationUriComplete ||
+            !authorization.userCode ||
+            authorization.expiresIn === undefined ||
+            authorization.interval === undefined
+        ) {
+            throw new ParameterError(
+                'AWS IAM Identity Center did not return device authorization details.',
+            );
+        }
+
+        return {
+            session: {
+                clientId: registeredClient.clientId,
+                clientSecret: registeredClient.clientSecret,
+                deviceCode: authorization.deviceCode,
+                region,
+                startUrl,
+                expiresAt: Date.now() + authorization.expiresIn * 1000,
+            },
+            results: {
+                verificationUri: authorization.verificationUri,
+                verificationUriComplete: authorization.verificationUriComplete,
+                userCode: authorization.userCode,
+                expiresIn: authorization.expiresIn,
+                interval: authorization.interval,
+            },
+        };
+    }
+
+    async completeRedshiftAwsSsoDeviceAuthorization(
+        user: SessionUser,
+        session: RedshiftAwsSsoSession | undefined,
+        data: RedshiftAwsSsoCompleteRequest,
+    ): Promise<RedshiftAwsSsoCompleteResults> {
+        if (!session) {
+            throw new ParameterError('AWS SSO login has not been started.');
+        }
+
+        if (session.expiresAt < Date.now()) {
+            throw new ParameterError('AWS SSO login has expired. Try again.');
+        }
+
+        UserService.validateRedshiftAwsSsoCompleteRequest(data);
+
+        const oidcClient = new SSOOIDCClient({ region: session.region });
+        let accessToken: string | undefined;
+
+        try {
+            const token = await oidcClient.send(
+                new CreateTokenCommand({
+                    clientId: session.clientId,
+                    clientSecret: session.clientSecret,
+                    deviceCode: session.deviceCode,
+                    grantType: AWS_SSO_DEVICE_GRANT_TYPE,
+                }),
+            );
+            accessToken = token.accessToken;
+        } catch (e) {
+            if (UserService.isAwsSsoAuthorizationPending(e)) {
+                return { status: 'pending' };
+            }
+            throw e;
+        }
+
+        if (!accessToken) {
+            throw new ParameterError(
+                'AWS IAM Identity Center did not return an access token.',
+            );
+        }
+
+        const ssoClient = new SSOClient({ region: session.region });
+        const roleCredentials = await ssoClient.send(
+            new GetRoleCredentialsCommand({
+                accessToken,
+                accountId: data.accountId!.trim(),
+                roleName: data.roleName!.trim(),
+            }),
+        );
+
+        const awsCredentials = roleCredentials.roleCredentials;
+        if (
+            !awsCredentials?.accessKeyId ||
+            !awsCredentials.secretAccessKey ||
+            !awsCredentials.sessionToken
+        ) {
+            throw new ParameterError(
+                'AWS IAM Identity Center did not return role credentials.',
+            );
+        }
+
+        const roleName = data.roleName!.trim();
+        const credentialsName =
+            data.credentialsName?.trim() || `Redshift AWS SSO (${roleName})`;
+        const projectName = data.projectName?.trim();
+        const redshiftCredentials: UpsertUserWarehouseCredentials = {
+            name: credentialsName,
+            credentials: {
+                type: WarehouseTypes.REDSHIFT,
+                authenticationType: RedshiftAuthenticationType.IAM_BROWSER,
+                user: data.databaseUser?.trim() ?? '',
+                accessKeyId: awsCredentials.accessKeyId,
+                secretAccessKey: awsCredentials.secretAccessKey,
+                sessionToken: awsCredentials.sessionToken,
+            },
+        };
+
+        const existingCredentials = data.projectUuid
+            ? await this.userWarehouseCredentialsModel.findForProject(
+                  data.projectUuid,
+                  user.userUuid,
+                  WarehouseTypes.REDSHIFT,
+              )
+            : undefined;
+        const credentials = existingCredentials
+            ? await this.updateWarehouseCredentials(
+                  user,
+                  existingCredentials.uuid,
+                  redshiftCredentials,
+              )
+            : await this.createWarehouseCredentials(
+                  user,
+                  {
+                      ...redshiftCredentials,
+                      name: projectName
+                          ? `Redshift AWS SSO (${projectName})`
+                          : redshiftCredentials.name,
+                  },
+                  data.projectUuid,
+              );
+
+        return {
+            status: 'authenticated',
+            credentials,
+        };
+    }
+
+    async createWarehouseCredentials(
+        user: SessionUser,
+        data: UpsertUserWarehouseCredentials,
+        projectUuid?: string,
+    ) {
+        const userWarehouseCredentialsUuid =
+            await this.userWarehouseCredentialsModel.create(
+                user.userUuid,
+                data,
+                projectUuid,
+            );
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'user_warehouse_credentials.created',
+            properties: {
+                credentialsId: userWarehouseCredentialsUuid,
+                warehouseType: data.credentials.type,
+            },
+        });
+        return this.userWarehouseCredentialsModel.getByUuid(
+            userWarehouseCredentialsUuid,
+        );
+    }
+
+    async updateWarehouseCredentials(
+        user: SessionUser,
+        userWarehouseCredentialsUuid: string,
+        data: UpsertUserWarehouseCredentials,
+    ) {
+        await this.userWarehouseCredentialsModel.update(
+            user.userUuid,
+            userWarehouseCredentialsUuid,
+            data,
+        );
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'user_warehouse_credentials.updated',
+            properties: {
+                credentialsId: userWarehouseCredentialsUuid,
+                warehouseType: data.credentials.type,
+            },
+        });
+        return this.userWarehouseCredentialsModel.getByUuid(
+            userWarehouseCredentialsUuid,
+        );
+    }
+
+    async deleteWarehouseCredentials(
+        user: SessionUser,
+        userWarehouseCredentialsUuid: string,
+    ) {
+        await this.userWarehouseCredentialsModel.delete(
+            user.userUuid,
+            userWarehouseCredentialsUuid,
+        );
+        this.analytics.track({
+            userId: user.userUuid,
+            event: 'user_warehouse_credentials.deleted',
+            properties: {
+                credentialsId: userWarehouseCredentialsUuid,
+            },
+        });
+    }
+
+    private getRedirectUri(issuer: OpenIdIdentityIssuerType) {
+        switch (issuer) {
+            case OpenIdIdentityIssuerType.AZUREAD:
+                return this.lightdashConfig.auth.azuread.loginPath;
+            case OpenIdIdentityIssuerType.GOOGLE:
+                return this.lightdashConfig.auth.google.loginPath;
+            case OpenIdIdentityIssuerType.OKTA:
+                return this.lightdashConfig.auth.okta.loginPath;
+            case OpenIdIdentityIssuerType.ONELOGIN:
+                return this.lightdashConfig.auth.oneLogin.loginPath;
+            case OpenIdIdentityIssuerType.GENERIC_OIDC:
+                return this.lightdashConfig.auth.oidc.loginPath;
+            case OpenIdIdentityIssuerType.SNOWFLAKE:
+                return this.lightdashConfig.auth.snowflake.loginPath;
+            case OpenIdIdentityIssuerType.DATABRICKS:
+                return this.lightdashConfig.auth.databricks.loginPath;
+            case OpenIdIdentityIssuerType.SLACK:
+                throw new NotImplementedError('Slack login is not supported');
+            default:
+                assertUnreachable(
+                    issuer,
+                    `Invalid login option for issuer ${issuer}`,
+                );
+        }
+        return undefined;
+    }
+
+    private getInstanceLoginOptions() {
+        const options = new Set<LoginOptionTypes>();
+        if (!this.lightdashConfig.auth.disablePasswordAuthentication) {
+            options.add(LocalIssuerTypes.EMAIL);
+        }
+        if (this.lightdashConfig.auth.google.enabled) {
+            options.add(OpenIdIdentityIssuerType.GOOGLE);
+        }
+        if (this.lightdashConfig.auth.azuread?.oauth2ClientId !== undefined) {
+            options.add(OpenIdIdentityIssuerType.AZUREAD);
+        }
+        if (this.lightdashConfig.auth.oneLogin?.oauth2ClientId) {
+            options.add(OpenIdIdentityIssuerType.ONELOGIN);
+        }
+        if (this.lightdashConfig.auth.okta?.oauth2ClientId) {
+            options.add(OpenIdIdentityIssuerType.OKTA);
+        }
+        if (this.lightdashConfig.auth.oidc.clientId) {
+            options.add(OpenIdIdentityIssuerType.GENERIC_OIDC);
+        }
+        return options;
+    }
+
+    async getLoginOptions(email?: string): Promise<LoginOptions> {
+        const instancesOptions = this.getInstanceLoginOptions();
+        if (!email) {
+            return {
+                showOptions: Array.from(instancesOptions),
+                forceRedirect: false,
+                redirectUri: undefined,
+            };
+        }
+
+        // Discover all enabled per-org SSO methods whose effective whitelist
+        // matches the email's domain. When any per-org method matches, it
+        // takes precedence over instance-level SSO providers for this user.
+        const domain = email.split('@')[1]?.toLowerCase();
+        const allMatchingMethods = domain
+            ? await this.organizationSsoModel.findEnabledMethodsForEmailDomain(
+                  domain,
+              )
+            : [];
+        // Per-org Google policy rows for the domain (includes disabled rows —
+        // a `google` row exists precisely to record an opt-out, which the
+        // enabled-only discovery above would never surface).
+        const allGoogleMethods = domain
+            ? await this.organizationSsoModel.findGoogleMethodsForEmailDomain(
+                  domain,
+              )
+            : [];
+
+        // Security: if the email belongs to an existing Lightdash user, only
+        // surface SSO methods from orgs they actually belong to. Prevents a
+        // malicious admin of org B from silently re-routing org A's existing
+        // users to their own Azure tenant by claiming the domain. Brand-new
+        // users (no account yet) still see all matching methods — the
+        // upstream feature flag + ops vetting is the gate for that case.
+        const existingUser = await this.userModel.findUserByEmail(email);
+        let matchingPerOrgMethods = allMatchingMethods;
+        let matchingGoogleMethods = allGoogleMethods;
+        if (existingUser) {
+            const userOrgs = await this.userModel.getOrganizationsForUser(
+                existingUser.userUuid,
+            );
+            const userOrgUuids = new Set(
+                userOrgs.map((o) => o.organizationUuid),
+            );
+            matchingPerOrgMethods = allMatchingMethods.filter((m) =>
+                userOrgUuids.has(m.organizationUuid),
+            );
+            matchingGoogleMethods = allGoogleMethods.filter((m) =>
+                userOrgUuids.has(m.organizationUuid),
+            );
+        }
+
+        // Google is enabled by default (shared instance OAuth app), so absence
+        // of a `google` row means "follow the instance default". An org opts
+        // out by storing a row with enabled=false for its domains — that
+        // suppresses the instance Google button here and is enforced
+        // server-side by isLoginMethodAllowed.
+        const googleEnabledForUser =
+            instancesOptions.has(OpenIdIdentityIssuerType.GOOGLE) &&
+            !matchingGoogleMethods.some((m) => !m.enabled);
+
+        // Each SSO provider enum value maps 1:1 to its OpenIdIdentityIssuerType
+        // string (e.g. 'azuread'); funnel through unknown to satisfy TS.
+        const matchingPerOrgProviders = new Set<OpenIdIdentityIssuerType>(
+            matchingPerOrgMethods.map(
+                (m) => m.provider as unknown as OpenIdIdentityIssuerType,
+            ),
+        );
+
+        const openIdIssuers = await this.userModel.getOpenIdIssuers(email);
+        const hasPassword = await this.userModel.hasPasswordByEmail(email);
+        // Not gated on the NewOnboarding flag: an enrolled passwordless
+        // account must keep its only sign-in path across a flag rollback.
+        let shouldShowEmailOtp = false;
+        if (existingUser && !hasPassword) {
+            const [hasPasswordLogin, hasOpenIdIdentity, isEmailLoginAllowed] =
+                await Promise.all([
+                    this.userModel.hasPassword(existingUser.userUuid),
+                    this.userModel.hasOpenIdIdentity(existingUser.userUuid),
+                    this.isLoginMethodAllowed(
+                        email,
+                        LocalIssuerTypes.EMAIL_OTP,
+                    ),
+                ]);
+            shouldShowEmailOtp =
+                !hasPasswordLogin && !hasOpenIdIdentity && isEmailLoginAllowed;
+        }
+        const applyEmailOtpOption = (options: LoginOptionTypes[]) =>
+            shouldShowEmailOtp && options.includes(LocalIssuerTypes.EMAIL)
+                ? options.map((option) =>
+                      option === LocalIssuerTypes.EMAIL
+                          ? LocalIssuerTypes.EMAIL_OTP
+                          : option,
+                  )
+                : options;
+
+        let ssoOptionsForUser: OpenIdIdentityIssuerType[];
+        let passwordAllowedForUser: boolean;
+
+        if (matchingPerOrgMethods.length > 0) {
+            // Per-org SSO suppresses instance-level SSO providers for this
+            // email's domain. Google is a per-org provider like the others:
+            // an enabled `google` row flows through discovery above and shows
+            // here; otherwise it follows the instance default.
+            ssoOptionsForUser = Array.from(matchingPerOrgProviders);
+            // Password visibility is governed by the SSO rows: lenient rule
+            // — ANY matching method that permits password → show password.
+            passwordAllowedForUser = matchingPerOrgMethods.some(
+                (m) => m.allowPassword,
+            );
+        } else {
+            // No per-org SSO matches: instance-level behavior preserved.
+            // Show OIDC issuers the user has previously linked (filtered to
+            // instance-supported providers), dropping Google if the org
+            // opted out for this domain.
+            ssoOptionsForUser = openIdIssuers.filter(
+                (o) =>
+                    instancesOptions.has(o) &&
+                    (googleEnabledForUser ||
+                        o !== OpenIdIdentityIssuerType.GOOGLE),
+            );
+            passwordAllowedForUser = true;
+        }
+
+        const showOptions: LoginOptionTypes[] = [...ssoOptionsForUser];
+        if (
+            passwordAllowedForUser &&
+            hasPassword &&
+            instancesOptions.has(LocalIssuerTypes.EMAIL)
+        ) {
+            showOptions.unshift(LocalIssuerTypes.EMAIL);
+        }
+
+        // If the precheck yielded nothing for this email, fall back to
+        // instance-level options so the user isn't shown an empty form.
+        // This branch only fires when no per-org SSO matched and the user
+        // has no linked identity or password — i.e. they're effectively a
+        // new signup.
+        if (showOptions.length === 0) {
+            return {
+                showOptions: applyEmailOtpOption(
+                    Array.from(instancesOptions).filter(
+                        (o) =>
+                            googleEnabledForUser ||
+                            o !== OpenIdIdentityIssuerType.GOOGLE,
+                    ),
+                ),
+                forceRedirect: false,
+                redirectUri: undefined,
+            };
+        }
+
+        const oidcOptions = showOptions.filter(isOpenIdIdentityIssuerType);
+        // Auto-redirect when there is genuinely a single option (one OIDC
+        // provider, no password input). Wrong-account loops are mitigated
+        // by forwarding `login_hint` to the provider so the right account
+        // is surfaced.
+        if (oidcOptions.length === 1 && showOptions.length === 1) {
+            return {
+                showOptions,
+                forceRedirect: true,
+                redirectUri: new URL(
+                    `/api/v1${this.getRedirectUri(
+                        oidcOptions[0],
+                    )}?login_hint=${encodeURIComponent(email)}`,
+                    this.lightdashConfig.siteUrl,
+                ).href,
+            };
+        }
+        const loginOptions = applyEmailOtpOption(showOptions);
+        return {
+            showOptions: loginOptions,
+            forceRedirect: false,
+            redirectUri: undefined,
+        };
+    }
+
+    /**
+     * Loads the SessionUser for the dedicated `users` row provisioned for this
+     * service account. Abilities are derived from the SA's scopes via
+     * `applyServiceAccountAbilities` inside
+     * `UserModel.generateUserAbilityBuilder`.
+     */
+    async getSessionUserForServiceAccount(
+        serviceAccount: ServiceAccount,
+    ): Promise<SessionUser> {
+        return this.userModel.findSessionUserAndOrgByUuid(
+            serviceAccount.userUuid,
+            serviceAccount.organizationUuid,
+        );
+    }
+
+    async isOpenIdLinked(
+        userUuid: string,
+        issuerType: OpenIdIdentityIssuerType,
+    ): Promise<boolean> {
+        const openId = await this.userModel.getOpenIdByIssuerType(
+            userUuid,
+            issuerType,
+        );
+
+        return openId !== undefined;
+    }
+
+    private async isImpersonationEnabled(
+        user: Pick<
+            LightdashUser,
+            'userUuid' | 'organizationUuid' | 'organizationName'
+        >,
+    ): Promise<boolean> {
+        if (!user.organizationUuid) {
+            return false;
+        }
+        return this.organizationModel.getImpersonationEnabled(
+            user.organizationUuid,
+        );
+    }
+
+    async startImpersonation(
+        adminUser: SessionUser,
+        targetUserUuid: string,
+        {
+            isSessionAuth,
+            getImpersonation,
+            setImpersonation,
+            context,
+        }: {
+            isSessionAuth: boolean;
+            getImpersonation: () => { targetUserUuid: string } | undefined;
+            setImpersonation: (data: {
+                adminUserUuid: string;
+                adminName: string;
+                adminEmail: string;
+                adminFirstName?: string;
+                adminLastName?: string;
+                adminRole: string;
+                targetUserUuid: string;
+                startedAt: string;
+            }) => void;
+            context?: AuthAuditContext;
+        },
+    ): Promise<void> {
+        const emitDenied = (reason: string, targetOrgUuid?: string) =>
+            emitAuthAuditEvent({
+                actor: createActorFromUser(adminUser),
+                action: 'impersonation_start',
+                resourceType: 'User',
+                status: 'denied',
+                reason,
+                organizationUuid:
+                    targetOrgUuid ?? adminUser.organizationUuid ?? undefined,
+                metadata: { targetUserUuid },
+                context,
+            });
+
+        if (!(await this.isImpersonationEnabled(adminUser))) {
+            emitDenied('User impersonation is not enabled');
+            throw new ForbiddenError('User impersonation is not enabled');
+        }
+
+        if (!isSessionAuth) {
+            emitDenied('Impersonation requires session authentication');
+            throw new ForbiddenError(
+                'Impersonation requires session authentication',
+            );
+        }
+
+        // Prevent recursive impersonation
+        if (getImpersonation()) {
+            emitDenied(
+                'Cannot start impersonation while already impersonating',
+            );
+            throw new ForbiddenError(
+                'Cannot start impersonation while already impersonating',
+            );
+        }
+
+        // Prevent self-impersonation
+        if (adminUser.userUuid === targetUserUuid) {
+            emitDenied('Cannot impersonate yourself');
+            throw new ParameterError('Cannot impersonate yourself');
+        }
+
+        // Load target user details
+        const targetUser =
+            await this.userModel.getUserDetailsByUuid(targetUserUuid);
+
+        // Check permissions using CASL (includes org match and isActive)
+        const auditedAbility = this.createAuditedAbility(adminUser);
+        if (
+            auditedAbility.cannot(
+                'impersonate',
+                subject('User', {
+                    organizationUuid: targetUser.organizationUuid!,
+                    isActive: targetUser.isActive,
+                    metadata: { targetUserUuid },
+                }),
+            )
+        ) {
+            emitDenied(
+                "You don't have permissions to impersonate this user",
+                targetUser.organizationUuid ?? undefined,
+            );
+            throw new ForbiddenError(
+                "You don't have permissions to impersonate this user",
+            );
+        }
+
+        setImpersonation({
+            adminUserUuid: adminUser.userUuid,
+            adminName: `${adminUser.firstName} ${adminUser.lastName}`,
+            adminEmail: adminUser.email ?? '',
+            adminFirstName: adminUser.firstName,
+            adminLastName: adminUser.lastName,
+            adminRole: adminUser.role ?? 'unknown',
+            targetUserUuid,
+            startedAt: new Date().toISOString(),
+        });
+
+        this.logger.info(
+            `Impersonation started: admin ${adminUser.userUuid} (${adminUser.firstName} ${adminUser.lastName}) is now impersonating user ${targetUserUuid} in organization ${adminUser.organizationUuid}`,
+        );
+
+        this.analytics.track({
+            event: 'user.impersonation_started',
+            userId: adminUser.userUuid,
+            properties: {
+                adminUserUuid: adminUser.userUuid,
+                targetUserUuid,
+                organizationUuid: adminUser.organizationUuid!,
+            },
+        });
+
+        emitAuthAuditEvent({
+            actor: createActorFromUser(adminUser),
+            action: 'impersonation_start',
+            resourceType: 'User',
+            status: 'allowed',
+            organizationUuid:
+                targetUser.organizationUuid ??
+                adminUser.organizationUuid ??
+                undefined,
+            metadata: { targetUserUuid },
+            context,
+        });
+    }
+
+    async stopImpersonation({
+        getImpersonation,
+        clearImpersonation,
+        context,
+    }: {
+        getImpersonation: () =>
+            | { adminUserUuid: string; targetUserUuid: string }
+            | undefined;
+        clearImpersonation: () => void;
+        context?: AuthAuditContext;
+    }): Promise<void> {
+        const impersonation = getImpersonation();
+
+        if (!impersonation) {
+            return;
+        }
+
+        const { adminUserUuid, targetUserUuid } = impersonation;
+        const adminUser =
+            await this.userModel.getUserDetailsByUuid(adminUserUuid);
+
+        clearImpersonation();
+
+        this.logger.info(
+            `Impersonation stopped: admin ${adminUserUuid} (${adminUser.firstName} ${adminUser.lastName}) stopped impersonating user ${targetUserUuid} in organization ${adminUser.organizationUuid}`,
+        );
+
+        this.analytics.track({
+            event: 'user.impersonation_stopped',
+            userId: adminUserUuid,
+            properties: {
+                adminUserUuid,
+                targetUserUuid,
+                organizationUuid: adminUser.organizationUuid!,
+            },
+        });
+
+        emitAuthAuditEvent({
+            actor: createActorFromUser(adminUser),
+            action: 'impersonation_stop',
+            resourceType: 'User',
+            status: 'allowed',
+            organizationUuid: adminUser.organizationUuid ?? undefined,
+            metadata: { targetUserUuid },
+            context,
+        });
+    }
+}

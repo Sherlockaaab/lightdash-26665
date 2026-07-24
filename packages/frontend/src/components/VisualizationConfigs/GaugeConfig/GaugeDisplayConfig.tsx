@@ -1,0 +1,211 @@
+import {
+    getGranularityMapFromItems,
+    getItemId,
+    getItemLabelWithoutTableName,
+} from '@lightdash/common';
+import {
+    Center,
+    Checkbox,
+    Group,
+    SegmentedControl,
+    Stack,
+    Tooltip,
+} from '@mantine-8/core';
+import { memo, type FC } from 'react';
+import FieldSelect from '../../common/FieldSelect';
+import { NumberInput } from '../../common/NumberInput';
+import { isGaugeVisualizationConfig } from '../../LightdashVisualization/types';
+import { useVisualizationContext } from '../../LightdashVisualization/useVisualizationContext';
+import { Config } from '../common/Config';
+import { LabelEditor } from '../common/LabelEditor';
+import compactStyles from '../mantineTheme.module.css';
+import GaugeSections from './GaugeSections';
+import { GaugeValueMode } from './types';
+
+export const GaugeDisplayConfig: FC = memo(() => {
+    const { visualizationConfig, itemsMap } = useVisualizationContext();
+
+    if (!isGaugeVisualizationConfig(visualizationConfig)) {
+        return null;
+    }
+
+    const granularityFields = Object.keys(getGranularityMapFromItems(itemsMap));
+
+    const {
+        chartConfig: {
+            selectedField: selectedFieldId,
+            min,
+            setMin,
+            max,
+            setMax,
+            maxFieldId,
+            setMaxFieldId,
+            getField,
+            showAxisLabels,
+            setShowAxisLabels,
+            customLabel,
+            setCustomLabel,
+            showPercentage,
+            setShowPercentage,
+            customPercentageLabel,
+            setCustomPercentageLabel,
+        },
+        numericMetrics,
+    } = visualizationConfig;
+
+    const maxValueMode = maxFieldId
+        ? GaugeValueMode.FIELD
+        : GaugeValueMode.FIXED;
+    const maxField = getField(maxFieldId);
+    const selectedField = getField(selectedFieldId);
+
+    const numericMetricsList = Object.values(numericMetrics ?? {});
+
+    return (
+        <Stack>
+            <Config>
+                <Config.Section>
+                    <Config.Heading>Scale</Config.Heading>
+                    <NumberInput
+                        size="xs"
+                        label="Minimum value"
+                        description="Set the minimum value for the gauge scale"
+                        value={min}
+                        onNumberChange={(value) => setMin(value ?? 0)}
+                        placeholder="0"
+                        decimalScale={2}
+                    />
+                    <Group gap="xs" align="flex-end">
+                        {maxValueMode === GaugeValueMode.FIXED ? (
+                            <NumberInput
+                                size="xs"
+                                label="Maximum value"
+                                description="Set the maximum value for the gauge scale"
+                                value={max}
+                                onNumberChange={(value) => setMax(value ?? 0)}
+                                placeholder="100"
+                                decimalScale={2}
+                                style={{ flex: 1 }}
+                            />
+                        ) : (
+                            <FieldSelect
+                                label="Maximum value"
+                                description="Select a field to use as the maximum value"
+                                item={maxField}
+                                items={numericMetricsList}
+                                onChange={(newValue) => {
+                                    setMaxFieldId(
+                                        newValue
+                                            ? getItemId(newValue)
+                                            : undefined,
+                                    );
+                                }}
+                                hasGrouping
+                                style={{ flex: 1 }}
+                            />
+                        )}
+                        <SegmentedControl
+                            size="xs"
+                            value={maxValueMode}
+                            onChange={(value) => {
+                                if (value === GaugeValueMode.FIXED) {
+                                    // When switching to fixed mode, clear the field selection
+                                    setMaxFieldId(undefined);
+                                } else {
+                                    // When switching to field mode, set to first available field
+                                    if (numericMetricsList.length > 0) {
+                                        setMaxFieldId(
+                                            getItemId(numericMetricsList[0]),
+                                        );
+                                    }
+                                }
+                            }}
+                            data={[
+                                {
+                                    label: (
+                                        <Tooltip
+                                            label="Set the maximum value"
+                                            withinPortal
+                                        >
+                                            <Center>Value</Center>
+                                        </Tooltip>
+                                    ),
+                                    value: GaugeValueMode.FIXED,
+                                },
+                                {
+                                    label: (
+                                        <Tooltip
+                                            label="Select a field to use as the maximum value"
+                                            withinPortal
+                                        >
+                                            <Center>Field</Center>
+                                        </Tooltip>
+                                    ),
+                                    value: GaugeValueMode.FIELD,
+                                },
+                            ]}
+                        />
+                    </Group>
+                </Config.Section>
+            </Config>
+            <Config>
+                <Config.Section>
+                    <Config.Heading>Appearance</Config.Heading>
+
+                    <Checkbox
+                        size="xs"
+                        classNames={{
+                            label: compactStyles.compactCheckboxLabel,
+                        }}
+                        label="Show axis labels"
+                        description="Display axis labels and tick marks"
+                        checked={showAxisLabels}
+                        onChange={(event) =>
+                            setShowAxisLabels(event.currentTarget.checked)
+                        }
+                    />
+
+                    <Checkbox
+                        size="xs"
+                        classNames={{
+                            label: compactStyles.compactCheckboxLabel,
+                        }}
+                        label="Show as percentage"
+                        description="Display the value as a percentage of the scale"
+                        checked={showPercentage}
+                        onChange={(event) =>
+                            setShowPercentage(event.currentTarget.checked)
+                        }
+                    />
+
+                    {showPercentage && (
+                        <LabelEditor
+                            label="Custom percentage label"
+                            description="Add a custom label after the percentage"
+                            value={customPercentageLabel || ''}
+                            onChange={(value) =>
+                                setCustomPercentageLabel(value || undefined)
+                            }
+                            fields={granularityFields}
+                            placeholder="e.g. 'completed'"
+                        />
+                    )}
+
+                    <LabelEditor
+                        label="Custom label"
+                        description="Override the default field label"
+                        value={customLabel || ''}
+                        onChange={(value) => setCustomLabel(value || undefined)}
+                        fields={granularityFields}
+                        placeholder={
+                            selectedField
+                                ? getItemLabelWithoutTableName(selectedField)
+                                : "e.g. 'Sales'"
+                        }
+                    />
+                </Config.Section>
+            </Config>
+            <GaugeSections />
+        </Stack>
+    );
+});

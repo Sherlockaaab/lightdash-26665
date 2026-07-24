@@ -1,0 +1,95 @@
+import { WarehouseTypes } from '@lightdash/common';
+import { Select, Stack } from '@mantine-8/core';
+import { type FC, type ReactNode } from 'react';
+import { useFormContext } from './formContext';
+import AthenaForm from './WarehouseForms/AthenaForm';
+import BigQueryForm from './WarehouseForms/BigQueryForm';
+import ClickhouseForm from './WarehouseForms/ClickhouseForm';
+import DatabricksForm from './WarehouseForms/DatabricksForm';
+import { warehouseDefaultValues } from './WarehouseForms/defaultValues';
+import DuckdbForm from './WarehouseForms/DuckdbForm';
+import PostgresForm from './WarehouseForms/PostgresForm';
+import RedshiftForm from './WarehouseForms/RedshiftForm';
+import { SnowflakeCliSsoModeProvider } from './WarehouseForms/SnowflakeCliSsoModeProvider';
+import SnowflakeForm from './WarehouseForms/SnowflakeForm';
+import TrinoForm from './WarehouseForms/TrinoForm';
+
+const WarehouseTypeLabels = {
+    [WarehouseTypes.BIGQUERY]: 'BigQuery',
+    [WarehouseTypes.POSTGRES]: 'PostgreSQL',
+    [WarehouseTypes.REDSHIFT]: 'Redshift',
+    [WarehouseTypes.SNOWFLAKE]: 'Snowflake',
+    [WarehouseTypes.DATABRICKS]: 'Databricks',
+    [WarehouseTypes.TRINO]: 'Trino',
+    [WarehouseTypes.CLICKHOUSE]: 'ClickHouse',
+    [WarehouseTypes.ATHENA]: 'Athena',
+    [WarehouseTypes.DUCKDB]: 'DuckDB',
+};
+
+const WarehouseTypeForms = {
+    [WarehouseTypes.BIGQUERY]: BigQueryForm,
+    [WarehouseTypes.POSTGRES]: PostgresForm,
+    [WarehouseTypes.REDSHIFT]: RedshiftForm,
+    [WarehouseTypes.SNOWFLAKE]: SnowflakeForm,
+    [WarehouseTypes.DATABRICKS]: DatabricksForm,
+    [WarehouseTypes.TRINO]: TrinoForm,
+    [WarehouseTypes.CLICKHOUSE]: ClickhouseForm,
+    [WarehouseTypes.ATHENA]: AthenaForm,
+    [WarehouseTypes.DUCKDB]: DuckdbForm,
+};
+
+interface WarehouseSettingsFormProps {
+    disabled: boolean;
+    isProjectUpdate?: boolean | undefined;
+    children?: ReactNode;
+}
+
+const WarehouseSettingsForm: FC<WarehouseSettingsFormProps> = ({
+    disabled,
+    isProjectUpdate,
+    children,
+}) => {
+    const form = useFormContext();
+
+    const warehouseType: WarehouseTypes =
+        form.values?.warehouse?.type ?? WarehouseTypes.BIGQUERY;
+
+    const WarehouseForm = WarehouseTypeForms[warehouseType];
+
+    return (
+        <SnowflakeCliSsoModeProvider>
+            <Stack h="100%" gap={0}>
+                {isProjectUpdate && (
+                    <Select
+                        allowDeselect={false}
+                        defaultValue={WarehouseTypes.BIGQUERY}
+                        label="Type"
+                        data={Object.entries(WarehouseTypeLabels).map(
+                            ([value, label]) => ({
+                                value,
+                                label,
+                            }),
+                        )}
+                        required
+                        {...form.getInputProps('warehouse.type')}
+                        onChange={(value) => {
+                            if (!value) return;
+                            const warehouseType = value as WarehouseTypes;
+
+                            form.setValues({
+                                warehouse:
+                                    warehouseDefaultValues[warehouseType],
+                            });
+                        }}
+                        disabled={disabled}
+                    />
+                )}
+
+                <WarehouseForm disabled={disabled} />
+                {children}
+            </Stack>
+        </SnowflakeCliSsoModeProvider>
+    );
+};
+
+export default WarehouseSettingsForm;

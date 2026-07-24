@@ -1,0 +1,1 @@
+export const DATA_ACCESS_ENABLED_SECTION = `- You receive the actual query results as CSV. Use them to summarize key findings, call out trends, outliers, or anything notable, and emphasize the headline insight.`;

@@ -1,0 +1,61 @@
+import {
+    CustomFormatType,
+    TableCalculationType,
+    type TableCalculation,
+} from '@lightdash/common';
+import { useCallback, type FC } from 'react';
+import {
+    explorerActions,
+    useExplorerDispatch,
+} from '../../../features/explorer/store';
+import useTracking from '../../../providers/Tracking/useTracking';
+import { EventName } from '../../../types/Events';
+import TableCalculationModal, {
+    type TableCalculationSaveMeta,
+} from './TableCalculationModal';
+
+type Props = {
+    opened: boolean;
+    onClose: () => void;
+    tableCalculation: TableCalculation;
+};
+
+export const UpdateTableCalculationModal: FC<Props> = ({
+    opened,
+    tableCalculation,
+    onClose,
+}) => {
+    const dispatch = useExplorerDispatch();
+    const { track } = useTracking();
+
+    const onUpdate = useCallback(
+        (value: TableCalculation, meta: TableCalculationSaveMeta) => {
+            dispatch(
+                explorerActions.updateTableCalculation({
+                    oldName: tableCalculation.name,
+                    tableCalculation: value,
+                }),
+            );
+            track({
+                name: EventName.UPDATE_TABLE_CALCULATION_BUTTON_CLICKED,
+                properties: {
+                    mode: meta.mode,
+                    generatedByAi: meta.generatedByAi,
+                    resultType: value.type ?? TableCalculationType.NUMBER,
+                    formatType: value.format?.type ?? CustomFormatType.DEFAULT,
+                },
+            });
+            onClose();
+        },
+        [dispatch, tableCalculation.name, track, onClose],
+    );
+
+    return (
+        <TableCalculationModal
+            opened={opened}
+            tableCalculation={tableCalculation}
+            onSave={onUpdate}
+            onClose={onClose}
+        />
+    );
+};

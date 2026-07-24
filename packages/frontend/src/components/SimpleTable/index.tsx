@@ -1,0 +1,443 @@
+import { Box, Flex, Text, Button } from '@mantine-8/core';
+import { IconAlertCircle, IconRefresh, IconTable } from '@tabler/icons-react';
+import { useCallback, useEffect, useMemo, useRef, type FC } from 'react';
+import {
+    isChunkLoadError,
+    triggerChunkErrorReload,
+} from '../../features/chunkErrorHandler';
+import { computeLimitedRowCount, sliceRows } from '../../utils/sliceRows';
+import LoadingChart from '../common/LoadingChart';
+import PivotTable from '../common/PivotTable';
+import SuboptimalState from '../common/SuboptimalState/SuboptimalState';
+import Table from '../common/Table';
+import { ResultCount } from '../common/Table/TablePagination';
+import {
+    type CellContextMenuProps,
+    type HeaderProps,
+} from '../common/Table/types';
+import { isTableVisualizationConfig } from '../LightdashVisualization/types';
+import { useVisualizationContext } from '../LightdashVisualization/useVisualizationContext';
+import CellContextMenu from './CellContextMenu';
+import DashboardCellContextMenu from './DashboardCellContextMenu';
+import DashboardHeaderContextMenu from './DashboardHeaderContextMenu';
+import ExplorerPivotTable from './ExplorerPivotTable';
+import MinimalCellContextMenu from './MinimalCellContextMenu';
+import PivotRerunState from './PivotRerunState';
+
+const noop = () => undefined;
+
+type SimpleTableProps = {
+    isDashboard: boolean;
+    tileUuid?: string;
+    className?: string;
+    $shouldExpand?: boolean;
+    minimal?: boolean;
+    onScreenshotReady?: () => void;
+    onScreenshotError?: () => void;
+};
+
+const SimpleTable: FC<SimpleTableProps> = ({
+    isDashboard,
+    tileUuid,
+    className,
+    $shouldExpand,
+    minimal = false,
+    onScreenshotReady,
+    onScreenshotError,
+    ...rest
+}) => {
+    const {
+        columnOrder,
+        itemsMap,
+        visualizationConfig,
+        resultsData,
+        isLoading,
+        isEditMode,
+        parameters,
+        hasExplorerStore,
+    } = useVisualizationContext();
+
+    const hasSignaledScreenshotReady = useRef(false);
+
+    const rowLimit = isTableVisualizationConfig(visualizationConfig)
+        ? visualizationConfig.chartConfig.rowLimit
+        : undefined;
+
+    const needsAllRows =
+        rowLimit != null &&
+        rowLimit.count > 0 &&
+        (rowLimit.direction === 'last' || rowLimit.mode === 'hide');
+
+    const shouldPaginateResults = useMemo(() => {
+        if (needsAllRows) return false;
+        return Boolean(
+            !resultsData ||
+            !isTableVisualizationConfig(visualizationConfig) ||
+            // When subtotals are disable and there is no pivot table data, we don't need to load all the rows
+            (!visualizationConfig.chartConfig.showSubtotals &&
+                !visualizationConfig.chartConfig.pivotTableData?.data),
+        );
+    }, [needsAllRows, resultsData, visualizationConfig]);
+
+    const loadResultsStatus = useMemo(() => {
+        if (!resultsData) {
+            return 'loading';
+        }
+
+        if (
+            !isLoading &&
+            resultsData.rows.length === 0 &&
+            !resultsData.hasFetchedAllRows
+        ) {
+            return 'idle';
+        }
+
+        // When paginated, it's success as soon as there are rows
+        // When not paginated, it's success as soon as all rows have been fetched
+        const isSuccess = shouldPaginateResults
+            ? resultsData.rows.length > 0 || resultsData.hasFetchedAllRows
+            : resultsData.hasFetchedAllRows;
+
+        return isSuccess ? 'success' : 'loading';
+    }, [resultsData, shouldPaginateResults, isLoading]);
+
+    useEffect(() => {
+        if (hasSignaledScreenshotReady.current) return;
+        if (!onScreenshotReady && !onScreenshotError) return;
+        if (!isTableVisualizationConfig(visualizationConfig)) return;
+
+        const { pivotTableData, isPivotTableEnabled } =
+            visualizationConfig.chartConfig;
+
+        if (pivotTableData.error) {
+            onScreenshotError?.();
+            hasSignaledScreenshotReady.current = true;
+            return;
+        }
+
+        if (isPivotTableEnabled) {
+            if (pivotTableData.data && resultsData?.hasFetchedAllRows) {
+                onScreenshotReady?.();
+                hasSignaledScreenshotReady.current = true;
+            }
+            return;
+        }
+
+        // Signal ready for both success and idle (idle = no data to fetch)
+        if (loadResultsStatus === 'success' || loadResultsStatus === 'idle') {
+            onScreenshotReady?.();
+            hasSignaledScreenshotReady.current = true;
+        }
+    }, [
+        visualizationConfig,
+        loadResultsStatus,
+        resultsData?.hasFetchedAllRows,
+        onScreenshotReady,
+        onScreenshotError,
+    ]);
+
+    const showColumnCalculation = useMemo(() => {
+        if (!isTableVisualizationConfig(visualizationConfig)) {
+            return undefined;
+        }
+
+        return visualizationConfig.chartConfig.showColumnCalculation;
+    }, [visualizationConfig]);
+
+    const pagination = useMemo(() => {
+        return {
+            show: showColumnCalculation,
+        };
+    }, [showColumnCalculation]);
+
+    const headerContextMenu = useCallback<
+        FC<React.PropsWithChildren<HeaderProps>>
+    >(
+        (props) => {
+            if (isDashboard && tileUuid)
+                return (
+                    <DashboardHeaderContextMenu
+                        {...props}
+                        tileUuid={tileUuid}
+                    />
+                );
+            return null;
+        },
+        [isDashboard, tileUuid],
+    );
+
+    const cellContextMenu = useCallback<
+        FC<React.PropsWithChildren<CellContextMenuProps>>
+    >(
+        (props) => {
+            if (minimal) {
+                return <MinimalCellContextMenu {...props} />;
+            }
+            if (isDashboard && tileUuid) {
+                return (
+                    <DashboardCellContextMenu {...props} itemsMap={itemsMap} />
+                );
+            }
+            return <CellContextMenu {...props} />;
+        },
+        [isDashboard, itemsMap, minimal, tileUuid],
+    );
+
+    const DashboardEmptyState = useCallback(() => {
+        return (
+            <SuboptimalState
+                icon={IconTable}
+                title="No results"
+                description="This query ran successfully but returned no results"
+            />
+        );
+    }, []);
+
+    useEffect(() => {
+        if (shouldPaginateResults) return;
+
+        // Load all the rows
+        resultsData?.setFetchAll(true);
+    }, [shouldPaginateResults, resultsData]);
+
+    const tableColumns = useMemo(() => {
+        return isTableVisualizationConfig(visualizationConfig)
+            ? visualizationConfig.chartConfig.columns
+            : [];
+    }, [visualizationConfig]);
+
+    const slicedRows = useMemo(
+        () => sliceRows(resultsData?.rows || [], rowLimit),
+        [resultsData?.rows, rowLimit],
+    );
+
+    const totalRowsCount = useMemo(
+        () => computeLimitedRowCount(resultsData?.totalResults || 0, rowLimit),
+        [resultsData?.totalResults, rowLimit],
+    );
+
+    if (!isTableVisualizationConfig(visualizationConfig)) return null;
+
+    const {
+        conditionalFormattings,
+        minMaxMap,
+        hideRowNumbers,
+        pivotTableData,
+        isPivotTableEnabled,
+        isPivotResultStale,
+        getFieldLabel,
+        getField,
+        showResultsTotal,
+        showSubtotals,
+        showSubtotalsExpanded,
+        showRowGrouping,
+        updateColumnProperty,
+        columnTotalsError,
+        rowTotalsError,
+        grandTotalsError,
+        columnSubtotalsError,
+        rowSubtotalsError,
+        isCalculatingColumnTotals,
+        isCalculatingRowTotals,
+        isCalculatingRowSubtotals,
+        isCalculatingGrandTotals,
+        isCalculatingSubtotals,
+    } = visualizationConfig.chartConfig;
+
+    const onColumnWidthChange =
+        !isDashboard && isEditMode !== false
+            ? (fieldId: string, width: number) => {
+                  updateColumnProperty(fieldId, { width });
+              }
+            : undefined;
+
+    if (pivotTableData.error) {
+        const isWorkerFetchError = isChunkLoadError(pivotTableData.error);
+        if (isWorkerFetchError) {
+            return (
+                <SuboptimalState
+                    icon={IconAlertCircle}
+                    title="Application update required"
+                    description={
+                        <Box>
+                            <Text mb="xs">
+                                Refresh your browser to load the latest version
+                                and display this visualization correctly.
+                            </Text>
+                            <Text size="sm" c="dimmed">
+                                If this persists after refreshing, contact
+                                support.
+                            </Text>
+                        </Box>
+                    }
+                    action={
+                        <Button
+                            variant="default"
+                            size={'xs'}
+                            leftSection={<IconRefresh size={16} />}
+                            onClick={triggerChunkErrorReload}
+                        >
+                            Refresh page
+                        </Button>
+                    }
+                />
+            );
+        }
+        return (
+            <SuboptimalState
+                title="Results not available"
+                description={pivotTableData.error}
+                icon={IconAlertCircle}
+            />
+        );
+    }
+
+    // Pivot is configured but the current results weren't computed with the same
+    // pivot dimensions (pivot just added, or config changed without re-running).
+    // Prompt a re-run in the editor instead of an empty/stale table.
+    if (
+        isPivotTableEnabled &&
+        isPivotResultStale &&
+        !isDashboard &&
+        isEditMode &&
+        !isLoading
+    ) {
+        return <PivotRerunState />;
+    }
+
+    if (pivotTableData.loading || pivotTableData.data) {
+        return (
+            <Box
+                p={isDashboard ? 0 : 'xs'}
+                pb={showResultsTotal ? 'xxl' : 'xl'}
+                miw="100%"
+                h="100%"
+            >
+                {pivotTableData.data && resultsData?.hasFetchedAllRows ? (
+                    <>
+                        {hasExplorerStore && !isDashboard ? (
+                            <ExplorerPivotTable
+                                className={className}
+                                data={pivotTableData.data}
+                                isMinimal={minimal}
+                                isDashboard={isDashboard}
+                                conditionalFormattings={conditionalFormattings}
+                                minMaxMap={minMaxMap}
+                                getFieldLabel={getFieldLabel}
+                                getField={getField}
+                                hideRowNumbers={hideRowNumbers}
+                                showSubtotals={showSubtotals}
+                                showSubtotalsExpanded={showSubtotalsExpanded}
+                                showRowGrouping={showRowGrouping}
+                                columnProperties={
+                                    visualizationConfig.chartConfig
+                                        .columnProperties
+                                }
+                                onColumnWidthChange={onColumnWidthChange}
+                                parameters={parameters}
+                                isColumnTotalsLoading={
+                                    isCalculatingColumnTotals
+                                }
+                                columnTotalsError={columnTotalsError}
+                                rowTotalsError={rowTotalsError}
+                                grandTotalsError={grandTotalsError}
+                                columnSubtotalsError={columnSubtotalsError}
+                                rowSubtotalsError={rowSubtotalsError}
+                                isRowTotalsLoading={isCalculatingRowTotals}
+                                isRowSubtotalsLoading={
+                                    isCalculatingRowSubtotals
+                                }
+                                isGrandTotalsLoading={isCalculatingGrandTotals}
+                                isSubtotalsLoading={isCalculatingSubtotals}
+                                {...rest}
+                            />
+                        ) : (
+                            <PivotTable
+                                className={className}
+                                data={pivotTableData.data}
+                                isMinimal={minimal}
+                                isDashboard={isDashboard}
+                                conditionalFormattings={conditionalFormattings}
+                                minMaxMap={minMaxMap}
+                                getFieldLabel={getFieldLabel}
+                                getField={getField}
+                                hideRowNumbers={hideRowNumbers}
+                                showSubtotals={showSubtotals}
+                                showSubtotalsExpanded={showSubtotalsExpanded}
+                                showRowGrouping={showRowGrouping}
+                                columnProperties={
+                                    visualizationConfig.chartConfig
+                                        .columnProperties
+                                }
+                                onColumnWidthChange={onColumnWidthChange}
+                                parameters={parameters}
+                                isColumnTotalsLoading={
+                                    isCalculatingColumnTotals
+                                }
+                                columnTotalsError={columnTotalsError}
+                                rowTotalsError={rowTotalsError}
+                                grandTotalsError={grandTotalsError}
+                                columnSubtotalsError={columnSubtotalsError}
+                                rowSubtotalsError={rowSubtotalsError}
+                                isRowTotalsLoading={isCalculatingRowTotals}
+                                isRowSubtotalsLoading={
+                                    isCalculatingRowSubtotals
+                                }
+                                isGrandTotalsLoading={isCalculatingGrandTotals}
+                                isSubtotalsLoading={isCalculatingSubtotals}
+                                {...rest}
+                            />
+                        )}
+                        {showResultsTotal && (
+                            <Flex justify="flex-end" pt="xxs" align="center">
+                                <ResultCount
+                                    count={pivotTableData.data.rowsCount}
+                                />
+                            </Flex>
+                        )}
+                    </>
+                ) : (
+                    <LoadingChart />
+                )}
+            </Box>
+        );
+    }
+
+    return (
+        <Box p={isDashboard ? 0 : 'xs'} pb="md" miw="100%" h="100%">
+            <Table
+                isDashboard={isDashboard}
+                minimal={minimal}
+                $shouldExpand={$shouldExpand}
+                className={className}
+                status={loadResultsStatus}
+                data={slicedRows}
+                totalRowsCount={totalRowsCount}
+                isFetchingRows={!!resultsData?.isFetchingRows}
+                loadingState={() => <LoadingChart />}
+                emptyState={isDashboard ? DashboardEmptyState : undefined}
+                fetchMoreRows={resultsData?.fetchMoreRows || noop}
+                columns={tableColumns}
+                columnOrder={columnOrder}
+                hideRowNumbers={hideRowNumbers}
+                showColumnCalculation={showColumnCalculation}
+                showSubtotals={showSubtotals}
+                showSubtotalsExpanded={showSubtotalsExpanded}
+                showRowGrouping={showRowGrouping}
+                conditionalFormattings={conditionalFormattings}
+                minMaxMap={minMaxMap}
+                onColumnWidthChange={onColumnWidthChange}
+                columnProperties={
+                    visualizationConfig.chartConfig.columnProperties
+                }
+                footer={pagination}
+                headerContextMenu={headerContextMenu}
+                cellContextMenu={cellContextMenu}
+                pagination={{ showResultsTotal }}
+                {...rest}
+            />
+        </Box>
+    );
+};
+
+export default SimpleTable;

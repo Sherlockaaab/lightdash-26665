@@ -1,0 +1,151 @@
+import { SupportedDbtAdapter } from '../types/dbt';
+import {
+    DuckdbConnectionType,
+    WarehouseTypes,
+    type WarehouseCredentials,
+} from '../types/projects';
+import type { WarehouseSqlBuilder } from '../types/warehouse';
+import { VizAggregationOptions } from '../visualizations/types';
+import assertUnreachable from './assertUnreachable';
+
+export type ConnectionDefaults = {
+    database: string | undefined;
+    schema: string | undefined;
+};
+
+const nonEmpty = (value: string | undefined): string | undefined =>
+    value || undefined;
+
+export const getConnectionDefaults = (
+    credentials: WarehouseCredentials,
+): ConnectionDefaults => {
+    switch (credentials.type) {
+        case WarehouseTypes.POSTGRES:
+        case WarehouseTypes.REDSHIFT:
+        case WarehouseTypes.TRINO:
+            return {
+                database: nonEmpty(credentials.dbname),
+                schema: nonEmpty(credentials.schema),
+            };
+        case WarehouseTypes.SNOWFLAKE:
+        case WarehouseTypes.ATHENA:
+            return {
+                database: nonEmpty(credentials.database),
+                schema: nonEmpty(credentials.schema),
+            };
+        case WarehouseTypes.BIGQUERY:
+            return {
+                database: nonEmpty(credentials.project),
+                schema: nonEmpty(credentials.dataset),
+            };
+        case WarehouseTypes.DATABRICKS:
+            return {
+                database: nonEmpty(credentials.catalog),
+                schema: nonEmpty(credentials.database),
+            };
+        case WarehouseTypes.CLICKHOUSE:
+            return {
+                database: undefined,
+                schema: nonEmpty(credentials.schema),
+            };
+        case WarehouseTypes.DUCKDB:
+            if (credentials.connectionType === DuckdbConnectionType.DUCKLAKE) {
+                return {
+                    database: nonEmpty(credentials.catalogAlias) ?? 'ducklake',
+                    schema: nonEmpty(credentials.schema),
+                };
+            }
+            if (credentials.connectionType === DuckdbConnectionType.EMBEDDED) {
+                return {
+                    database: undefined,
+                    schema: nonEmpty(credentials.schema),
+                };
+            }
+            return {
+                database: nonEmpty(credentials.database),
+                schema: nonEmpty(credentials.schema),
+            };
+        default:
+            return assertUnreachable(
+                credentials,
+                'Unknown warehouse type when getting connection defaults',
+            );
+    }
+};
+
+// `NULL = NULL` is NULL in standard SQL, which silently drops rows in JOINs.
+export const defaultNullSafeEqualSql = (left: string, right: string): string =>
+    `(${left} = ${right} OR (${left} IS NULL AND ${right} IS NULL))`;
+
+/**
+ * @deprecated use WarehouseSqlBuilder.getFieldQuoteChar instead
+ * @param warehouseType
+ */
+export const getFieldQuoteChar = (
+    warehouseType: WarehouseTypes | undefined,
+) => {
+    if (warehouseType) {
+        switch (warehouseType) {
+            case WarehouseTypes.BIGQUERY:
+            case WarehouseTypes.DATABRICKS:
+                return '`';
+            case WarehouseTypes.SNOWFLAKE:
+            case WarehouseTypes.REDSHIFT:
+            case WarehouseTypes.POSTGRES:
+            case WarehouseTypes.TRINO:
+            case WarehouseTypes.CLICKHOUSE:
+            case WarehouseTypes.ATHENA:
+            case WarehouseTypes.DUCKDB:
+                return '"';
+            default:
+                return assertUnreachable(
+                    warehouseType,
+                    `Unknown warehouse type ${warehouseType}`,
+                );
+        }
+    }
+    return '"';
+};
+
+export const getAggregatedField = (
+    warehouseSqlBuilder: WarehouseSqlBuilder,
+    aggregation: VizAggregationOptions,
+    reference: string,
+): string => {
+    const q = warehouseSqlBuilder.getFieldQuoteChar();
+    const adapterType = warehouseSqlBuilder.getAdapterType();
+    switch (adapterType) {
+        case SupportedDbtAdapter.BIGQUERY:
+        case SupportedDbtAdapter.DATABRICKS:
+        case SupportedDbtAdapter.SPARK:
+        case SupportedDbtAdapter.SNOWFLAKE:
+        case SupportedDbtAdapter.REDSHIFT:
+        case SupportedDbtAdapter.TRINO:
+        case SupportedDbtAdapter.ATHENA:
+        case SupportedDbtAdapter.DUCKDB:
+            const aggregationFunction =
+                aggregation === VizAggregationOptions.ANY
+                    ? 'ANY_VALUE'
+                    : aggregation;
+            return `${aggregationFunction}(${q}${reference}${q})`;
+
+        case SupportedDbtAdapter.POSTGRES:
+            if (aggregation === VizAggregationOptions.ANY) {
+                // ANY_VALUE on Postgres is only available from version v16+
+                return `(ARRAY_AGG(${q}${reference}${q}))[1]`;
+            }
+            break;
+        case SupportedDbtAdapter.CLICKHOUSE:
+            if (aggregation === VizAggregationOptions.ANY) {
+                // ClickHouse uses any() function for ANY_VALUE equivalent
+                return `any(${q}${reference}${q})`;
+            }
+            break;
+        default:
+            return assertUnreachable(
+                adapterType,
+                `Unknown warehouse type ${adapterType}`,
+            );
+    }
+    return `${aggregation}(${q}${reference}${q})`;
+};

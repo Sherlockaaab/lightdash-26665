@@ -1,0 +1,851 @@
+import { subject } from '@casl/ability';
+import {
+    assertUnreachable,
+    ChartType,
+    DashboardTileTypes,
+    getDefaultChartTileSize,
+    hasUnusedDimensions,
+    type CreateChartInDashboard,
+    type CreateDashboardChartTile,
+    type CreateSavedChartVersion,
+    type DashboardChartTile,
+    type DashboardTile,
+    type DashboardVersionedFields,
+    type SavedChart,
+} from '@lightdash/common';
+import {
+    Button,
+    Group,
+    LoadingOverlay,
+    Radio,
+    Stack,
+    Text,
+    Textarea,
+    TextInput,
+} from '@mantine-8/core';
+import { useForm, zodResolver } from '@mantine/form';
+import { IconPlus } from '@tabler/icons-react';
+import { useCallback, useEffect, useMemo, useState, type FC } from 'react';
+import { useNavigate } from 'react-router';
+import { v4 as uuid4 } from 'uuid';
+import { z } from 'zod';
+import {
+    appendNewTilesToBottom,
+    useCreateMutation as useCreateDashboardMutation,
+    useDashboardQuery,
+    useUpdateDashboard,
+    updateDashboardApi,
+} from '../../../../hooks/dashboard/useDashboard';
+import { useDashboards } from '../../../../hooks/dashboard/useDashboards';
+import useDashboardStorage from '../../../../hooks/dashboard/useDashboardStorage';
+import useToaster from '../../../../hooks/toaster/useToaster';
+import { useCreateMutation } from '../../../../hooks/useSavedQuery';
+import { useSpaceManagement } from '../../../../hooks/useSpaceManagement';
+import {
+    useCreateMutation as useCreateSpaceMutation,
+    useSpaceSummaries,
+} from '../../../../hooks/useSpaces';
+import useApp from '../../../../providers/App/useApp';
+import Callout from '../../Callout';
+import MantineIcon from '../../MantineIcon';
+import classes from './ChartCreateModal.module.css';
+import SaveToDashboardForm from './SaveToDashboardForm';
+import SaveToSpaceForm from './SaveToSpaceForm';
+import {
+    DEFAULT_CHART_METADATA,
+    ModalStep,
+    SaveDestination,
+    saveToDashboardSchema,
+    saveToSpaceSchema,
+    type ChartMetadata,
+} from './types';
+
+const saveToSpaceOrDashboardSchema = z
+    .object({
+        name: z.string().min(1),
+        description: z.string().nullable(),
+    })
+    // for saving to the dashboard
+    .merge(saveToDashboardSchema)
+    // for saving to the space
+    .merge(saveToSpaceSchema);
+const saveToSpaceOrDashboardResolver = zodResolver(
+    saveToSpaceOrDashboardSchema,
+);
+
+type FormValues = z.infer<typeof saveToSpaceOrDashboardSchema>;
+
+type Props = {
+    projectUuid?: string;
+    savedData: CreateSavedChartVersion;
+    onConfirm: (savedData: SavedChart) => void;
+    onClose: () => void;
+    dashboardInfoFromSavedData?: {
+        dashboardUuid: string | null;
+        dashboardName: string | null;
+    };
+    /**
+     * When the editor is opened from a dashboard tile, this carries the
+     * originating dashboard so that the radio can offer a third option to save
+     * the new chart into that dashboard (mirroring the in-dashboard save flow).
+     */
+    originatingDashboard?: {
+        dashboardUuid: string;
+        dashboardName: string;
+    } | null;
+    defaultSpaceUuid?: string | undefined;
+    forcedSpaceUuid?: string | undefined;
+    chartMetadata?: ChartMetadata;
+    redirectOnSuccess?: boolean;
+    showViewChartAction?: boolean;
+};
+
+export const SaveToSpaceOrDashboard: FC<Props> = ({
+    projectUuid,
+    savedData,
+    defaultSpaceUuid,
+    onConfirm,
+    onClose,
+    dashboardInfoFromSavedData = { dashboardUuid: null, dashboardName: null },
+    originatingDashboard = null,
+    forcedSpaceUuid,
+    chartMetadata = DEFAULT_CHART_METADATA,
+    redirectOnSuccess = true,
+    showViewChartAction = true,
+}) => {
+    const { user } = useApp();
+    const navigate = useNavigate();
+    const { showToastSuccess } = useToaster();
+
+    const { mutateAsync: createChart, isLoading: isSavingChart } =
+        useCreateMutation({ redirectOnSuccess, showViewChartAction });
+
+    const {
+        clearIsEditingDashboardChart,
+        getUnsavedDashboardTiles,
+        setUnsavedDashboardTiles,
+        getDashboardActiveTabUuid,
+        setDashboardChartInfo,
+    } = useDashboardStorage();
+
+    const [saveDestination, setSaveDestination] = useState<SaveDestination>(
+        SaveDestination.Space,
+    );
+    const [currentStep, setCurrentStep] = useState<ModalStep>(
+        ModalStep.InitialInfo,
+    );
+    const [isCreatingNewDashboard, setIsCreatingNewDashboard] = useState(false);
+    const [isCreatingNewSpaceForDashboard, setIsCreatingNewSpaceForDashboard] =
+        useState(false);
+
+    const spaceManagement = useSpaceManagement({
+        projectUuid,
+        defaultSpaceUuid,
+    });
+
+    const {
+        selectedSpaceUuid,
+        isCreatingNewSpace,
+        openCreateSpaceForm,
+        handleCreateNewSpace,
+    } = spaceManagement;
+
+    const form = useForm<FormValues>({
+        validate: saveToSpaceOrDashboardResolver,
+    });
+
+    // Check if the chart has unused dimensions that may cause incorrect results
+    const showUnusedDimensionsWarning = useMemo(() => {
+        const pivotDimensions = savedData.pivotConfig?.columns ?? [];
+        const queryDimensions = savedData.metricQuery?.dimensions ?? [];
+        return hasUnusedDimensions({
+            chartType: savedData.chartConfig?.type,
+            chartConfig: savedData.chartConfig?.config,
+            pivotDimensions,
+            queryDimensions,
+        });
+    }, [savedData]);
+
+    const {
+        data: dashboards,
+        isLoading: isLoadingDashboards,
+        isSuccess: isDashboardsSuccess,
+    } = useDashboards(
+        projectUuid,
+        {
+            enabled: !forcedSpaceUuid,
+            staleTime: 0,
+        },
+        !forcedSpaceUuid,
+    );
+
+    const {
+        data: spaces,
+        isLoading: isLoadingSpaces,
+        isSuccess: isSpacesSuccess,
+    } = useSpaceSummaries(projectUuid, true, {
+        select: (data) =>
+            data.filter((space) =>
+                // Only get spaces that the user can create charts to
+                user.data?.ability.can(
+                    'create',
+                    subject('SavedChart', {
+                        ...space,
+                        access: space.userAccess ? [space.userAccess] : [],
+                    }),
+                ),
+            ),
+        enabled: !forcedSpaceUuid,
+        staleTime: 0,
+    });
+
+    const { initialize, setFieldValue, setFieldError, clearFieldError } = form;
+
+    useEffect(
+        function initializeForm() {
+            if (
+                !forcedSpaceUuid &&
+                (!isSpacesSuccess || !isDashboardsSuccess)
+            ) {
+                return;
+            }
+            if (form.initialized) return;
+
+            const initialValues: FormValues = {
+                ...chartMetadata,
+                newSpaceName: null,
+                dashboardUuid: dashboardInfoFromSavedData.dashboardUuid,
+                spaceUuid: forcedSpaceUuid ?? null,
+                newDashboardName: null,
+                newDashboardDescription: null,
+            };
+
+            initialize(initialValues);
+        },
+        [
+            form.initialized,
+            initialize,
+            dashboardInfoFromSavedData.dashboardUuid,
+            isDashboardsSuccess,
+            isSpacesSuccess,
+            chartMetadata,
+            forcedSpaceUuid,
+        ],
+    );
+
+    // If default space is set, set the spaceUuid to the default space
+    // This happens when the user creates a chart from a space view, so that space is selected by default
+    const setPreselectedSpace = useCallback(() => {
+        if (form.values.spaceUuid === null) {
+            const isValidDefaultSpaceUuid = spaces?.some(
+                (space) => space.uuid === defaultSpaceUuid,
+            );
+
+            const initialSpaceUuid = isValidDefaultSpaceUuid
+                ? defaultSpaceUuid
+                : spaces?.find((space) => !space.parentSpaceUuid)?.uuid;
+
+            if (initialSpaceUuid) {
+                spaceManagement.setSelectedSpaceUuid(initialSpaceUuid);
+
+                setFieldValue('spaceUuid', initialSpaceUuid);
+            }
+        }
+    }, [
+        setFieldValue,
+        spaces,
+        defaultSpaceUuid,
+        spaceManagement,
+        form.values.spaceUuid,
+    ]);
+
+    const { mutateAsync: updateDashboard } = useUpdateDashboard(
+        form.values.dashboardUuid ?? undefined,
+        projectUuid,
+    );
+    const { mutateAsync: createDashboard, isLoading: isCreatingDashboard } =
+        useCreateDashboardMutation(projectUuid);
+    const { mutateAsync: createSpace, isLoading: isCreatingSpace } =
+        useCreateSpaceMutation(projectUuid);
+    const {
+        data: selectedDashboard,
+        isLoading: isLoadingSelectedDashboard,
+        isError: isSelectedDashboardError,
+        error: selectedDashboardError,
+    } = useDashboardQuery({
+        uuidOrSlug: form.values.dashboardUuid ?? undefined,
+        projectUuid,
+    });
+
+    const { data: originatingDashboardData } = useDashboardQuery({
+        uuidOrSlug: originatingDashboard?.dashboardUuid ?? undefined,
+        projectUuid,
+    });
+
+    // Handle dashboard selection errors
+    useEffect(() => {
+        if (selectedDashboardError) {
+            setFieldError(
+                'dashboardUuid',
+                `Failed to load dashboard. ${selectedDashboardError.error.message}`,
+            );
+        } else {
+            clearFieldError('dashboardUuid');
+        }
+    }, [selectedDashboardError, setFieldError, clearFieldError]);
+
+    const isFormReadyToSave = useMemo(() => {
+        // OriginatingDashboard skips step 2 — it submits straight from
+        // InitialInfo as soon as the chart has a name.
+        if (forcedSpaceUuid) {
+            return !!form.values.name;
+        }
+        if (saveDestination === SaveDestination.OriginatingDashboard) {
+            return !!form.values.name && !!originatingDashboard;
+        }
+        if (currentStep === ModalStep.SelectDestination) {
+            if (saveDestination === SaveDestination.Space) {
+                return (
+                    form.values.newSpaceName ||
+                    (form.values.spaceUuid !== null &&
+                        form.values.spaceUuid !== undefined)
+                );
+            }
+            if (saveDestination === SaveDestination.Dashboard) {
+                if (isCreatingNewDashboard) {
+                    if (!form.values.newDashboardName) {
+                        return false;
+                    }
+                    return isCreatingNewSpaceForDashboard
+                        ? !!form.values.newSpaceName
+                        : !!form.values.spaceUuid;
+                }
+                return (
+                    form.values.dashboardUuid &&
+                    selectedDashboard &&
+                    !isLoadingSelectedDashboard &&
+                    !isSelectedDashboardError
+                );
+            }
+        }
+        return false;
+    }, [
+        currentStep,
+        form.values,
+        saveDestination,
+        selectedDashboard,
+        isLoadingSelectedDashboard,
+        isSelectedDashboardError,
+        originatingDashboard,
+        isCreatingNewDashboard,
+        isCreatingNewSpaceForDashboard,
+        forcedSpaceUuid,
+    ]);
+
+    const handleOnSubmit = useCallback(
+        async (values: FormValues) => {
+            if (!isFormReadyToSave) {
+                return;
+            }
+
+            let savedQuery: SavedChart | undefined;
+            if (forcedSpaceUuid) {
+                savedQuery = await createChart({
+                    ...savedData,
+                    name: values.name,
+                    description: values.description ?? undefined,
+                    spaceUuid: forcedSpaceUuid,
+                    dashboardUuid: undefined,
+                });
+            }
+
+            /**
+             * Save back to the dashboard the editor was opened from.
+             * Mirrors `SaveToDashboard` — stages the new tile in
+             * sessionStorage and navigates to the dashboard editor so the
+             * user can review/save unsaved dashboard changes.
+             */
+            if (
+                !savedQuery &&
+                saveDestination === SaveDestination.OriginatingDashboard &&
+                originatingDashboard &&
+                projectUuid
+            ) {
+                const newChartInDashboard: CreateChartInDashboard = {
+                    ...savedData,
+                    name: values.name,
+                    description: values.description ?? undefined,
+                    dashboardUuid: originatingDashboard.dashboardUuid,
+                };
+                savedQuery = await createChart(newChartInDashboard);
+                const activeTabUuid = getDashboardActiveTabUuid(
+                    originatingDashboard.dashboardUuid,
+                );
+                const newTile: CreateDashboardChartTile = {
+                    uuid: uuid4(),
+                    type: DashboardTileTypes.SAVED_CHART,
+                    tabUuid: activeTabUuid ?? undefined,
+                    properties: {
+                        belongsToDashboard: true,
+                        savedChartUuid: savedQuery.uuid,
+                        chartName: values.name,
+                    },
+                    ...getDefaultChartTileSize(savedData.chartConfig?.type),
+                };
+                const unsavedTiles = getUnsavedDashboardTiles(
+                    originatingDashboard.dashboardUuid,
+                );
+                const existingTiles =
+                    unsavedTiles?.length > 0
+                        ? unsavedTiles
+                        : originatingDashboardData?.tiles;
+                setUnsavedDashboardTiles(
+                    originatingDashboard.dashboardUuid,
+                    appendNewTilesToBottom<
+                        DashboardTile | CreateDashboardChartTile
+                    >(existingTiles ?? [], [newTile]),
+                );
+                void navigate(
+                    activeTabUuid
+                        ? `/projects/${projectUuid}/dashboards/${originatingDashboard.dashboardUuid}/edit/tabs/${activeTabUuid}`
+                        : `/projects/${projectUuid}/dashboards/${originatingDashboard.dashboardUuid}/edit`,
+                );
+                showToastSuccess({
+                    title: `Success! ${values.name} was added to ${originatingDashboard.dashboardName}`,
+                });
+            }
+
+            /**
+             * Create chart
+             * Save to dashboard by creating a new tile and then updating the dashboard by sending it to the bottom.
+             * If isCreatingNewDashboard, create the destination dashboard (and optionally a space for it) first.
+             */
+            if (saveDestination === SaveDestination.Dashboard) {
+                let destinationDashboard = selectedDashboard;
+
+                if (isCreatingNewDashboard) {
+                    let newDashboardSpaceUuid = values.spaceUuid;
+                    if (isCreatingNewSpaceForDashboard && values.newSpaceName) {
+                        const newSpace = await createSpace({
+                            name: values.newSpaceName,
+                            inheritParentPermissions: true,
+                            access: [],
+                        });
+                        newDashboardSpaceUuid = newSpace.uuid;
+                    }
+
+                    if (!newDashboardSpaceUuid || !values.newDashboardName) {
+                        throw new Error(
+                            'A name and space are required to create a new dashboard.',
+                        );
+                    }
+
+                    destinationDashboard = await createDashboard({
+                        name: values.newDashboardName,
+                        description: values.newDashboardDescription ?? '',
+                        spaceUuid: newDashboardSpaceUuid,
+                        tiles: [],
+                        tabs: [],
+                    });
+                }
+
+                if (!destinationDashboard) {
+                    throw new Error(
+                        'Dashboard not found or failed to load. Please try selecting a different dashboard.',
+                    );
+                }
+
+                savedQuery = await createChart({
+                    ...savedData,
+                    name: values.name,
+                    description: values.description ?? undefined,
+                    dashboardUuid: destinationDashboard.uuid,
+                });
+                const firstTab = destinationDashboard.tabs?.[0];
+                const newTile: DashboardChartTile = {
+                    uuid: uuid4(),
+                    type: DashboardTileTypes.SAVED_CHART,
+                    tabUuid: firstTab?.uuid,
+                    properties: {
+                        belongsToDashboard: true,
+                        savedChartUuid: savedQuery.uuid,
+                        chartName: values.name,
+                        // BigNumber charts default to hidden title for cleaner appearance
+                        hideTitle:
+                            savedData.chartConfig?.type === ChartType.BIG_NUMBER
+                                ? true
+                                : undefined,
+                    },
+                    ...getDefaultChartTileSize(savedData.chartConfig?.type),
+                };
+                const updateFields: DashboardVersionedFields = {
+                    filters: destinationDashboard.filters,
+                    tiles: appendNewTilesToBottom(destinationDashboard.tiles, [
+                        newTile,
+                    ]),
+                    tabs: destinationDashboard.tabs,
+                };
+                if (isCreatingNewDashboard && projectUuid) {
+                    await updateDashboardApi(
+                        destinationDashboard.uuid,
+                        updateFields,
+                        projectUuid,
+                    );
+                } else {
+                    await updateDashboard(updateFields);
+                }
+
+                // Set dashboard context to the destination so the chart viewer
+                // shows the correct "viewing this chart from within {dashboard}"
+                // banner.
+                setDashboardChartInfo({
+                    name: destinationDashboard.name,
+                    dashboardUuid: destinationDashboard.uuid,
+                });
+            }
+
+            /**
+             * Create space if user wants to create a new space
+             * Save to space by creating a new chart
+             */
+            if (!savedQuery && saveDestination === SaveDestination.Space) {
+                let newSpace = values.newSpaceName
+                    ? await handleCreateNewSpace({
+                          inheritParentPermissions: false,
+                      })
+                    : undefined;
+
+                const spaceUuid =
+                    newSpace?.uuid ?? values.spaceUuid ?? undefined;
+
+                savedQuery = await createChart({
+                    ...savedData,
+                    name: values.name,
+                    description: values.description ?? undefined,
+                    spaceUuid,
+                    dashboardUuid: undefined,
+                });
+            }
+
+            if (savedQuery) {
+                // Saving to a Space leaves the dashboard context behind — clear
+                // the editing flag so the banner disappears in the new viewer.
+                if (saveDestination === SaveDestination.Space) {
+                    clearIsEditingDashboardChart();
+                }
+                // Dashboard context is set inside the Dashboard branch above,
+                // covering both existing and freshly-created destinations.
+                onConfirm(savedQuery);
+                return savedQuery;
+            }
+        },
+        [
+            isFormReadyToSave,
+            saveDestination,
+            selectedDashboard,
+            createChart,
+            savedData,
+            updateDashboard,
+            handleCreateNewSpace,
+            onConfirm,
+            clearIsEditingDashboardChart,
+            setDashboardChartInfo,
+            originatingDashboard,
+            originatingDashboardData,
+            projectUuid,
+            navigate,
+            showToastSuccess,
+            getUnsavedDashboardTiles,
+            setUnsavedDashboardTiles,
+            getDashboardActiveTabUuid,
+            isCreatingNewDashboard,
+            isCreatingNewSpaceForDashboard,
+            createDashboard,
+            createSpace,
+            forcedSpaceUuid,
+        ],
+    );
+
+    const isLoading =
+        !form.initialized ||
+        (!forcedSpaceUuid && (isLoadingDashboards || isLoadingSpaces)) ||
+        isSavingChart ||
+        spaceManagement.createSpaceMutation.isLoading ||
+        isCreatingDashboard ||
+        isCreatingSpace;
+
+    const handleBack = () => {
+        setCurrentStep(ModalStep.InitialInfo);
+    };
+
+    const handleNextStep = () => {
+        setCurrentStep(ModalStep.SelectDestination);
+        if (saveDestination === SaveDestination.Space) {
+            setPreselectedSpace();
+        }
+    };
+
+    const skipDestinationStep =
+        !!forcedSpaceUuid ||
+        saveDestination === SaveDestination.OriginatingDashboard;
+
+    // Determine if we should show the "New Space" button
+    const shouldShowNewSpaceButton =
+        currentStep === ModalStep.SelectDestination &&
+        saveDestination === SaveDestination.Space &&
+        !isCreatingNewSpace;
+
+    // Get the name of the selected space for display in SpaceCreationForm
+    const selectedSpaceName = useMemo(() => {
+        if (!selectedSpaceUuid) return undefined;
+        return spaces?.find((space) => space.uuid === selectedSpaceUuid)?.name;
+    }, [selectedSpaceUuid, spaces]);
+
+    return (
+        <form
+            onSubmit={(e) => {
+                if (
+                    currentStep === ModalStep.InitialInfo &&
+                    !skipDestinationStep
+                ) {
+                    e.preventDefault();
+                    return;
+                }
+                form.onSubmit((values) => handleOnSubmit(values))(e);
+            }}
+        >
+            <LoadingOverlay visible={isLoading} />
+
+            <Stack gap="xs" p="md">
+                {currentStep === ModalStep.InitialInfo && (
+                    <>
+                        <TextInput
+                            label="Chart name"
+                            placeholder="eg. How many weekly active users do we have?"
+                            required
+                            {...form.getInputProps('name')}
+                            value={form.values.name ?? ''}
+                            data-testid="ChartCreateModal/NameInput"
+                        />
+                        <Textarea
+                            label="Chart description"
+                            placeholder="A few words to give your team some context"
+                            autosize
+                            maxRows={3}
+                            {...form.getInputProps('description')}
+                            value={form.values.description ?? ''}
+                        />
+
+                        {!forcedSpaceUuid && (
+                            <Stack gap="sm" mt="sm">
+                                <Text fw={500}>Save to</Text>
+
+                                <Radio.Group
+                                    value={saveDestination}
+                                    onChange={(value) =>
+                                        setSaveDestination(
+                                            value as SaveDestination,
+                                        )
+                                    }
+                                >
+                                    <Stack gap="xs">
+                                        <Radio
+                                            value={SaveDestination.Space}
+                                            label="Space"
+                                            disabled={
+                                                !spaces || isLoadingSpaces
+                                            }
+                                        />
+                                        {originatingDashboard && (
+                                            <Radio
+                                                value={
+                                                    SaveDestination.OriginatingDashboard
+                                                }
+                                                label={`"${originatingDashboard.dashboardName}" dashboard`}
+                                            />
+                                        )}
+                                        <Radio
+                                            value={SaveDestination.Dashboard}
+                                            label={
+                                                originatingDashboard
+                                                    ? 'Different dashboard'
+                                                    : 'Dashboard'
+                                            }
+                                        />
+                                    </Stack>
+                                </Radio.Group>
+                            </Stack>
+                        )}
+
+                        {showUnusedDimensionsWarning && (
+                            <Callout
+                                variant="warning"
+                                title="Chart configuration warning"
+                            >
+                                This chart has dimensions in the query that are
+                                not used in the chart configuration (x-axis,
+                                y-axis, or group by). This may cause incorrect
+                                results.
+                            </Callout>
+                        )}
+                    </>
+                )}
+
+                {currentStep === ModalStep.SelectDestination && (
+                    <>
+                        {saveDestination === SaveDestination.Space ? (
+                            <SaveToSpaceForm
+                                form={form}
+                                isLoading={isLoadingSpaces}
+                                spaces={spaces}
+                                projectUuid={projectUuid}
+                                spaceManagement={spaceManagement}
+                                selectedSpaceName={selectedSpaceName}
+                            />
+                        ) : saveDestination === SaveDestination.Dashboard ? (
+                            <SaveToDashboardForm
+                                form={form}
+                                isLoading={
+                                    isLoadingDashboards || isLoadingSpaces
+                                }
+                                spaces={spaces}
+                                dashboards={dashboards}
+                                isCreatingNewDashboard={isCreatingNewDashboard}
+                                onStartCreatingNewDashboard={() => {
+                                    setIsCreatingNewDashboard(true);
+                                    if (
+                                        spaces &&
+                                        spaces.length > 0 &&
+                                        !form.values.spaceUuid
+                                    ) {
+                                        const initialSpaceUuid =
+                                            (defaultSpaceUuid &&
+                                                spaces.some(
+                                                    (s) =>
+                                                        s.uuid ===
+                                                        defaultSpaceUuid,
+                                                ) &&
+                                                defaultSpaceUuid) ||
+                                            spaces.find(
+                                                (s) => !s.parentSpaceUuid,
+                                            )?.uuid ||
+                                            spaces[0]?.uuid ||
+                                            null;
+                                        form.setFieldValue(
+                                            'spaceUuid',
+                                            initialSpaceUuid,
+                                        );
+                                    }
+                                    if (!spaces || spaces.length === 0) {
+                                        setIsCreatingNewSpaceForDashboard(true);
+                                    }
+                                }}
+                                onCancelCreatingNewDashboard={() => {
+                                    setIsCreatingNewDashboard(false);
+                                    setIsCreatingNewSpaceForDashboard(false);
+                                    form.setFieldValue(
+                                        'newDashboardName',
+                                        null,
+                                    );
+                                    form.setFieldValue(
+                                        'newDashboardDescription',
+                                        null,
+                                    );
+                                    form.setFieldValue('newSpaceName', null);
+                                }}
+                                isCreatingNewSpaceForDashboard={
+                                    isCreatingNewSpaceForDashboard
+                                }
+                                onStartCreatingNewSpaceForDashboard={() =>
+                                    setIsCreatingNewSpaceForDashboard(true)
+                                }
+                                onCancelCreatingNewSpaceForDashboard={() => {
+                                    setIsCreatingNewSpaceForDashboard(false);
+                                    form.setFieldValue('newSpaceName', null);
+                                }}
+                            />
+                        ) : saveDestination ===
+                          SaveDestination.OriginatingDashboard ? null : (
+                            assertUnreachable(
+                                saveDestination,
+                                `Unknown save destination ${saveDestination}`,
+                            )
+                        )}
+                    </>
+                )}
+            </Stack>
+
+            <Group
+                justify={
+                    shouldShowNewSpaceButton ? 'space-between' : 'flex-end'
+                }
+                className={classes.footer}
+            >
+                {shouldShowNewSpaceButton && (
+                    <Button
+                        variant="subtle"
+                        size="xs"
+                        leftSection={<MantineIcon icon={IconPlus} />}
+                        onClick={openCreateSpaceForm}
+                    >
+                        New Space
+                    </Button>
+                )}
+
+                <Group gap="sm">
+                    {currentStep === ModalStep.InitialInfo ? (
+                        <>
+                            <Button onClick={onClose} variant="default">
+                                Cancel
+                            </Button>
+                            {skipDestinationStep ? (
+                                <Button
+                                    type="submit"
+                                    loading={isSavingChart}
+                                    disabled={!isFormReadyToSave}
+                                >
+                                    Save
+                                </Button>
+                            ) : (
+                                <Button
+                                    onClick={(
+                                        e: React.MouseEvent<HTMLButtonElement>,
+                                    ) => {
+                                        e.preventDefault();
+                                        handleNextStep();
+                                    }}
+                                    disabled={!form.values.name}
+                                    type="button"
+                                >
+                                    Next
+                                </Button>
+                            )}
+                        </>
+                    ) : (
+                        <>
+                            <Button onClick={handleBack} variant="default">
+                                Back
+                            </Button>
+                            <Button
+                                type="submit"
+                                loading={
+                                    isSavingChart ||
+                                    spaceManagement.createSpaceMutation
+                                        .isLoading ||
+                                    isCreatingDashboard ||
+                                    isCreatingSpace ||
+                                    (!!form.values.dashboardUuid &&
+                                        !isCreatingNewDashboard &&
+                                        isLoadingSelectedDashboard)
+                                }
+                                disabled={!isFormReadyToSave}
+                            >
+                                Save
+                            </Button>
+                        </>
+                    )}
+                </Group>
+            </Group>
+        </form>
+    );
+};

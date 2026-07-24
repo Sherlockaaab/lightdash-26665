@@ -1,0 +1,199 @@
+import {
+    defineUserAbility,
+    ForbiddenError,
+    OrganizationMemberRole,
+    PullRequestProvider,
+} from '@lightdash/common';
+import type { SessionUser } from '@lightdash/common';
+import { analyticsMock } from '../../analytics/LightdashAnalytics.mock';
+import { getOrRefreshToken } from '../../clients/github/Github';
+import { lightdashConfigMock } from '../../config/lightdashConfig.mock';
+import type { GithubAppInstallationsModel } from '../../models/GithubAppInstallations/GithubAppInstallationsModel';
+import type { GitUserCredentialsModel } from '../../models/GitUserCredentials/GitUserCredentialsModel';
+import type { UserModel } from '../../models/UserModel';
+import { GithubAppService } from './GithubAppService';
+
+vi.mock('../../clients/github/Github', () => ({
+    getGithubUserAuthorizeUrl: vi
+        .fn()
+        .mockReturnValue('https://github.com/login/oauth/authorize'),
+    getOrRefreshToken: vi.fn(),
+}));
+
+const organizationUuid = 'org-uuid';
+const userFields = {
+    userUuid: 'user-uuid',
+    organizationUuid,
+    organizationName: 'org',
+    organizationCreatedAt: new Date(),
+    role: OrganizationMemberRole.ADMIN,
+};
+const user = {
+    ...userFields,
+    ability: defineUserAbility(userFields, []),
+} as SessionUser;
+
+const buildService = ({
+    findCredential,
+    deleteCredential = vi.fn(),
+    updateTokens = vi.fn(),
+}: {
+    findCredential?: import('vitest').Mock;
+    deleteCredential?: import('vitest').Mock;
+    updateTokens?: import('vitest').Mock;
+} = {}) =>
+    new GithubAppService({
+        githubAppInstallationsModel:
+            {} as unknown as GithubAppInstallationsModel,
+        gitUserCredentialsModel: {
+            findCredential:
+                findCredential ?? vi.fn().mockResolvedValue(undefined),
+            deleteCredential,
+            updateTokens,
+        } as unknown as GitUserCredentialsModel,
+        userModel: {} as unknown as UserModel,
+        lightdashConfig: lightdashConfigMock,
+        analytics: analyticsMock,
+    });
+
+describe('GithubAppService', () => {
+    afterEach(() => {
+        vi.clearAllMocks();
+    });
+
+    describe('linkUserRedirect (open redirect protection)', () => {
+        it.each([
+            ['https://evil.com/phish', '/generalSettings/integrations'],
+            ['//evil.com', '/generalSettings/integrations'],
+            ['/\\evil.com', '/generalSettings/integrations'],
+            ['evil.com', '/generalSettings/integrations'],
+            ['https:evil.com', '/generalSettings/integrations'],
+        ])(
+            'coerces unsafe returnTo %s to a same-origin path',
+            async (returnToPath, expectedPath) => {
+                const service = buildService();
+                const { returnToUrl } = await service.linkUserRedirect(
+                    user,
+                    returnToPath,
+                );
+                expect(returnToUrl).toBe(
+                    `${lightdashConfigMock.siteUrl}${expectedPath}`,
+                );
+            },
+        );
+
+        it('preserves a safe same-origin relative path', async () => {
+            const service = buildService();
+            const { returnToUrl } = await service.linkUserRedirect(
+                user,
+                '/projects/abc/settings?tab=git',
+            );
+            expect(returnToUrl).toBe(
+                `${lightdashConfigMock.siteUrl}/projects/abc/settings?tab=git`,
+            );
+        });
+    });
+
+    describe('getAiWritebackAttribution', () => {
+        it('reports personal attribution with the linked login when a credential exists', async () => {
+            const service = buildService({
+                findCredential: vi.fn().mockResolvedValue({
+                    providerLogin: 'octocat',
+                    token: 't',
+                    refreshToken: 'r',
+                }),
+            });
+
+            const attribution = await service.getAiWritebackAttribution(user);
+
+            expect(attribution).toEqual({
+                mode: 'personal',
+                githubLogin: 'octocat',
+            });
+        });
+
+        it('reports org/canLink:true when no credential is linked', async () => {
+            const service = buildService({
+                findCredential: vi.fn().mockResolvedValue(undefined),
+            });
+
+            const attribution = await service.getAiWritebackAttribution(user);
+
+            expect(attribution).toEqual({ mode: 'org', canLink: true });
+        });
+
+        it('throws ForbiddenError when the caller cannot view their organization', async () => {
+            const findCredential = vi.fn();
+            const service = buildService({
+                findCredential,
+            });
+            // Ability scoped to a different org → cannot view this org.
+            const otherOrgUser = {
+                ...userFields,
+                ability: defineUserAbility(
+                    { ...userFields, organizationUuid: 'another-org-uuid' },
+                    [],
+                ),
+            } as SessionUser;
+
+            await expect(
+                service.getAiWritebackAttribution(otherOrgUser),
+            ).rejects.toThrow(ForbiddenError);
+            expect(findCredential).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('getValidUserToken (credential retention on refresh failure)', () => {
+        const credential = {
+            token: 'old-token',
+            refreshToken: 'refresh-token',
+        };
+
+        it('keeps the credential on a transient refresh failure', async () => {
+            const deleteCredential = vi.fn();
+            const service = buildService({
+                findCredential: vi.fn().mockResolvedValue(credential),
+                deleteCredential,
+            });
+            (getOrRefreshToken as import('vitest').Mock).mockRejectedValue(
+                Object.assign(new Error('socket hang up'), { status: 503 }),
+            );
+
+            const token = await service.getValidUserToken(
+                user.userUuid,
+                organizationUuid,
+            );
+
+            expect(token).toBeUndefined();
+            expect(deleteCredential).not.toHaveBeenCalled();
+        });
+
+        it('deletes the credential when the token is revoked', async () => {
+            const deleteCredential = vi.fn();
+            const service = buildService({
+                findCredential: vi.fn().mockResolvedValue(credential),
+                deleteCredential,
+            });
+            (getOrRefreshToken as import('vitest').Mock).mockRejectedValue(
+                Object.assign(new Error('bad refresh token'), {
+                    response: {
+                        status: 400,
+                        data: { error: 'bad_refresh_token' },
+                    },
+                }),
+            );
+
+            const token = await service.getValidUserToken(
+                user.userUuid,
+                organizationUuid,
+            );
+
+            expect(token).toBeUndefined();
+            expect(deleteCredential).toHaveBeenCalledWith(
+                user.userUuid,
+                organizationUuid,
+                PullRequestProvider.GITHUB,
+            );
+        });
+    });
+});

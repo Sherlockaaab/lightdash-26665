@@ -1,0 +1,285 @@
+import { NotFoundError } from '@lightdash/common';
+import { Readable } from 'stream';
+import type { LightdashAnalytics } from '../../analytics/LightdashAnalytics';
+import { type FileStorageClient } from '../../clients/FileStorage/FileStorageClient';
+import { lightdashConfigMock } from '../../config/lightdashConfig.mock';
+import type { LightdashConfig } from '../../config/parseConfig';
+import type { DbPersistentDownloadFile } from '../../database/entities/persistentDownloadFile';
+import { PersistentDownloadFileModel } from '../../models/PersistentDownloadFileModel';
+import { PersistentDownloadFileService } from './PersistentDownloadFileService';
+
+const mockS3GetFileUrl = vi.fn();
+const mockS3GetFileStream = vi.fn();
+const mockModelCreate = vi.fn();
+const mockModelGet = vi.fn();
+
+const baseData = {
+    s3Key: 'exports/test-file.csv',
+    fileType: 'csv',
+    organizationUuid: 'org-uuid-123',
+    projectUuid: 'project-uuid-456',
+    createdByUserUuid: 'user-uuid-789',
+};
+
+const createService = (
+    configOverrides: Partial<LightdashConfig['persistentDownloadUrls']> = {},
+) =>
+    new PersistentDownloadFileService({
+        analytics: {
+            track: vi.fn(),
+        } as unknown as LightdashAnalytics,
+        lightdashConfig: {
+            ...lightdashConfigMock,
+            persistentDownloadUrls: {
+                ...lightdashConfigMock.persistentDownloadUrls,
+                ...configOverrides,
+            },
+        },
+        persistentDownloadFileModel: {
+            create: mockModelCreate,
+            get: mockModelGet,
+        } as unknown as PersistentDownloadFileModel,
+        fileStorageClient: {
+            getFileUrl: mockS3GetFileUrl,
+            getFileStream: mockS3GetFileStream,
+        } as unknown as FileStorageClient,
+    });
+
+describe('PersistentDownloadFileService', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    describe('createPersistentUrl', () => {
+        it('should return raw S3 URL (honoring the requested expiry) when feature is disabled', async () => {
+            mockS3GetFileUrl.mockResolvedValue(
+                'https://s3.amazonaws.com/bucket/test-file.csv',
+            );
+            const service = createService({ enabled: false });
+
+            const url = await service.createPersistentUrl({
+                ...baseData,
+                expirationSeconds: 86400,
+            });
+
+            expect(url).toBe('https://s3.amazonaws.com/bucket/test-file.csv');
+            // The requested expiry is forwarded to the raw presigned URL.
+            expect(mockS3GetFileUrl).toHaveBeenCalledWith(
+                baseData.s3Key,
+                86400,
+            );
+            expect(mockModelCreate).not.toHaveBeenCalled();
+        });
+
+        it('should transparently use persistent URLs when the requested expiry exceeds the 7-day S3 limit, even with the feature off', async () => {
+            mockModelCreate.mockResolvedValue(undefined);
+            const service = createService({ enabled: false });
+
+            // 14 days — longer than a raw S3 presigned URL can live.
+            const url = await service.createPersistentUrl({
+                ...baseData,
+                expirationSeconds: 14 * 86400,
+            });
+
+            expect(url).toMatch(
+                /^https:\/\/test\.lightdash\.cloud\/api\/v1\/file\/[\w-]{21}$/,
+            );
+            expect(mockModelCreate).toHaveBeenCalled();
+            expect(mockS3GetFileUrl).not.toHaveBeenCalled();
+        });
+
+        it('should create persistent URL when feature is enabled', async () => {
+            mockModelCreate.mockResolvedValue(undefined);
+            const service = createService({
+                enabled: true,
+                expirationSeconds: 3600,
+            });
+
+            const url = await service.createPersistentUrl(baseData);
+
+            expect(url).toMatch(
+                /^https:\/\/test\.lightdash\.cloud\/api\/v1\/file\/[\w-]{21}$/,
+            );
+            expect(mockModelCreate).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    s3Key: baseData.s3Key,
+                    fileType: baseData.fileType,
+                    organizationUuid: baseData.organizationUuid,
+                    projectUuid: baseData.projectUuid,
+                    createdByUserUuid: baseData.createdByUserUuid,
+                    expiresAt: expect.any(Date),
+                }),
+            );
+            expect(mockS3GetFileUrl).not.toHaveBeenCalled();
+        });
+
+        it('should set expiresAt based on configured expirationSeconds', async () => {
+            mockModelCreate.mockResolvedValue(undefined);
+            const now = Date.now();
+            vi.spyOn(Date, 'now').mockReturnValue(now);
+
+            const service = createService({
+                enabled: true,
+                expirationSeconds: 7200,
+            });
+
+            await service.createPersistentUrl(baseData);
+
+            const createCall = mockModelCreate.mock.calls[0][0];
+            expect(createCall.expiresAt.getTime()).toBe(now + 7200 * 1000);
+
+            vi.restoreAllMocks();
+        });
+
+        it('should use expirationSeconds override when provided', async () => {
+            mockModelCreate.mockResolvedValue(undefined);
+            const now = Date.now();
+            vi.spyOn(Date, 'now').mockReturnValue(now);
+
+            const service = createService({
+                enabled: true,
+                expirationSeconds: 259200,
+            });
+
+            await service.createPersistentUrl({
+                ...baseData,
+                expirationSeconds: 86400,
+            });
+
+            const createCall = mockModelCreate.mock.calls[0][0];
+            expect(createCall.expiresAt.getTime()).toBe(now + 86400 * 1000);
+
+            vi.restoreAllMocks();
+        });
+
+        it('should fall back to config expirationSeconds when override is undefined', async () => {
+            mockModelCreate.mockResolvedValue(undefined);
+            const now = Date.now();
+            vi.spyOn(Date, 'now').mockReturnValue(now);
+
+            const service = createService({
+                enabled: true,
+                expirationSeconds: 259200,
+            });
+
+            await service.createPersistentUrl({
+                ...baseData,
+                expirationSeconds: undefined,
+            });
+
+            const createCall = mockModelCreate.mock.calls[0][0];
+            expect(createCall.expiresAt.getTime()).toBe(now + 259200 * 1000);
+
+            vi.restoreAllMocks();
+        });
+    });
+
+    describe('getSignedUrl', () => {
+        it('should return fresh S3 signed URL for valid file', async () => {
+            const futureDate = new Date(Date.now() + 3600 * 1000);
+            mockModelGet.mockResolvedValue({
+                nanoid: 'test-nanoid-123456789',
+                s3_key: 'exports/test-file.csv',
+                expires_at: futureDate,
+            } as DbPersistentDownloadFile);
+            mockS3GetFileUrl.mockResolvedValue(
+                'http://mock-s3:9000/mock_bucket/exports/test-file.csv?signed',
+            );
+
+            const service = createService({ enabled: true });
+            const url = await service.getSignedUrl('test-nanoid-123456789');
+
+            expect(url).toBe(
+                'http://mock-s3:9000/mock_bucket/exports/test-file.csv?signed',
+            );
+            expect(mockModelGet).toHaveBeenCalledWith('test-nanoid-123456789');
+            expect(mockS3GetFileUrl).toHaveBeenCalledWith(
+                'exports/test-file.csv',
+                300,
+            );
+        });
+
+        it('should throw NotFoundError for expired file', async () => {
+            const pastDate = new Date(Date.now() - 3600 * 1000);
+            mockModelGet.mockResolvedValue({
+                nanoid: 'test-nanoid-123456789',
+                s3_key: 'exports/test-file.csv',
+                expires_at: pastDate,
+            } as DbPersistentDownloadFile);
+
+            const service = createService({ enabled: true });
+
+            await expect(
+                service.getSignedUrl('test-nanoid-123456789'),
+            ).rejects.toThrow(NotFoundError);
+            expect(mockS3GetFileUrl).not.toHaveBeenCalled();
+        });
+
+        it('should throw NotFoundError when file does not exist', async () => {
+            mockModelGet.mockRejectedValue(
+                new NotFoundError('Cannot find file'),
+            );
+
+            const service = createService({ enabled: true });
+
+            await expect(
+                service.getSignedUrl('nonexistent-nanoid1234'),
+            ).rejects.toThrow(NotFoundError);
+        });
+    });
+
+    describe('getFileStream', () => {
+        it('should return S3 stream and metadata for valid file', async () => {
+            const futureDate = new Date(Date.now() + 3600 * 1000);
+            mockModelGet.mockResolvedValue({
+                nanoid: 'test-nanoid-123456789',
+                s3_key: 'exports/test-file.csv',
+                file_type: 'csv',
+                expires_at: futureDate,
+            } as DbPersistentDownloadFile);
+            const fakeStream = Readable.from(['hello,world\n']);
+            mockS3GetFileStream.mockResolvedValue(fakeStream);
+
+            const service = createService({ enabled: true });
+            const result = await service.getFileStream('test-nanoid-123456789');
+
+            expect(result.stream).toBe(fakeStream);
+            expect(result.fileType).toBe('csv');
+            expect(result.s3Key).toBe('exports/test-file.csv');
+            expect(mockS3GetFileStream).toHaveBeenCalledWith(
+                'exports/test-file.csv',
+            );
+            expect(mockS3GetFileUrl).not.toHaveBeenCalled();
+        });
+
+        it('should throw NotFoundError for expired file', async () => {
+            const pastDate = new Date(Date.now() - 3600 * 1000);
+            mockModelGet.mockResolvedValue({
+                nanoid: 'test-nanoid-123456789',
+                s3_key: 'exports/test-file.csv',
+                file_type: 'csv',
+                expires_at: pastDate,
+            } as DbPersistentDownloadFile);
+
+            const service = createService({ enabled: true });
+
+            await expect(
+                service.getFileStream('test-nanoid-123456789'),
+            ).rejects.toThrow(NotFoundError);
+            expect(mockS3GetFileStream).not.toHaveBeenCalled();
+        });
+
+        it('should throw NotFoundError when file does not exist', async () => {
+            mockModelGet.mockRejectedValue(
+                new NotFoundError('Cannot find file'),
+            );
+
+            const service = createService({ enabled: true });
+
+            await expect(
+                service.getFileStream('nonexistent-nanoid1234'),
+            ).rejects.toThrow(NotFoundError);
+            expect(mockS3GetFileStream).not.toHaveBeenCalled();
+        });
+    });
+});

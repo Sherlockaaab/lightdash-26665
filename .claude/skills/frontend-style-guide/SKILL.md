@@ -1,0 +1,404 @@
+---
+name: frontend-style-guide
+description: Apply the Lightdash frontend style guide when working on React components, migrating Mantine v6 to v8, or styling frontend code. Use when editing TSX files, fixing styling issues, or when user mentions Mantine, styling, or CSS modules.
+allowed-tools: Read, Edit, Write, Glob, Grep
+---
+
+# Lightdash Frontend Style Guide
+
+Apply these rules when working on any frontend component in `packages/frontend/`.
+
+## Mantine 8 Migration
+
+**CRITICAL**: We are migrating from Mantine 6 to 8. Always upgrade v6 components when you encounter them.
+
+## Component Checklist
+
+When creating/updating components:
+
+- [ ] Use `@mantine-8/core` imports
+- [ ] No `style` or `styles` or `sx` props
+- [ ] Check Mantine docs/types for available component props
+- [ ] Use inline-style component props for styling when available (and follow <=3 props rule)
+- [ ] Use CSS modules when component props aren't available or when more than 3 inline-style props are needed
+- [ ] Theme values ('md', 'lg', 'xl', or 'ldGray.1', 'ldGray.2', 'ldDark.1', 'ldDark.2', etc) instead of magic numbers
+- [ ] When using mantine colors in css modules, always use the theme awared variables:
+    - `--mantine-color-${color}-text`: for text on filled background
+    - `--mantine-color-${color}-filled`: for filled background (strong color)
+    - `--mantine-color-${color}-filled-hover`: for filled background on hover
+    - `--mantine-color-${color}-light`: for light background
+    - `--mantine-color-${color}-light-hover`: for light background on hover (light color)
+    - `--mantine-color-${color}-light-color`: for text on light background
+    - `--mantine-color-${color}-outline`: for outlines
+    - `--mantine-color-${color}-outline-hover`: for outlines on hover
+
+## Quick Migration Guide
+
+```tsx
+// ❌ Mantine 6
+import { Button, Group } from '@mantine/core';
+
+<Group spacing="xs" noWrap>
+    <Button sx={{ mt: 20 }}>Click</Button>
+</Group>;
+
+// ✅ Mantine 8
+import { Button, Group } from '@mantine-8/core';
+
+<Group gap="xs" wrap="nowrap">
+    <Button mt={20}>Click</Button>
+</Group>;
+```
+
+## Key Prop Changes
+
+- `spacing` → `gap`
+- `noWrap` → `wrap="nowrap"`
+- `sx` → Component props (e.g., `mt`, `w`, `c`) or CSS modules
+- `leftIcon` → `leftSection`
+- `rightIcon` → `rightSection`
+
+## Styling Best Practices
+
+### Core Principle: Theme First
+
+**The goal is to use theme defaults whenever possible.** Style overrides should be the exception, not the rule.
+
+### Styling Hierarchy
+
+1. **Best**: No custom styles (use theme defaults)
+2. **Theme extension**: For repeated patterns, add to `mantine8Theme.ts`
+3. **Component props**: Simple overrides (1-3 props like `mt="xl" w={240}`)
+4. **CSS modules**: Complex styling or more than 3 props
+
+### NEVER Use
+
+- `styles` prop (always use CSS modules instead)
+- `sx` prop (it's a v6 prop)
+- `style` prop (inline styles)
+
+### Theme Extensions (For Repeated Patterns)
+
+If you find yourself applying the same style override multiple times, add it to the theme in `mantine8Theme.ts`:
+
+```tsx
+// In src/mantine8Theme.ts - inside the components object
+components: {
+    Button: Button.extend({
+        styles: {
+            root: {
+                minWidth: '120px',
+                fontWeight: 600,
+            }
+        }
+    }),
+}
+```
+
+### Context-Specific Overrides
+
+#### Inline-style Component Props (1-3 simple props)
+
+```tsx
+// ✅ Good
+<Button mt="xl" w={240} c="blue.6">Submit</Button>
+
+// ❌ Bad - Too many props, use CSS modules instead
+<Button mt={20} mb={20} ml={10} mr={10} w={240} c="blue.6" bg="white">Submit</Button>
+```
+
+Common inline-style props:
+
+- Layout: `mt`, `mb`, `ml`, `mr`, `m`, `p`, `pt`, `pb`, `pl`, `pr`
+- Sizing: `w`, `h`, `maw`, `mah`, `miw`, `mih`
+- Colors: `c` (color), `bg` (background)
+- Font: `ff`, `fs`, `fw`
+- Text: `ta`, `lh`
+
+#### CSS Modules (complex styles or >3 props)
+
+Create a `.module.css` file in the same folder as the component:
+
+```css
+/* Component.module.css */
+.customCard {
+    transition: transform 0.2s ease;
+    cursor: pointer;
+}
+
+.customCard:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--mantine-shadow-lg);
+}
+```
+
+```tsx
+import styles from './Component.module.css';
+
+<Card className={styles.customCard}>{/* content */}</Card>;
+```
+
+**Do NOT include `.css.d.ts` files** - Vite handles this automatically.
+
+## Color Guidelines
+
+**Prefer default component colors** - Mantine handles theme switching automatically.
+
+When you need custom colors, use our custom scales for dark mode compatibility:
+
+```tsx
+// ❌ Bad - Standard Mantine colors (poor dark mode support)
+<Text c="gray.6">Secondary text</Text>
+
+// ✅ Good - ldGray for borders and neutral elements
+<Text c="ldGray.6">Secondary text</Text>
+
+// ✅ Good - ldDark for elements that appear dark in light mode
+<Button bg="ldDark.8" c="ldDark.0">Dark button</Button>
+
+// ✅ Good - Foreground/background variables
+<Text c="foreground">Primary text</Text>
+<Box bg="background">Main background</Box>
+```
+
+### Custom Color Scales
+
+| Token        | Purpose                                            |
+| ------------ | -------------------------------------------------- |
+| `ldGray.0-9` | Borders, subtle text, neutral UI elements          |
+| `ldDark.0-9` | Buttons/badges with dark backgrounds in light mode |
+| `background` | Page/card backgrounds                              |
+| `foreground` | Primary text color                                 |
+
+### Dark Mode in CSS Modules
+
+Use `@mixin dark` for theme-specific overrides:
+
+```css
+.clickableRow {
+    &:hover {
+        background-color: var(--mantine-color-ldGray-0);
+
+        @mixin dark {
+            background-color: var(--mantine-color-ldDark-5);
+        }
+    }
+}
+```
+
+Alternative: use CSS `light-dark()` function for single-line theme switching:
+
+```css
+.clickableRow:hover {
+    background-color: light-dark(
+        var(--mantine-color-ldGray-0),
+        var(--mantine-color-ldDark-5)
+    );
+}
+```
+
+## Always Use Theme Tokens
+
+```tsx
+// ❌ Bad - Magic numbers
+<Box p={16} mt={24}>
+
+// ✅ Good - Theme tokens
+<Box p="md" mt="lg">
+```
+
+## Beware of dependencies
+
+If a component is migrated to use Mantine 8 Menu.Item, ensure its parent also uses Mantine 8 Menu
+
+## Remove Dead Styles
+
+Before moving styles to CSS modules, check if they're actually needed:
+
+```tsx
+// ❌ Unnecessary - display: block has no effect on flex children
+<Flex justify="flex-end">
+    <Button style={{display: 'block'}}>Submit</Button>
+</Flex>
+
+// ✅ Better - Remove the style entirely
+<Flex justify="flex-end">
+    <Button>Submit</Button>
+</Flex>
+```
+
+## Shared Layout CSS Variables (heights, widths, z-indexes)
+
+Cross-cutting layout constants (navbar/header/banner/footer heights, page content
+widths, sidebar dimensions, dashboard header/tab heights and z-indexes) are exposed
+as **global CSS variables** so CSS modules can use them directly:
+
+```css
+/* ✅ Reference the global var — resolves on :root everywhere */
+.myPanel {
+    top: var(--dashboard-header-height);
+    max-width: var(--page-content-max-width-large);
+}
+```
+
+```css
+/* ❌ Don't hardcode the literal — drifts from the source of truth */
+.myPanel {
+    top: 50px;
+}
+```
+
+```tsx
+// ❌ Don't bridge a constant into CSS via an inline style object
+<div style={{ '--dashboard-header-height': `${DASHBOARD_HEADER_HEIGHT}px` }}>
+```
+
+**Source of truth:** the numeric values live in their `*/constants.ts` files
+(e.g. `components/common/Page/constants.ts`,
+`components/common/Dashboard/dashboard.constants.ts`) and are registered as CSS
+variables in **`src/mantine8CssVariablesResolver.ts`** (wired into `Mantine8Provider`
+via Mantine's `cssVariablesResolver`). Read that file for the full list of available
+`var(--...)` names before defining your own.
+
+**To add a new shared layout constant:** add the number to the relevant
+`constants.ts`, register it in `mantine8CssVariablesResolver.ts`, then reference
+`var(--your-name)` in CSS. Don't re-declare the literal in a `.module.css` file and
+don't pass it through an inline `style`. Keep using the numeric constant directly in
+TS where you need it as a JS value (e.g. a Mantine `h=` prop).
+
+## Theme-Aware Component Logic
+
+For JavaScript logic that needs to know the current theme:
+
+```tsx
+import { useMantineColorScheme } from '@mantine/core';
+
+const MyComponent = () => {
+    const { colorScheme } = useMantineColorScheme();
+    const iconColor = colorScheme === 'dark' ? 'blue.4' : 'blue.6';
+    // ...
+};
+```
+
+## Keep using mantine/core's clsx utility until we migrate to Mantine 8 fully
+
+```tsx
+import { clsx } from '@mantine/core';
+
+const MyComponent = () => {
+    return (
+        <div className={clsx('my-class', 'my-other-class')}>My Component</div>
+    );
+};
+```
+
+## Select/MultiSelect grouping has a different structure on Mantine 8
+
+```tsx
+<Select
+    label="Your favorite library"
+    placeholder="Pick value"
+    data={[
+        { group: 'Frontend', items: ['React', 'Angular'] },
+        { group: 'Backend', items: ['Express', 'Django'] },
+    ]}
+/>
+```
+
+## Reusable Components
+
+### Modals
+
+- **Always use `MantineModal`** from `components/common/MantineModal` - never use Mantine's Modal directly
+- See `stories/Modal.stories.tsx` for usage examples
+- For forms inside modals: use `id` on the form and `form="form-id"` on the submit button
+- For alerts inside modals: use `Callout` with variants `danger`, `warning`, `info`
+
+### Callouts
+
+- Use `Callout` from `components/common/Callout`
+- Variants: `danger`, `warning`, `info`
+
+### Empty / Unavailable Sections (dotted style)
+
+- **`<Paper variant="dotted">`** (also `Card`) renders a dashed `ldGray.3` border with a transparent background — the house style for empty, placeholder, or unavailable sections. Defined in `mantine8Theme.ts` (`paperDottedStyles`); used by e.g. `FavoritesPanel` and `AiAgentKnowledgeFilesSection`.
+- **Section failed to load**: use `InlineErrorState` from `components/common/InlineErrorState` — a dotted Paper with a muted message and optional `onRetry` button. Keep it quiet; a failing secondary panel shouldn't shout.
+- **Placeholder values** (stat tiles etc. with no data): render an em dash (`—`) in `ldGray.5` inside a dotted container rather than fake zeros or endless skeletons. Skeletons mean "loading", dotted means "nothing here".
+- Reserve `ErrorState` / `SuboptimalState` for whole-page failures.
+
+### Polymorphic Clickable Containers
+
+Use these when you need a layout container that is also clickable — avoids the native `<button>` background/border reset problem.
+
+- **`PolymorphicGroupButton`** from `components/common/PolymorphicGroupButton` — a `Group` (flex row) that is polymorphic and sets `cursor: pointer`. Use for horizontal groups of elements that act as a single button.
+- **`PolymorphicPaperButton`** from `components/common/PolymorphicPaperButton` — a `Paper` (card surface) that is polymorphic and sets `cursor: pointer`. Use for card-like clickable surfaces.
+
+Both accept all props of their base component (`GroupProps` / `PaperProps`) plus a `component` prop for the underlying element.
+
+```tsx
+// ✅ Clickable row without native button style bleed
+<PolymorphicGroupButton component="div" gap="sm" onClick={handleClick}>
+    <MantineIcon icon={IconFolder} />
+    <Text>Label</Text>
+</PolymorphicGroupButton>
+
+// ✅ Clickable card surface
+<PolymorphicPaperButton component="div" p="md" onClick={handleClick}>
+    Card content
+</PolymorphicPaperButton>
+
+// ❌ Avoid - native <button> brings unwanted background/border in menus and panels
+<UnstyledButton>
+    <Group>...</Group>
+</UnstyledButton>
+```
+
+### NumberInput
+
+- **Always use `NumberInput` from `components/common/NumberInput`** — never Mantine's NumberInput directly
+- Mantine 8's onChange emits `number | string` (empty field, half-typed values like `-`/`12.`, unsafe-large integers). The wrapper's `onNumberChange` shields you: it fires with a `number`, or `undefined` when the field is cleared — transient strings never fire
+- **Integer-only by default** — the wrapper defaults `decimalScale={0}` (most fields are ports, counts, timeouts). Decimal fields opt in with `decimalScale={2}` etc., or `decimalScale="unlimited"` to remove the cap
+- The raw `onChange` prop remains available only for `form.getInputProps()` spreads, where the form library owns parsing
+
+```tsx
+// ✅ Good - cleared field maps to a domain decision at the call site
+<NumberInput onNumberChange={(v) => setLimit(v ?? DEFAULT)} />
+
+// ✅ Good - number-or-undefined sinks take the callback directly
+<NumberInput decimalScale={2} onNumberChange={setThreshold} />
+
+// ✅ OK - form spread owns value/onChange
+<NumberInput {...form.getInputProps('warehouse.port')} />
+
+// ❌ Avoid - hand-rolled typeof guards on the raw Mantine component
+<MantineNumberInput onChange={(v) => { if (typeof v === 'number') setX(v); }} />
+```
+
+### EmptyStateLoader
+
+- Use `EmptyStateLoader` from `components/common/EmptyStateLoader` for **any** centered loading state: page-level guards, panels, tables, empty containers
+- Built on `SuboptimalState` (Mantine v8) — renders a spinner with an optional title, fully centered in its parent
+
+### TruncatedText
+
+- Use `TruncatedText` from `components/common/TruncatedText` whenever text may overflow a constrained width
+- Pass `maxWidth` (number or string) to control the truncation boundary
+- Automatically shows a tooltip with the full text **only when the text is actually truncated** (no tooltip spam for short names)
+- Defaults to `fz="sm"`; override via standard `Text` props
+
+```tsx
+// ✅ Good - truncates long names, tooltip only appears when needed
+<TruncatedText maxWidth={200}>{item.name}</TruncatedText>
+
+// ✅ Accepts any Text prop
+<TruncatedText maxWidth="100%" fw={500}>{space.name}</TruncatedText>
+```
+
+### Tables with search, pagination, and sorting
+
+Use the `ContentTable` component from `components/common/ContentTable` for tables with search, pagination, and sorting.
+If you need filters, use FilterFacet
+
+## Mantine Documentation
+
+List of all components and links to their documentation in LLM-friendly format: `https://mantine.dev/llms.txt`

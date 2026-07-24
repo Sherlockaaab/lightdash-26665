@@ -1,0 +1,214 @@
+import {
+    AnyType,
+    ApiChartValidationResponse,
+    ApiDashboardValidationResponse,
+    ApiErrorPayload,
+    ApiJobScheduledResponse,
+    ApiValidateResponse,
+    ApiValidationDismissResponse,
+    assertRegisteredAccount,
+    getRequestMethod,
+    LightdashRequestMethodHeader,
+    ValidationTarget,
+} from '@lightdash/common';
+import {
+    Body,
+    Delete,
+    Get,
+    Middlewares,
+    OperationId,
+    Path,
+    Post,
+    Query,
+    Request,
+    Response,
+    Route,
+    SuccessResponse,
+    Tags,
+} from '@tsoa/runtime';
+import express from 'express';
+import { toSessionUser } from '../auth/account';
+import { allowApiKeyAuthentication, isAuthenticated } from './authentication';
+import { BaseController } from './baseController';
+
+@Route('/api/v1/projects/{projectUuid}/validate')
+@Response<ApiErrorPayload>('default', 'Error')
+@Tags('Projects')
+export class ValidationController extends BaseController {
+    /**
+     * Validate content inside a project. This will start a validation job and return the job id.
+     *
+     * Validation jobs scan all charts and dashboards inside a project to find any broken references
+     * to metrics or dimensions that aren't available. Results are available after the job is completed.
+     * @summary Validate project
+     * @param projectUuid the projectId for the validation
+     * @param req express request
+     * @param body the compiled explores to validate against an existing project, this is used in the CLI to validate a project without creating a preview
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/')
+    @OperationId('ValidateProject')
+    async post(
+        @Path() projectUuid: string,
+        @Request() req: express.Request,
+        @Body()
+        body: {
+            onlyValidateExploresInArgs?: boolean;
+            explores?: AnyType[];
+            validationTargets?: ValidationTarget[];
+        }, // TODO: This should be (Explore| ExploreError)[] but using this type will not process metrics/dimensions
+    ): Promise<ApiJobScheduledResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        const context = getRequestMethod(
+            req.header(LightdashRequestMethodHeader),
+        );
+
+        return {
+            status: 'ok',
+            results: {
+                jobId: await this.services
+                    .getValidationService()
+                    .validate(
+                        toSessionUser(req.account),
+                        projectUuid,
+                        context,
+                        body.explores,
+                        body.validationTargets,
+                        body.onlyValidateExploresInArgs,
+                    ),
+            },
+        };
+    }
+
+    /**
+     * Get validation results for a project. This will return the results of the latest validation job.
+     * @summary Get validation results
+     * @param projectUuid the projectId for the validation
+     * @param req express request
+     * @param fromSettings boolean to know if this request is made from the settings page, for analytics
+     * @param jobId optional jobId to get results for a specific job, used on CLI
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Get('/')
+    @OperationId('GetLatestValidationResults')
+    async get(
+        @Path() projectUuid: string,
+        @Request() req: express.Request,
+        @Query() fromSettings?: boolean,
+        @Query() jobId?: string,
+    ): Promise<ApiValidateResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: await this.services
+                .getValidationService()
+                .get(
+                    toSessionUser(req.account),
+                    projectUuid,
+                    fromSettings,
+                    jobId,
+                ),
+        };
+    }
+
+    /**
+     * Deletes a single validation error.
+     * @summary Dismiss validation error
+     * @param validationIdOrUuid the validation UUID, or a legacy integer id
+     *   for rows created before the UUID migration (PROD-7386).
+     * @param req express request
+     * @param fromSettings boolean to know if this request is made from the settings page, for analytics
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Delete('/{validationIdOrUuid}')
+    @OperationId('DeleteValidationDismiss')
+    async dismiss(
+        @Path() projectUuid: string,
+        @Path() validationIdOrUuid: number | string,
+        @Request() req: express.Request,
+    ): Promise<ApiValidationDismissResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        await this.services
+            .getValidationService()
+            .deleteValidation(
+                toSessionUser(req.account),
+                projectUuid,
+                validationIdOrUuid,
+            );
+        return {
+            status: 'ok',
+        };
+    }
+
+    /**
+     * Validates a specific chart and updates validation entries in database.
+     * @summary Validate specific chart
+     * @param projectUuid the project UUID
+     * @param chartUuid the chart UUID to validate
+     * @param req express request
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/chart/{chartUuid}')
+    @OperationId('ValidateChart')
+    async validateChart(
+        @Path() projectUuid: string,
+        @Path() chartUuid: string,
+        @Request() req: express.Request,
+    ): Promise<ApiChartValidationResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        const validationErrors = await this.services
+            .getValidationService()
+            .validateAndUpdateChart(
+                toSessionUser(req.account),
+                projectUuid,
+                chartUuid,
+            );
+        return {
+            status: 'ok',
+            results: {
+                errors: validationErrors,
+            },
+        };
+    }
+
+    /**
+     * Validates a specific dashboard and updates validation entries in database.
+     * @summary Validate specific dashboard
+     * @param projectUuid the project UUID
+     * @param dashboardUuid the dashboard UUID to validate
+     * @param req express request
+     */
+    @Middlewares([allowApiKeyAuthentication, isAuthenticated])
+    @SuccessResponse('200', 'Success')
+    @Post('/dashboard/{dashboardUuid}')
+    @OperationId('ValidateDashboard')
+    async validateDashboard(
+        @Path() projectUuid: string,
+        @Path() dashboardUuid: string,
+        @Request() req: express.Request,
+    ): Promise<ApiDashboardValidationResponse> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+        const validationErrors = await this.services
+            .getValidationService()
+            .validateAndUpdateDashboard(
+                toSessionUser(req.account),
+                projectUuid,
+                dashboardUuid,
+            );
+        return {
+            status: 'ok',
+            results: {
+                errors: validationErrors,
+            },
+        };
+    }
+}

@@ -1,0 +1,218 @@
+import {
+    PullRequestProvider,
+    type AiAgentReviewItemSummary,
+} from '@lightdash/common';
+import {
+    planReviewWriteback,
+    PROJECT_CONTEXT_WORK_THREAD_INSTRUCTION,
+} from './buildReviewWritebackPrompt';
+
+const baseItem = (
+    overrides: Partial<AiAgentReviewItemSummary> = {},
+): AiAgentReviewItemSummary => ({
+    uuid: 'fp',
+    fingerprint: 'fp',
+    source: 'ai_finding',
+    organizationUuid: 'org',
+    projectUuid: 'project',
+    agentUuid: 'agent',
+    title: 'Agent picked the wrong revenue metric',
+    description: 'It used order count instead of revenue.',
+    primaryRootCause: 'semantic_layer',
+    priority: 'none',
+    targetRefs: [],
+    status: 'open',
+    dismissedReason: null,
+    ownerType: 'semantic_layer_owner',
+    assignedToUserUuid: null,
+    firstSeenAt: new Date('2026-05-26T00:00:00.000Z'),
+    lastSeenAt: new Date('2026-05-26T00:00:00.000Z'),
+    findingCount: 1,
+    statusUpdatedAt: new Date('2026-05-26T00:00:00.000Z'),
+    statusUpdatedByUserUuid: null,
+    linkedIssueUrl: null,
+    linkedPrUrl: null,
+    prState: null,
+    prWritebackStatus: null,
+    prWritebackMessage: null,
+    boardPosition: null,
+    createdByUserUuid: null,
+    writebackEligible: true,
+    writebackEligibility: {
+        eligible: true,
+        provider: PullRequestProvider.GITHUB,
+        strategy: 'semantic_layer',
+        reason: null,
+    },
+    remediation: null,
+    createdAt: new Date('2026-05-26T00:00:00.000Z'),
+    updatedAt: new Date('2026-05-26T00:00:00.000Z'),
+    latestFinding: {
+        uuid: 'signal',
+        promptUuid: 'prompt',
+        threadUuid: 'thread',
+        projectUuid: 'project',
+        agentUuid: 'agent',
+        subcategories: ['metric_selection_ambiguity'],
+        fixTargets: ['semantic_yaml_patch'],
+        targetRefs: [
+            {
+                type: 'metric',
+                modelName: 'orders',
+                metricName: 'average_order_size',
+            },
+        ],
+        evidenceExcerpts: [
+            {
+                source: 'next_user_prompt',
+                text: 'use average_order_size, not total_order_amount',
+                redacted: false,
+            },
+        ],
+        recommendation: {
+            actionType: 'update_semantic_yaml',
+            title: 'Add an ai_hint to average_order_size',
+            rationale: 'Disambiguate it from total_order_amount.',
+            targetRefs: [],
+        },
+        projectContextEntry: null,
+        createdAt: new Date('2026-05-26T00:00:00.000Z'),
+    },
+    ...overrides,
+});
+
+const expectPromptPlan = (plan: ReturnType<typeof planReviewWriteback>) => {
+    if (plan.strategy !== 'prompt') {
+        throw new Error(`expected a prompt plan, got ${plan.strategy}`);
+    }
+    return plan;
+};
+
+describe('planReviewWriteback', () => {
+    it('builds a deterministic one-shot prompt for semantic_layer items', () => {
+        const plan = expectPromptPlan(
+            planReviewWriteback(
+                baseItem(),
+                new Map([['orders', 'models/orders.yml']]),
+            ),
+        );
+
+        expect(plan.aggregationKey).toBeNull();
+        expect(plan.promptText).toContain(
+            'Add an ai_hint to average_order_size',
+        );
+        expect(plan.promptText).toContain(
+            'Disambiguate it from total_order_amount.',
+        );
+        expect(plan.promptText).toContain(
+            'metric "orders.average_order_size" (yaml: models/orders.yml)',
+        );
+        // The finding title and raw evidence now travel as pins, not prose.
+        expect(plan.promptText).not.toContain(
+            'Agent picked the wrong revenue metric',
+        );
+        expect(plan.promptText).not.toContain(
+            'use average_order_size, not total_order_amount',
+        );
+    });
+
+    it('omits the yaml path when the model is not in the resolved map', () => {
+        const plan = expectPromptPlan(planReviewWriteback(baseItem()));
+
+        expect(plan.promptText).toContain('metric "orders.average_order_size"');
+        expect(plan.promptText).not.toContain('(yaml:');
+    });
+
+    it('builds a prompt from a manual semantic-layer issue', () => {
+        const plan = expectPromptPlan(
+            planReviewWriteback(
+                baseItem({
+                    source: 'manual',
+                    latestFinding: null,
+                    findingCount: 0,
+                    title: 'Add a revenue metric on orders',
+                    description: 'Finance needs a governed revenue metric.',
+                }),
+            ),
+        );
+
+        expect(plan.promptText).toContain('Add a revenue metric on orders');
+        expect(plan.promptText).toContain(
+            'Finance needs a governed revenue metric.',
+        );
+        expect(plan.promptText).toContain('No source conversation is attached');
+    });
+
+    it('returns a project_context plan when the finding carries an entry', () => {
+        const item = baseItem({ primaryRootCause: 'project_context' });
+        const entry = {
+            op: 'create' as const,
+            id: null,
+            kind: 'definition' as const,
+            content: '"HR" = high-risk cohort.',
+            terms: ['HR'],
+            objects: [],
+        };
+        if (item.latestFinding) {
+            item.latestFinding.projectContextEntry = entry;
+        }
+
+        const plan = planReviewWriteback(item);
+        expect(plan).toEqual({ strategy: 'project_context', entry });
+    });
+
+    it('builds a project_context entry from a manual issue', () => {
+        const plan = planReviewWriteback(
+            baseItem({
+                source: 'manual',
+                latestFinding: null,
+                findingCount: 0,
+                primaryRootCause: 'project_context',
+                title: 'Document ARR',
+                description: 'ARR should exclude one-off services.',
+            }),
+        );
+
+        expect(plan).toEqual({
+            strategy: 'project_context',
+            entry: {
+                op: 'create',
+                id: null,
+                kind: 'definition',
+                content: 'Document ARR\n\nARR should exclude one-off services.',
+                terms: [],
+                objects: [],
+            },
+        });
+    });
+
+    it('throws for a project_context item with no entry', () => {
+        expect(() =>
+            planReviewWriteback(
+                baseItem({ primaryRootCause: 'project_context' }),
+            ),
+        ).toThrow('requires a projectContextEntry');
+    });
+
+    it('throws for unsupported root causes', () => {
+        expect(() =>
+            planReviewWriteback(
+                baseItem({ primaryRootCause: 'runtime_reliability' }),
+            ),
+        ).toThrow('not supported');
+    });
+});
+
+describe('PROJECT_CONTEXT_WORK_THREAD_INSTRUCTION', () => {
+    it('is a one-line instruction pointing at the editProjectContext tool', () => {
+        // The finding/change/conversation now travel as pinned context, so the
+        // seed prompt no longer renders the entry inline.
+        expect(PROJECT_CONTEXT_WORK_THREAD_INSTRUCTION).toContain(
+            'editProjectContext',
+        );
+        expect(PROJECT_CONTEXT_WORK_THREAD_INSTRUCTION).toContain(
+            'project context',
+        );
+        expect(PROJECT_CONTEXT_WORK_THREAD_INSTRUCTION).not.toContain('\n\n');
+    });
+});

@@ -1,0 +1,244 @@
+import {
+    assertUnreachable,
+    getResourceViewItemName,
+    ResourceViewItemType,
+    type ResourceViewItem,
+} from '@lightdash/common';
+import { Button, Group, LoadingOverlay, Text } from '@mantine-8/core';
+import { IconFolderShare, IconPlus } from '@tabler/icons-react';
+import { useCallback, useMemo, type ReactNode } from 'react';
+import { useSpaceManagement } from '../../../hooks/useSpaceManagement';
+import { useSpaceSummaries } from '../../../hooks/useSpaces';
+import Callout from '../Callout';
+import MantineIcon from '../MantineIcon';
+import MantineModal, { type MantineModalProps } from '../MantineModal';
+import SpaceCreationForm from '../SpaceSelector/SpaceCreationForm';
+import SpaceSelector from '../SpaceSelector/SpaceSelector';
+
+type Props<T> = Pick<MantineModalProps, 'opened' | 'onClose'> & {
+    projectUuid: string;
+    items: T;
+    isLoading: boolean;
+    onConfirm: (spaceUuid: string | null) => void;
+    title?: string;
+    description?: ReactNode;
+    confirmLabel?: string;
+    createSpaceConfirmLabel?: string;
+    /** Extra content rendered in the modal's fixed footer bar, next to the
+     *  "New Space" button — e.g. per-content-type move options. Lives outside
+     *  the scrollable space list so it stays visible however many spaces there
+     *  are. Hidden while the create-space form is open. */
+    footer?: ReactNode;
+};
+
+const ItemName = ({ name }: { name: string }) => {
+    return (
+        <Text fw={600} component="span">
+            "{name}"
+        </Text>
+    );
+};
+
+const getItemsText = <T extends ResourceViewItem>(items: T[]) => {
+    if (items.length === 1) {
+        return {
+            name: <ItemName name={getResourceViewItemName(items[0])} />,
+            type: items[0].type,
+        };
+    }
+
+    return {
+        name: `${items.length} items`,
+        type: 'items',
+    };
+};
+
+const TransferItemsModal = <R extends ResourceViewItem, T extends Array<R>>({
+    projectUuid,
+    opened,
+    onClose,
+    items,
+    onConfirm,
+    isLoading,
+    title,
+    description,
+    confirmLabel = 'Confirm',
+    createSpaceConfirmLabel = 'Create space & move',
+    footer,
+}: Props<T>) => {
+    // Fetch spaces only when the modal is opened
+    const { data: spaces = [], isLoading: isLoadingSpaces } = useSpaceSummaries(
+        projectUuid,
+        true,
+        { enabled: opened },
+    );
+
+    const isMovingSingleItem = items.length === 1;
+
+    const defaultSpaceUuid = useMemo(() => {
+        // return space uuid only if there's a single item (i.e. not a bulk transfer)
+        if (!isMovingSingleItem) return undefined;
+
+        const item = items[0];
+
+        switch (item.type) {
+            case ResourceViewItemType.SPACE:
+                return item.data.parentSpaceUuid ?? undefined;
+            case ResourceViewItemType.CHART:
+            case ResourceViewItemType.DASHBOARD:
+                return item.data.spaceUuid;
+            case ResourceViewItemType.DATA_APP:
+                return item.data.spaceUuid ?? undefined;
+            default:
+                return assertUnreachable(item, 'Invalid item type');
+        }
+    }, [isMovingSingleItem, items]);
+
+    const singleItemType = useMemo(() => {
+        if (!isMovingSingleItem) return undefined;
+        return items[0].type;
+    }, [isMovingSingleItem, items]);
+
+    const allSelectedItemsAreSpaces = useMemo(
+        () => items.every((i) => i.type === ResourceViewItemType.SPACE),
+        [items],
+    );
+
+    const {
+        selectedSpaceUuid,
+        setSelectedSpaceUuid,
+        isCreatingNewSpace,
+        newSpaceName,
+        setNewSpaceName,
+        createSpaceMutation,
+        handleCreateNewSpace,
+        openCreateSpaceForm,
+        closeCreateSpaceForm,
+        inheritanceValue,
+        setInheritanceValue,
+    } = useSpaceManagement({
+        projectUuid,
+        defaultSpaceUuid,
+    });
+
+    const selectedSpaceLabel = useMemo(() => {
+        if (!selectedSpaceUuid) return '';
+        return (
+            spaces.find((space) => space.uuid === selectedSpaceUuid)?.name || ''
+        );
+    }, [selectedSpaceUuid, spaces]);
+
+    const handleConfirm = useCallback(() => {
+        onConfirm(selectedSpaceUuid);
+    }, [selectedSpaceUuid, onConfirm]);
+
+    const createSpace = useCallback(async () => {
+        try {
+            const result = await handleCreateNewSpace();
+            if (result?.uuid) {
+                onConfirm(result.uuid);
+            }
+        } catch (error) {
+            console.error('Failed to create space:', error);
+        }
+    }, [handleCreateNewSpace, onConfirm]);
+
+    if (items.length === 0) return null;
+
+    return (
+        <MantineModal
+            title={title ?? `Move ${getItemsText(items).type}`}
+            opened={opened}
+            onClose={onClose}
+            icon={IconFolderShare}
+            size="xl"
+            leftActions={
+                !isCreatingNewSpace ? (
+                    <Group gap="lg" wrap="nowrap">
+                        <Button
+                            variant="subtle"
+                            size="xs"
+                            onClick={openCreateSpaceForm}
+                            leftSection={<MantineIcon icon={IconPlus} />}
+                        >
+                            New Space
+                        </Button>
+                        {footer}
+                    </Group>
+                ) : null
+            }
+            actions={
+                isCreatingNewSpace ? (
+                    <Button
+                        loading={createSpaceMutation.isLoading}
+                        disabled={newSpaceName.length === 0}
+                        onClick={createSpace}
+                    >
+                        {createSpaceConfirmLabel}
+                    </Button>
+                ) : (
+                    <Button
+                        disabled={
+                            !selectedSpaceUuid && !allSelectedItemsAreSpaces
+                        }
+                        onClick={handleConfirm}
+                    >
+                        {confirmLabel}
+                    </Button>
+                )
+            }
+        >
+            <LoadingOverlay
+                visible={
+                    createSpaceMutation.isLoading ||
+                    isLoading ||
+                    isLoadingSpaces
+                }
+            />
+
+            {isCreatingNewSpace ? (
+                <SpaceCreationForm
+                    spaceName={newSpaceName}
+                    onSpaceNameChange={setNewSpaceName}
+                    onCancel={closeCreateSpaceForm}
+                    isLoading={createSpaceMutation.isLoading}
+                    parentSpaceName={selectedSpaceLabel}
+                    inheritanceValue={inheritanceValue ?? undefined}
+                    onInheritanceChange={setInheritanceValue}
+                />
+            ) : (
+                <>
+                    {description ?? (
+                        <Text fz="sm" fw={500}>
+                            <>
+                                Select a space to move{' '}
+                                {getItemsText(items).name} to:
+                            </>
+                        </Text>
+                    )}
+
+                    <SpaceSelector
+                        itemType={singleItemType}
+                        projectUuid={projectUuid}
+                        spaces={spaces}
+                        selectedSpaceUuid={selectedSpaceUuid}
+                        onSelectSpace={setSelectedSpaceUuid}
+                        isLoading={createSpaceMutation.isLoading}
+                        isRootSelectionEnabled={allSelectedItemsAreSpaces}
+                    >
+                        {!isCreatingNewSpace && selectedSpaceLabel ? (
+                            <Callout variant="info">
+                                <Text fw={500} fz="sm">
+                                    Move {getItemsText(items).name} to{' '}
+                                    <ItemName name={selectedSpaceLabel} />
+                                </Text>
+                            </Callout>
+                        ) : null}
+                    </SpaceSelector>
+                </>
+            )}
+        </MantineModal>
+    );
+};
+
+export default TransferItemsModal;

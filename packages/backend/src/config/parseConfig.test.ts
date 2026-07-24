@@ -1,0 +1,1538 @@
+import {
+    ALL_TASK_NAMES,
+    DbtProjectType,
+    LightdashMode,
+    OrganizationMemberRole,
+    ParameterError,
+    ParseError,
+    SentryConfig,
+    WarehouseTypes,
+    WeekDay,
+} from '@lightdash/common';
+import { VERSION } from '../version';
+import {
+    getFloatArrayFromEnvironmentVariable,
+    getFloatFromEnvironmentVariable,
+    getGroupProjectAccessSetupConfig,
+    getIntegerFromEnvironmentVariable,
+    getMaybeBase64EncodedFromEnvironmentVariable,
+    getMultiProjectSetupConfig,
+    getObjectFromEnvironmentVariable,
+    getStringRecordFromEnvironmentVariable,
+    getUpdateSetupConfig,
+    getUserAttributesSetupConfig,
+    parseConfig,
+    parseOrganizationMemberRoleArray,
+} from './parseConfig';
+
+vi.mock('fs/promises', () => ({
+    readFile: vi.fn(),
+    writeFile: vi.fn(),
+}));
+
+beforeEach(() => {
+    process.env = {
+        LIGHTDASH_SECRET: 'not very secret',
+        S3_ENDPOINT: 'mock_endpoint',
+        S3_BUCKET: 'mock_bucket',
+        S3_REGION: 'mock_region',
+    };
+});
+
+test('Should default results S3 config to S3 config', () => {
+    process.env.S3_ACCESS_KEY = 'mock_access_key';
+    process.env.S3_SECRET_KEY = 'mock_secret_key';
+    const config = parseConfig();
+    expect(config.results.s3).toEqual({
+        endpoint: 'mock_endpoint',
+        bucket: 'mock_bucket',
+        region: 'mock_region',
+        accessKey: 'mock_access_key',
+        secretKey: 'mock_secret_key',
+        forcePathStyle: false,
+    });
+});
+
+test('Should use explicit results S3 config when set', () => {
+    process.env.RESULTS_S3_BUCKET = 'new_bucket';
+    process.env.RESULTS_S3_REGION = 'new_region';
+    process.env.RESULTS_S3_ACCESS_KEY = 'new_access_key';
+    process.env.RESULTS_S3_SECRET_KEY = 'new_secret_key';
+    const config = parseConfig();
+    expect(config.results.s3).toEqual({
+        endpoint: 'mock_endpoint',
+        bucket: 'new_bucket',
+        region: 'new_region',
+        accessKey: 'new_access_key',
+        secretKey: 'new_secret_key',
+        forcePathStyle: false,
+    });
+});
+
+test('Should prioritize new results S3 config over deprecated config when both are set', () => {
+    // Set both new and deprecated environment variables
+    process.env.RESULTS_S3_BUCKET = 'new_bucket';
+    process.env.RESULTS_S3_REGION = 'new_region';
+    process.env.RESULTS_S3_ACCESS_KEY = 'new_access_key';
+    process.env.RESULTS_S3_SECRET_KEY = 'new_secret_key';
+    process.env.RESULTS_CACHE_S3_BUCKET = 'deprecated_bucket';
+    process.env.RESULTS_CACHE_S3_REGION = 'deprecated_region';
+    process.env.RESULTS_CACHE_S3_ACCESS_KEY = 'deprecated_access_key';
+    process.env.RESULTS_CACHE_S3_SECRET_KEY = 'deprecated_secret_key';
+
+    const config = parseConfig();
+    expect(config.results.s3).toEqual({
+        endpoint: 'mock_endpoint',
+        bucket: 'new_bucket',
+        region: 'new_region',
+        accessKey: 'new_access_key',
+        secretKey: 'new_secret_key',
+        forcePathStyle: false,
+    });
+});
+
+test('Should fall back to base S3 credentials for pre-aggregate results S3 config', () => {
+    process.env.S3_ACCESS_KEY = 'base_access_key';
+    process.env.S3_SECRET_KEY = 'base_secret_key';
+    process.env.PRE_AGGREGATE_RESULTS_S3_BUCKET = 'preagg_bucket';
+    process.env.PRE_AGGREGATE_RESULTS_S3_REGION = 'preagg_region';
+
+    const config = parseConfig();
+    expect(config.preAggregates.s3).toEqual({
+        endpoint: 'mock_endpoint',
+        bucket: 'preagg_bucket',
+        region: 'preagg_region',
+        accessKey: 'base_access_key',
+        secretKey: 'base_secret_key',
+        forcePathStyle: false,
+    });
+});
+
+test('Should use explicit pre-aggregate S3 credentials when set', () => {
+    process.env.S3_ACCESS_KEY = 'base_access_key';
+    process.env.S3_SECRET_KEY = 'base_secret_key';
+    process.env.PRE_AGGREGATE_RESULTS_S3_BUCKET = 'preagg_bucket';
+    process.env.PRE_AGGREGATE_RESULTS_S3_REGION = 'preagg_region';
+    process.env.PRE_AGGREGATE_RESULTS_S3_ACCESS_KEY = 'preagg_access_key';
+    process.env.PRE_AGGREGATE_RESULTS_S3_SECRET_KEY = 'preagg_secret_key';
+
+    const config = parseConfig();
+    expect(config.preAggregates.s3).toEqual({
+        endpoint: 'mock_endpoint',
+        bucket: 'preagg_bucket',
+        region: 'preagg_region',
+        accessKey: 'preagg_access_key',
+        secretKey: 'preagg_secret_key',
+        forcePathStyle: false,
+    });
+});
+
+test('Should default apps S3 config to base S3 config', () => {
+    process.env.S3_ACCESS_KEY = 'mock_access_key';
+    process.env.S3_SECRET_KEY = 'mock_secret_key';
+    const config = parseConfig();
+    expect(config.appRuntime.s3).toEqual({
+        endpoint: 'mock_endpoint',
+        bucket: 'mock_bucket',
+        region: 'mock_region',
+        accessKey: 'mock_access_key',
+        secretKey: 'mock_secret_key',
+        forcePathStyle: false,
+    });
+});
+
+test('Should use explicit apps S3 config when set', () => {
+    process.env.APPS_S3_BUCKET = 'apps_bucket';
+    process.env.APPS_S3_REGION = 'apps_region';
+    process.env.APPS_S3_ACCESS_KEY = 'apps_access_key';
+    process.env.APPS_S3_SECRET_KEY = 'apps_secret_key';
+    const config = parseConfig();
+    expect(config.appRuntime.s3).toEqual({
+        endpoint: 'mock_endpoint',
+        bucket: 'apps_bucket',
+        region: 'apps_region',
+        accessKey: 'apps_access_key',
+        secretKey: 'apps_secret_key',
+        forcePathStyle: false,
+    });
+});
+
+test('Should fail fast when base S3 is not configured', () => {
+    delete process.env.S3_ENDPOINT;
+    delete process.env.S3_BUCKET;
+    delete process.env.S3_REGION;
+    expect(() => parseConfig()).toThrow('S3-compatible storage is required');
+});
+
+test('Should parse rudder config from env', () => {
+    const expected = {
+        dataPlaneUrl: 'customurl',
+        writeKey: 'customkey',
+    };
+    process.env.RUDDERSTACK_DATA_PLANE_URL = 'customurl';
+    process.env.RUDDERSTACK_WRITE_KEY = 'customkey';
+    expect(parseConfig().rudder).toEqual(expected);
+});
+
+test('Should use default sentry configuration if no environment vars', () => {
+    const expected: SentryConfig = {
+        backend: {
+            dsn: '',
+            securityReportUri: '',
+        },
+        frontend: {
+            dsn: '',
+        },
+        release: VERSION,
+        environment: LightdashMode.DEFAULT,
+        tracesSampleRate: 0.1,
+        queryTracesSampleRate: null,
+        profilesSampleRate: 0.2,
+        anr: {
+            enabled: false,
+            captureStacktrace: false,
+            timeout: undefined,
+        },
+    };
+    expect(parseConfig().sentry).toStrictEqual(expected);
+});
+
+test('Should parse sentry config from env', () => {
+    const expected: SentryConfig = {
+        backend: {
+            dsn: 'mydsnbackend.sentry.io',
+            securityReportUri: '',
+        },
+        frontend: {
+            dsn: 'mydsnfrontend.sentry.io',
+        },
+        release: VERSION,
+        environment: 'development',
+        tracesSampleRate: 0.8,
+        queryTracesSampleRate: null,
+        profilesSampleRate: 1.0,
+        anr: {
+            enabled: true,
+            captureStacktrace: true,
+            timeout: 1000,
+        },
+    };
+    process.env.SENTRY_BE_DSN = 'mydsnbackend.sentry.io';
+    process.env.SENTRY_FE_DSN = 'mydsnfrontend.sentry.io';
+    process.env.NODE_ENV = 'development';
+    process.env.SENTRY_TRACES_SAMPLE_RATE = '0.8';
+    process.env.SENTRY_PROFILES_SAMPLE_RATE = '1.0';
+    process.env.SENTRY_ANR_ENABLED = 'true';
+    process.env.SENTRY_ANR_CAPTURE_STACKTRACE = 'true';
+    process.env.SENTRY_ANR_TIMEOUT = '1000';
+    expect(parseConfig().sentry).toStrictEqual(expected);
+});
+
+test('Should throw error when secret missing', () => {
+    delete process.env.LIGHTDASH_SECRET;
+    expect(() => parseConfig()).toThrowError(ParseError);
+});
+
+test('Should include secret in output', () => {
+    process.env.LIGHTDASH_SECRET = 'so very secret';
+    expect(parseConfig().lightdashSecret).toEqual('so very secret');
+});
+
+test('Should parse bedrock inference profile prefix from env', () => {
+    process.env.BEDROCK_API_KEY = 'test-bedrock-key';
+    process.env.BEDROCK_REGION = 'ap-northeast-1';
+    process.env.BEDROCK_INFERENCE_PROFILE_PREFIX = 'jp';
+
+    expect(parseConfig().ai.copilot.providers.bedrock).toMatchObject({
+        apiKey: 'test-bedrock-key',
+        region: 'ap-northeast-1',
+        inferenceProfilePrefix: 'jp',
+    });
+});
+
+test('Should default AI tool description max chars to 600', () => {
+    expect(parseConfig().ai.copilot.toolDescriptionMaxChars).toEqual(600);
+});
+
+test('Should parse AI tool description max chars from env', () => {
+    process.env.AI_TOOL_DESCRIPTION_MAX_CHARS = '2500';
+
+    expect(parseConfig().ai.copilot.toolDescriptionMaxChars).toEqual(2500);
+});
+
+test('Should parse valid integer', () => {
+    process.env.MY_NUMBER = '100';
+    expect(getIntegerFromEnvironmentVariable('MY_NUMBER')).toEqual(100);
+});
+test('Should parse non existent integer as undefined', () => {
+    expect(getIntegerFromEnvironmentVariable('MY_NUMBER')).toEqual(undefined);
+});
+test('Should throw ParseError if not a valid integer', () => {
+    process.env.MY_NUMBER = 'hello';
+    expect(() => getIntegerFromEnvironmentVariable('MY_NUMBER')).toThrowError(
+        ParseError,
+    );
+});
+test('Should parse valid float', () => {
+    process.env.MY_NUMBER = '0.5';
+    expect(getFloatFromEnvironmentVariable('MY_NUMBER')).toEqual(0.5);
+});
+test('Should parse non existent float as undefined', () => {
+    expect(getFloatFromEnvironmentVariable('MY_NUMBER')).toEqual(undefined);
+});
+test('Should throw ParseError if not a valid float', () => {
+    process.env.MY_NUMBER = 'hello';
+    expect(() => getFloatFromEnvironmentVariable('MY_NUMBER')).toThrowError(
+        ParseError,
+    );
+});
+
+describe('getMaybeBase64EncodedFromEnvironmentVariable', () => {
+    const b64 = (value: string) =>
+        Buffer.from(value, 'utf-8').toString('base64');
+
+    test('returns undefined if given undefined as content', () => {
+        expect(getMaybeBase64EncodedFromEnvironmentVariable(undefined)).toEqual(
+            undefined,
+        );
+    });
+
+    test('passes-through unchanged with default settings', () => {
+        expect(
+            getMaybeBase64EncodedFromEnvironmentVariable('Hey there'),
+        ).toEqual('Hey there');
+    });
+
+    test('decodes base64 with a prefix with base64: prefix', () => {
+        expect(
+            getMaybeBase64EncodedFromEnvironmentVariable(
+                `base64:${b64('Hey there')}`,
+                {
+                    decodeIfStartsWith: 'base64:',
+                },
+            ),
+        ).toEqual('Hey there');
+    });
+
+    test('decodes base64 with a prefix with custom prefix', () => {
+        expect(
+            getMaybeBase64EncodedFromEnvironmentVariable(
+                `DECODE-ME:${b64('Hello')}`,
+                {
+                    decodeIfStartsWith: 'DECODE-ME:',
+                },
+            ),
+        ).toEqual('Hello');
+    });
+
+    test('does not decode base64 with custom prefix', () => {
+        expect(
+            getMaybeBase64EncodedFromEnvironmentVariable(
+                `-----BEGIN CERTIFICATE-----\nPlease do not decode me`,
+                {
+                    decodeUnlessStartsWith: '-----BEGIN CERTIFICATE-----',
+                },
+            ),
+        ).toEqual('-----BEGIN CERTIFICATE-----\nPlease do not decode me');
+    });
+
+    test('decodes base64 with custom negative prefix if not a match', () => {
+        expect(
+            getMaybeBase64EncodedFromEnvironmentVariable(b64('Hey there'), {
+                decodeUnlessStartsWith: '-----BEGIN CERTIFICATE-----',
+            }),
+        ).toEqual('Hey there');
+    });
+});
+
+describe('getFloatArrayFromEnvironmentVariable', () => {
+    test('returns undefined if env var is not defined', () => {
+        expect(getFloatArrayFromEnvironmentVariable('MISSING_ENV_VAR')).toEqual(
+            undefined,
+        );
+    });
+    test('returns array if env var value is valid', () => {
+        process.env.VALID_NUMBER_ARRAY = '1,2.5,3.0';
+        expect(
+            getFloatArrayFromEnvironmentVariable('VALID_NUMBER_ARRAY'),
+        ).toEqual([1, 2.5, 3]);
+    });
+    test('throw error if env var value is invalid', () => {
+        process.env.INVALID_NUMBER_ARRAY = 'abc,1,2';
+        expect(() =>
+            getFloatArrayFromEnvironmentVariable('INVALID_NUMBER_ARRAY'),
+        ).toThrowError(ParseError);
+    });
+});
+
+describe('getObjectFromEnvironmentVariable', () => {
+    test('returns undefined if env var is not defined', () => {
+        expect(getObjectFromEnvironmentVariable('MISSING_ENV_VAR')).toEqual(
+            undefined,
+        );
+    });
+    test('returns object if env var value is valid', () => {
+        process.env.VALID_OBJECT = '{"test":"value", "test2": 2}';
+        expect(getObjectFromEnvironmentVariable('VALID_OBJECT')).toEqual({
+            test: 'value',
+            test2: 2,
+        });
+    });
+    test('throw error if env var value is invalid', () => {
+        process.env.INVALID_OBJECT = 'test="value"';
+        expect(() =>
+            getObjectFromEnvironmentVariable('INVALID_OBJECT'),
+        ).toThrowError(ParseError);
+    });
+});
+
+describe('getStringRecordFromEnvironmentVariable', () => {
+    test('returns undefined if env var is not defined', () => {
+        expect(
+            getStringRecordFromEnvironmentVariable('MISSING_ENV_VAR'),
+        ).toEqual(undefined);
+    });
+
+    test('returns string record if env var value is valid', () => {
+        process.env.VALID_STRING_RECORD =
+            '{"x-lightdash-use-case":"analytics-copilot","x-cost-center":"data-platform"}';
+        expect(
+            getStringRecordFromEnvironmentVariable('VALID_STRING_RECORD'),
+        ).toEqual({
+            'x-lightdash-use-case': 'analytics-copilot',
+            'x-cost-center': 'data-platform',
+        });
+    });
+
+    test('throws error if env var is not an object with string values', () => {
+        process.env.INVALID_STRING_RECORD = '{"team":["data"]}';
+        expect(() =>
+            getStringRecordFromEnvironmentVariable('INVALID_STRING_RECORD'),
+        ).toThrowError(ParseError);
+        expect(() =>
+            getStringRecordFromEnvironmentVariable('INVALID_STRING_RECORD'),
+        ).not.toThrow(/"team":\["data"\]/);
+    });
+
+    test('throws error if env var is explicit falsy JSON', () => {
+        process.env.INVALID_STRING_RECORD = 'null';
+        expect(() =>
+            getStringRecordFromEnvironmentVariable('INVALID_STRING_RECORD'),
+        ).toThrowError(ParseError);
+    });
+});
+
+test('Should parse AI provider custom headers from env', () => {
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
+    process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+    process.env.AZURE_AI_API_KEY = 'test-azure-key';
+    process.env.AZURE_AI_ENDPOINT = 'https://example.openai.azure.com';
+    process.env.AZURE_AI_API_VERSION = '2026-01-01';
+    process.env.AZURE_AI_DEPLOYMENT_NAME = 'gpt-5';
+    process.env.BEDROCK_API_KEY = 'test-bedrock-key';
+    process.env.BEDROCK_REGION = 'eu-west-1';
+    process.env.OPENAI_CUSTOM_HEADERS =
+        '{"x-lightdash-llm-provider":"openai","x-gateway-route":"responses-api"}';
+    process.env.ANTHROPIC_CUSTOM_HEADERS =
+        '{"x-lightdash-llm-provider":"anthropic","x-gateway-route":"messages-api"}';
+    process.env.OPENROUTER_CUSTOM_HEADERS =
+        '{"x-lightdash-llm-provider":"openrouter","x-gateway-route":"router-api"}';
+    process.env.AZURE_AI_CUSTOM_HEADERS =
+        '{"x-lightdash-llm-provider":"azure-openai","x-gateway-route":"azure-deployment"}';
+    process.env.BEDROCK_CUSTOM_HEADERS =
+        '{"x-lightdash-llm-provider":"bedrock","x-gateway-route":"aws-runtime"}';
+
+    expect(parseConfig().ai.copilot.providers).toMatchObject({
+        openai: {
+            customHeaders: {
+                'x-lightdash-llm-provider': 'openai',
+                'x-gateway-route': 'responses-api',
+            },
+        },
+        anthropic: {
+            customHeaders: {
+                'x-lightdash-llm-provider': 'anthropic',
+                'x-gateway-route': 'messages-api',
+            },
+        },
+        openrouter: {
+            customHeaders: {
+                'x-lightdash-llm-provider': 'openrouter',
+                'x-gateway-route': 'router-api',
+            },
+        },
+        azure: {
+            customHeaders: {
+                'x-lightdash-llm-provider': 'azure-openai',
+                'x-gateway-route': 'azure-deployment',
+            },
+        },
+        bedrock: {
+            customHeaders: {
+                'x-lightdash-llm-provider': 'bedrock',
+                'x-gateway-route': 'aws-runtime',
+            },
+        },
+    });
+});
+
+describe('AI provider supportsStreaming', () => {
+    beforeEach(() => {
+        process.env.OPENAI_API_KEY = 'test-openai-key';
+        process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+        process.env.AZURE_AI_API_KEY = 'test-azure-key';
+        process.env.AZURE_AI_ENDPOINT = 'https://example.openai.azure.com';
+        process.env.AZURE_AI_API_VERSION = '2026-01-01';
+        process.env.AZURE_AI_DEPLOYMENT_NAME = 'gpt-5';
+        process.env.BEDROCK_API_KEY = 'test-bedrock-key';
+        process.env.BEDROCK_REGION = 'eu-west-1';
+    });
+
+    test('defaults to true when env vars are unset', () => {
+        expect(parseConfig().ai.copilot.providers).toMatchObject({
+            openai: { supportsStreaming: true },
+            anthropic: { supportsStreaming: true },
+            openrouter: { supportsStreaming: true },
+            azure: { supportsStreaming: true },
+            bedrock: { supportsStreaming: true },
+        });
+    });
+
+    test('stays true when env vars are explicitly "true"', () => {
+        process.env.OPENAI_SUPPORTS_STREAMING = 'true';
+        process.env.ANTHROPIC_SUPPORTS_STREAMING = 'true';
+        process.env.OPENROUTER_SUPPORTS_STREAMING = 'true';
+        process.env.AZURE_AI_SUPPORTS_STREAMING = 'true';
+        process.env.BEDROCK_SUPPORTS_STREAMING = 'true';
+
+        expect(parseConfig().ai.copilot.providers).toMatchObject({
+            openai: { supportsStreaming: true },
+            anthropic: { supportsStreaming: true },
+            openrouter: { supportsStreaming: true },
+            azure: { supportsStreaming: true },
+            bedrock: { supportsStreaming: true },
+        });
+    });
+
+    test('is false only when env vars are the literal "false"', () => {
+        process.env.OPENAI_SUPPORTS_STREAMING = 'false';
+        process.env.ANTHROPIC_SUPPORTS_STREAMING = 'false';
+        process.env.OPENROUTER_SUPPORTS_STREAMING = 'false';
+        process.env.AZURE_AI_SUPPORTS_STREAMING = 'false';
+        process.env.BEDROCK_SUPPORTS_STREAMING = 'false';
+
+        expect(parseConfig().ai.copilot.providers).toMatchObject({
+            openai: { supportsStreaming: false },
+            anthropic: { supportsStreaming: false },
+            openrouter: { supportsStreaming: false },
+            azure: { supportsStreaming: false },
+            bedrock: { supportsStreaming: false },
+        });
+    });
+});
+
+// test parseOrganizationMemberRoleArray
+describe('parseOrganizationMemberRoleArray', () => {
+    beforeEach(() => {
+        // clear env var
+        delete process.env.ORGANIZATION_MEMBER_ROLE_ARRAY;
+    });
+    test('Should parse non existent organization member role array as undefined', () => {
+        expect(
+            parseOrganizationMemberRoleArray('ORGANIZATION_MEMBER_ROLE_ARRAY'),
+        ).toEqual(undefined);
+    });
+    test('Should parse single valid organization member role', () => {
+        process.env.ORGANIZATION_MEMBER_ROLE_ARRAY = 'editor';
+        expect(
+            parseOrganizationMemberRoleArray('ORGANIZATION_MEMBER_ROLE_ARRAY'),
+        ).toStrictEqual([OrganizationMemberRole.EDITOR]);
+    });
+    test('Should parse multiple valid organization member roles', () => {
+        process.env.ORGANIZATION_MEMBER_ROLE_ARRAY = 'admin,member';
+        expect(
+            parseOrganizationMemberRoleArray('ORGANIZATION_MEMBER_ROLE_ARRAY'),
+        ).toStrictEqual([
+            OrganizationMemberRole.ADMIN,
+            OrganizationMemberRole.MEMBER,
+        ]);
+    });
+    test('Should throw ParseError if not a valid organization member role array', () => {
+        process.env.ORGANIZATION_MEMBER_ROLE_ARRAY = 'admin,member,invalid';
+        expect(() =>
+            parseOrganizationMemberRoleArray('ORGANIZATION_MEMBER_ROLE_ARRAY'),
+        ).toThrowError(ParseError);
+    });
+});
+
+describe('process.env.LIGHTDASH_IFRAME_EMBEDDING_DOMAINS', () => {
+    test('should be empty array if not set', () => {
+        process.env.SECURE_COOKIES = 'true';
+
+        const config = parseConfig();
+        expect(config.security.contentSecurityPolicy.frameAncestors).toEqual(
+            [],
+        );
+        expect(config.cookieSameSite).toEqual('lax');
+    });
+
+    test('should parse single domain', () => {
+        process.env.SECURE_COOKIES = 'true';
+        process.env.LIGHTDASH_IFRAME_EMBEDDING_DOMAINS = 'https://example.com';
+        const config = parseConfig();
+        expect(config.security.contentSecurityPolicy.frameAncestors).toEqual([
+            'https://example.com',
+        ]);
+
+        expect(config.cookieSameSite).toEqual('none');
+    });
+
+    test('should parse multiple domains', () => {
+        process.env.SECURE_COOKIES = 'true';
+        process.env.LIGHTDASH_IFRAME_EMBEDDING_DOMAINS =
+            'https://example.com,https://example.org';
+        const config = parseConfig();
+        expect(config.security.contentSecurityPolicy.frameAncestors).toEqual([
+            'https://example.com',
+            'https://example.org',
+        ]);
+        expect(config.cookieSameSite).toEqual('none');
+    });
+
+    test('should throw ParameterError if SECURE_COOKIES is not true', () => {
+        process.env.LIGHTDASH_IFRAME_EMBEDDING_DOMAINS =
+            'https://example.com,https://example.org';
+        expect(() => parseConfig()).toThrowError(ParameterError);
+    });
+
+    describe('headlessBrowser configuration', () => {
+        beforeEach(() => {
+            process.env.HEADLESS_BROWSER_HOST = 'headless-browser-host';
+            process.env.HEADLESS_BROWSER_PORT = '3000';
+        });
+        test('should use ws and port when USE_SECURE_BROWSER is not set', () => {
+            const config = parseConfig();
+            expect(config.headlessBrowser.browserEndpoint).toEqual(
+                'ws://headless-browser-host:3000',
+            );
+        });
+
+        test('should use wss and omit the port when USE_SECURE_BROWSER is true', () => {
+            process.env.USE_SECURE_BROWSER = 'true';
+            const config = parseConfig();
+            expect(config.headlessBrowser.browserEndpoint).toEqual(
+                'wss://headless-browser-host',
+            );
+        });
+
+        test('internalLightdashHostIgnoreHttpsErrors defaults to false', () => {
+            const config = parseConfig();
+            expect(
+                config.headlessBrowser.internalLightdashHostIgnoreHttpsErrors,
+            ).toBe(false);
+        });
+
+        test('internalLightdashHostIgnoreHttpsErrors is true when env var is "true"', () => {
+            process.env.INTERNAL_LIGHTDASH_HOST_IGNORE_HTTPS_ERRORS = 'true';
+            const config = parseConfig();
+            expect(
+                config.headlessBrowser.internalLightdashHostIgnoreHttpsErrors,
+            ).toBe(true);
+        });
+
+        test('internalLightdashHostIgnoreHttpsErrors is false for any other value', () => {
+            process.env.INTERNAL_LIGHTDASH_HOST_IGNORE_HTTPS_ERRORS = '1';
+            const config = parseConfig();
+            expect(
+                config.headlessBrowser.internalLightdashHostIgnoreHttpsErrors,
+            ).toBe(false);
+        });
+
+        test('screenshotTimeoutMs defaults to 180000', () => {
+            const config = parseConfig();
+            expect(config.headlessBrowser.screenshotTimeoutMs).toBe(180000);
+        });
+
+        test('screenshotTimeoutMs is overridden by HEADLESS_BROWSER_SCREENSHOT_TIMEOUT_MS', () => {
+            process.env.HEADLESS_BROWSER_SCREENSHOT_TIMEOUT_MS = '360000';
+            const config = parseConfig();
+            expect(config.headlessBrowser.screenshotTimeoutMs).toBe(360000);
+        });
+    });
+
+    describe('environment variables for API tokens', () => {
+        beforeEach(() => {
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2025-06-19'));
+
+            process.env.LD_SETUP_ADMIN_EMAIL = 'admin@example.com';
+            process.env.LD_SETUP_SERVICE_ACCOUNT_EXPIRATION = '0';
+            process.env.LD_SETUP_PROJECT_PAT = 'project_personal_access_token';
+        });
+
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        test('should parse service account token', () => {
+            process.env.LD_SETUP_SERVICE_ACCOUNT_TOKEN =
+                'ldsvc_service-account-token';
+            const config = parseConfig();
+            expect(config.initialSetup?.serviceAccount).toEqual({
+                token: 'ldsvc_service-account-token',
+                expirationTime: null,
+            });
+        });
+
+        test('should throw error if service account token is not prefixed with "svc_"', () => {
+            process.env.LD_SETUP_SERVICE_ACCOUNT_TOKEN =
+                'service-account-token';
+            expect(() => parseConfig()).toThrowError(ParseError);
+        });
+
+        test('should parse personal access token', () => {
+            process.env.LD_SETUP_PROJECT_PAT = 'project_personal_access_token';
+            const config = parseConfig();
+            const warehouseConnection = config.initialSetup?.projects[0]
+                ?.warehouseConnection as { personalAccessToken?: string };
+            expect(warehouseConnection?.personalAccessToken).toBe(
+                'project_personal_access_token',
+            );
+        });
+
+        test('should throw ParameterError when LD_SETUP_PROJECT_PAT is missing but LD_SETUP_ADMIN_EMAIL is set', () => {
+            delete process.env.LD_SETUP_PROJECT_PAT;
+            expect(() => parseConfig()).toThrowError(ParameterError);
+            expect(() => parseConfig()).toThrowError(
+                'LD_SETUP_PROJECT_PAT is required for initial setup',
+            );
+        });
+
+        test('should throw ParameterError when LD_SETUP_PROJECT_PAT is empty string', () => {
+            process.env.LD_SETUP_PROJECT_PAT = '';
+            expect(() => parseConfig()).toThrowError(ParameterError);
+            expect(() => parseConfig()).toThrowError(
+                'LD_SETUP_PROJECT_PAT is required for initial setup',
+            );
+        });
+
+        test('should return undefined initialSetup when LD_SETUP_ADMIN_EMAIL is not set', () => {
+            delete process.env.LD_SETUP_ADMIN_EMAIL;
+            // LD_SETUP_PROJECT_PAT should be ignored when admin email is not set
+            process.env.LD_SETUP_PROJECT_PAT = 'some_token';
+            const config = parseConfig();
+            expect(config.initialSetup).toBeUndefined();
+        });
+    });
+});
+
+describe('getUserAttributesSetupConfig', () => {
+    beforeEach(() => {
+        delete process.env.LD_SETUP_USER_ATTRIBUTES;
+    });
+
+    test('returns undefined when LD_SETUP_USER_ATTRIBUTES is not set', () => {
+        expect(getUserAttributesSetupConfig()).toBeUndefined();
+    });
+
+    test('returns undefined when LD_SETUP_USER_ATTRIBUTES is an empty array', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = '[]';
+        expect(getUserAttributesSetupConfig()).toBeUndefined();
+    });
+
+    test('parses a single attribute with a group mapping', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = JSON.stringify([
+            {
+                name: 'is_privileged',
+                description: 'PII access',
+                attributeDefault: null,
+                groups: [{ group: 'Privileged Data Analyst', value: 'true' }],
+            },
+        ]);
+        expect(getUserAttributesSetupConfig()).toEqual([
+            {
+                name: 'is_privileged',
+                description: 'PII access',
+                attributeDefault: null,
+                groups: [
+                    { group: 'Privileged Data Analyst', values: ['true'] },
+                ],
+            },
+        ]);
+    });
+
+    test('accepts array values and array attributeDefault', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = JSON.stringify([
+            {
+                name: 'region',
+                attributeDefault: ['US', 'CA'],
+                groups: [{ group: 'Analysts', values: ['US', 'UK'] }],
+            },
+        ]);
+        expect(getUserAttributesSetupConfig()).toEqual([
+            {
+                name: 'region',
+                attributeDefault: ['US', 'CA'],
+                groups: [{ group: 'Analysts', values: ['US', 'UK'] }],
+            },
+        ]);
+    });
+
+    test('normalizes a scalar attributeDefault to an array', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = JSON.stringify([
+            { name: 'region', attributeDefault: 'US' },
+        ]);
+        expect(getUserAttributesSetupConfig()).toEqual([
+            {
+                name: 'region',
+                attributeDefault: ['US'],
+                groups: [],
+            },
+        ]);
+    });
+
+    test('defaults groups to [] and attributeDefault to null when omitted', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = JSON.stringify([
+            { name: 'region' },
+        ]);
+        expect(getUserAttributesSetupConfig()).toEqual([
+            {
+                name: 'region',
+                attributeDefault: null,
+                groups: [],
+            },
+        ]);
+    });
+
+    test('throws ParseError on malformed JSON', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = '{not json';
+        expect(() => getUserAttributesSetupConfig()).toThrowError(ParseError);
+    });
+
+    test('throws ParseError when an attribute is missing a name', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = JSON.stringify([
+            { groups: [{ group: 'g', value: 'v' }] },
+        ]);
+        expect(() => getUserAttributesSetupConfig()).toThrowError(ParseError);
+    });
+
+    test('throws ParseError on duplicate attribute names', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = JSON.stringify([
+            { name: 'dup', groups: [] },
+            { name: 'dup', groups: [] },
+        ]);
+        expect(() => getUserAttributesSetupConfig()).toThrowError(
+            'Duplicate user attribute name "dup"',
+        );
+    });
+});
+
+describe('getUpdateSetupConfig userAttributes', () => {
+    beforeEach(() => {
+        delete process.env.LD_SETUP_USER_ATTRIBUTES;
+    });
+
+    test('includes parsed userAttributes from LD_SETUP_USER_ATTRIBUTES', () => {
+        process.env.LD_SETUP_USER_ATTRIBUTES = JSON.stringify([
+            { name: 'is_privileged', groups: [{ group: 'G', value: 'true' }] },
+        ]);
+        expect(getUpdateSetupConfig()?.userAttributes).toEqual([
+            {
+                name: 'is_privileged',
+                attributeDefault: null,
+                groups: [{ group: 'G', values: ['true'] }],
+            },
+        ]);
+    });
+
+    test('userAttributes is undefined when env var not set', () => {
+        expect(getUpdateSetupConfig()?.userAttributes).toBeUndefined();
+    });
+});
+
+describe('getGroupProjectAccessSetupConfig', () => {
+    beforeEach(() => {
+        delete process.env.LD_SETUP_GROUP_PROJECT_ACCESS;
+    });
+
+    test('returns undefined when LD_SETUP_GROUP_PROJECT_ACCESS is not set', () => {
+        expect(getGroupProjectAccessSetupConfig()).toBeUndefined();
+    });
+
+    test('returns undefined when the array is empty', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = '[]';
+        expect(getGroupProjectAccessSetupConfig()).toBeUndefined();
+    });
+
+    test('parses an entry referencing the project by name', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = JSON.stringify([
+            {
+                groupName: 'Core Data Developer',
+                projectName: 'Production',
+                role: 'developer',
+            },
+        ]);
+        expect(getGroupProjectAccessSetupConfig()).toEqual([
+            {
+                groupName: 'Core Data Developer',
+                projectName: 'Production',
+                role: 'developer',
+            },
+        ]);
+    });
+
+    test('parses an entry referencing the project by uuid with a custom role name', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = JSON.stringify([
+            {
+                groupName: 'Data Analyst',
+                projectUuid: 'abc-123',
+                role: 'PII Analyst',
+            },
+        ]);
+        expect(getGroupProjectAccessSetupConfig()).toEqual([
+            {
+                groupName: 'Data Analyst',
+                projectUuid: 'abc-123',
+                role: 'PII Analyst',
+            },
+        ]);
+    });
+
+    test('throws ParseError on malformed JSON', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = '{not json';
+        expect(() => getGroupProjectAccessSetupConfig()).toThrowError(
+            ParseError,
+        );
+    });
+
+    test('throws ParseError when groupName is missing', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = JSON.stringify([
+            { projectName: 'Production', role: 'developer' },
+        ]);
+        expect(() => getGroupProjectAccessSetupConfig()).toThrowError(
+            ParseError,
+        );
+    });
+
+    test('throws ParseError when neither projectName nor projectUuid is given', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = JSON.stringify([
+            { groupName: 'Core Data Developer', role: 'developer' },
+        ]);
+        expect(() => getGroupProjectAccessSetupConfig()).toThrowError(
+            ParseError,
+        );
+    });
+
+    test('accepts both projectName and projectUuid (uuid wins at reconcile time)', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = JSON.stringify([
+            {
+                groupName: 'Core Data Developer',
+                projectName: 'Production',
+                projectUuid: 'abc-123',
+                role: 'developer',
+            },
+        ]);
+        expect(getGroupProjectAccessSetupConfig()).toEqual([
+            {
+                groupName: 'Core Data Developer',
+                projectName: 'Production',
+                projectUuid: 'abc-123',
+                role: 'developer',
+            },
+        ]);
+    });
+
+    test('throws ParseError on a duplicate group/project pair', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = JSON.stringify([
+            {
+                groupName: 'Core Data Developer',
+                projectName: 'Production',
+                role: 'developer',
+            },
+            {
+                groupName: 'Core Data Developer',
+                projectName: 'Production',
+                role: 'editor',
+            },
+        ]);
+        expect(() => getGroupProjectAccessSetupConfig()).toThrowError(
+            'Duplicate group/project pair',
+        );
+    });
+});
+
+describe('getUpdateSetupConfig groupProjectAccess', () => {
+    beforeEach(() => {
+        delete process.env.LD_SETUP_GROUP_PROJECT_ACCESS;
+    });
+
+    test('includes parsed groupProjectAccess from the env var', () => {
+        process.env.LD_SETUP_GROUP_PROJECT_ACCESS = JSON.stringify([
+            { groupName: 'G', projectName: 'P', role: 'developer' },
+        ]);
+        expect(getUpdateSetupConfig()?.groupProjectAccess).toEqual([
+            { groupName: 'G', projectName: 'P', role: 'developer' },
+        ]);
+    });
+
+    test('groupProjectAccess is undefined when env var not set', () => {
+        expect(getUpdateSetupConfig()?.groupProjectAccess).toBeUndefined();
+    });
+});
+
+describe('process.env.LIGHTDASH_CORS_ENABLED', () => {
+    test('defaults CORS to enabled when not set', () => {
+        process.env.LIGHTDASH_CORS_ALLOWED_DOMAINS = 'https://example.com';
+
+        const config = parseConfig();
+
+        expect(config.security.crossOriginResourceSharingPolicy.enabled).toBe(
+            true,
+        );
+        expect(
+            config.security.crossOriginResourceSharingPolicy.allowedDomains,
+        ).toEqual(['https://example.com']);
+    });
+
+    test('disables CORS only when explicitly false', () => {
+        process.env.LIGHTDASH_CORS_ENABLED = 'false';
+        process.env.LIGHTDASH_CORS_ALLOWED_DOMAINS = 'https://example.com';
+
+        const config = parseConfig();
+
+        expect(config.security.crossOriginResourceSharingPolicy.enabled).toBe(
+            false,
+        );
+        expect(
+            config.security.crossOriginResourceSharingPolicy.allowedDomains,
+        ).toEqual([]);
+    });
+});
+
+describe('parseAndSanitizeSchedulerTasks', () => {
+    beforeEach(() => {
+        // Clear scheduler environment variables before each test
+        delete process.env.SCHEDULER_INCLUDE_TASKS;
+        delete process.env.SCHEDULER_EXCLUDE_TASKS;
+        // Mock console.warn to capture warning messages
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    describe('Default behavior', () => {
+        test('should return all tasks when scheduler tasks environment variables are not set or empty', () => {
+            // Test with no environment variables set
+            const config1 = parseConfig();
+            expect(config1.scheduler.tasks).toEqual(ALL_TASK_NAMES);
+
+            // Test with empty string
+            process.env.SCHEDULER_INCLUDE_TASKS = '';
+            process.env.SCHEDULER_EXCLUDE_TASKS = '';
+            const config2 = parseConfig();
+            expect(config2.scheduler.tasks).toEqual(ALL_TASK_NAMES);
+        });
+    });
+
+    describe('Include tasks validation', () => {
+        test.each([
+            ['handleScheduledDelivery', ['handleScheduledDelivery']],
+            [
+                'handleScheduledDelivery,sendSlackNotification',
+                ['handleScheduledDelivery', 'sendSlackNotification'],
+            ],
+        ])(
+            'should return array with valid include tasks: %s',
+            (input, expected) => {
+                process.env.SCHEDULER_INCLUDE_TASKS = input;
+                const config = parseConfig();
+                expect(config.scheduler.tasks).toEqual(expected);
+            },
+        );
+
+        test('should filter out invalid tasks and warn about them', () => {
+            process.env.SCHEDULER_INCLUDE_TASKS =
+                'handleScheduledDelivery,invalidTask,sendSlackNotification';
+            const config = parseConfig();
+            expect(config.scheduler.tasks).toEqual([
+                'handleScheduledDelivery',
+                'sendSlackNotification',
+            ]);
+            expect(console.warn).toHaveBeenCalledWith(
+                'Invalid scheduler tasks found in SCHEDULER_INCLUDE_TASKS environment variable: invalidTask. These tasks will be ignored.',
+            );
+        });
+    });
+
+    describe('Exclude tasks validation', () => {
+        test('should return all tasks except excluded ones', () => {
+            process.env.SCHEDULER_EXCLUDE_TASKS =
+                'sendEmailNotification,uploadGsheets';
+            const config = parseConfig();
+            expect(config.scheduler.tasks).toEqual(
+                expect.arrayContaining(
+                    ALL_TASK_NAMES.filter(
+                        (task) =>
+                            task !== 'sendEmailNotification' &&
+                            task !== 'uploadGsheets',
+                    ),
+                ),
+            );
+        });
+
+        test('should filter out invalid exclude tasks and warn about them', () => {
+            process.env.SCHEDULER_EXCLUDE_TASKS =
+                'invalidTask,sendEmailNotification';
+            const config = parseConfig();
+            expect(config.scheduler.tasks).toEqual(
+                expect.arrayContaining([
+                    'handleScheduledDelivery',
+                    'sendSlackNotification',
+                ]),
+            );
+            expect(config.scheduler.tasks).not.toEqual(
+                expect.arrayContaining(['sendEmailNotification']),
+            );
+            expect(console.warn).toHaveBeenCalledWith(
+                'Invalid scheduler tasks found in SCHEDULER_EXCLUDE_TASKS environment variable: invalidTask. These tasks will be ignored.',
+            );
+        });
+    });
+
+    describe('Include and exclude together', () => {
+        test('should throw error if both include and exclude are set', () => {
+            process.env.SCHEDULER_INCLUDE_TASKS =
+                'handleScheduledDelivery,sendSlackNotification,sendEmailNotification,uploadGsheets';
+            process.env.SCHEDULER_EXCLUDE_TASKS = 'sendEmailNotification';
+            expect(() => parseConfig()).toThrowError(ParseError);
+        });
+    });
+
+    describe('Edge cases', () => {
+        test('should handle whitespace in include task list', () => {
+            process.env.SCHEDULER_INCLUDE_TASKS =
+                ' handleScheduledDelivery , sendSlackNotification ';
+            const config = parseConfig();
+            expect(config.scheduler.tasks).toEqual([
+                'handleScheduledDelivery',
+                'sendSlackNotification',
+            ]);
+        });
+
+        test('should not warn when all include tasks are valid', () => {
+            process.env.SCHEDULER_INCLUDE_TASKS =
+                'handleScheduledDelivery,sendSlackNotification';
+            parseConfig();
+            expect(console.warn).not.toHaveBeenCalled();
+        });
+    });
+});
+
+describe('scheduler poll interval', () => {
+    test('should default poll interval to 1000', () => {
+        const config = parseConfig();
+
+        expect(config.scheduler.pollInterval).toBe(1000);
+    });
+
+    test('should parse poll interval from environment variable', () => {
+        process.env.SCHEDULER_POLL_INTERVAL = '2500';
+
+        const config = parseConfig();
+
+        expect(config.scheduler.pollInterval).toBe(2500);
+    });
+});
+
+test('should set groups.enabled only when the environment variable is set', () => {
+    const undefinedConfig = parseConfig();
+    expect(undefinedConfig.groups.enabled).toBeUndefined();
+
+    process.env.GROUPS_ENABLED = 'true';
+    const trueConfig = parseConfig();
+    expect(trueConfig.groups.enabled).toBe(true);
+
+    process.env.GROUPS_ENABLED = 'false';
+    const falseConfig = parseConfig();
+    expect(falseConfig.groups.enabled).toBe(false);
+});
+
+describe('LD_SETUP_START_OF_WEEK', () => {
+    beforeEach(() => {
+        process.env.LD_SETUP_ADMIN_EMAIL = 'admin@example.com';
+        process.env.LD_SETUP_PROJECT_PAT = 'project_personal_access_token';
+    });
+
+    test('should convert day name to its numeric WeekDay value', () => {
+        process.env.LD_SETUP_START_OF_WEEK = 'THURSDAY';
+        const config = parseConfig();
+        expect(
+            config.initialSetup?.projects[0]?.warehouseConnection.startOfWeek,
+        ).toBe(WeekDay.THURSDAY);
+    });
+
+    test('should accept the numeric WeekDay value', () => {
+        process.env.LD_SETUP_START_OF_WEEK = '3';
+        const config = parseConfig();
+        expect(
+            config.initialSetup?.projects[0]?.warehouseConnection.startOfWeek,
+        ).toBe(WeekDay.THURSDAY);
+    });
+
+    test('should be undefined when unset', () => {
+        const config = parseConfig();
+        expect(
+            config.initialSetup?.projects[0]?.warehouseConnection.startOfWeek,
+        ).toBeUndefined();
+    });
+
+    test('should skip initial setup for an invalid value', () => {
+        process.env.LD_SETUP_START_OF_WEEK = 'FUNDAY';
+        const consoleError = vi
+            .spyOn(console, 'error')
+            .mockImplementation(() => {});
+        const config = parseConfig();
+        expect(config.initialSetup).toBeUndefined();
+        expect(consoleError).toHaveBeenCalledWith(
+            'Error parsing initial setup config',
+            expect.objectContaining({
+                message: expect.stringContaining('FUNDAY'),
+            }),
+        );
+        consoleError.mockRestore();
+    });
+});
+
+describe('getMultiProjectSetupConfig', () => {
+    beforeEach(() => {
+        delete process.env.LD_SETUP_PROJECTS;
+    });
+
+    test('should return undefined when LD_SETUP_PROJECTS is not set', () => {
+        expect(getMultiProjectSetupConfig()).toBeUndefined();
+    });
+
+    test('should return undefined for empty array', () => {
+        process.env.LD_SETUP_PROJECTS = '[]';
+        expect(getMultiProjectSetupConfig()).toBeUndefined();
+    });
+
+    test('should parse valid multi-project config', () => {
+        const projects = [
+            {
+                name: 'Project Alpha',
+                warehouseConnection: {
+                    type: WarehouseTypes.DATABRICKS,
+                    serverHostName: 'alpha.databricks.com',
+                    httpPath: '/sql/1.0/warehouses/alpha',
+                    database: 'alpha_db',
+                    personalAccessToken: 'alpha-token',
+                },
+                dbtConnection: {
+                    type: DbtProjectType.GITHUB,
+                    authorization_method: 'personal_access_token',
+                    personal_access_token: 'alpha-dbt-token',
+                    repository: 'org/alpha-repo',
+                    branch: 'main',
+                    project_sub_path: '/',
+                },
+            },
+        ];
+        process.env.LD_SETUP_PROJECTS = JSON.stringify(projects);
+        const result = getMultiProjectSetupConfig();
+        expect(result).toEqual(projects);
+    });
+
+    test('should convert day-name startOfWeek to its numeric WeekDay value', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                warehouseConnection: {
+                    type: WarehouseTypes.DATABRICKS,
+                    startOfWeek: 'THURSDAY',
+                },
+                dbtConnection: { type: DbtProjectType.NONE },
+            },
+        ]);
+        const result = getMultiProjectSetupConfig();
+        expect(result?.[0]?.warehouseConnection.startOfWeek).toBe(
+            WeekDay.THURSDAY,
+        );
+    });
+
+    test('should keep numeric startOfWeek values', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                warehouseConnection: {
+                    type: WarehouseTypes.DATABRICKS,
+                    startOfWeek: 3,
+                },
+                dbtConnection: { type: DbtProjectType.NONE },
+            },
+        ]);
+        const result = getMultiProjectSetupConfig();
+        expect(result?.[0]?.warehouseConnection.startOfWeek).toBe(
+            WeekDay.THURSDAY,
+        );
+    });
+
+    test('should keep null startOfWeek', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                warehouseConnection: {
+                    type: WarehouseTypes.DATABRICKS,
+                    startOfWeek: null,
+                },
+                dbtConnection: { type: DbtProjectType.NONE },
+            },
+        ]);
+        const result = getMultiProjectSetupConfig();
+        expect(result?.[0]?.warehouseConnection.startOfWeek).toBeNull();
+    });
+
+    test('should throw ParseError for invalid startOfWeek', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                warehouseConnection: {
+                    type: WarehouseTypes.DATABRICKS,
+                    startOfWeek: 'FUNDAY',
+                },
+                dbtConnection: { type: DbtProjectType.NONE },
+            },
+        ]);
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Invalid LD_SETUP_PROJECTS',
+        );
+    });
+
+    test('should throw ParseError for non-array JSON', () => {
+        process.env.LD_SETUP_PROJECTS = '{"name": "not an array"}';
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Invalid LD_SETUP_PROJECTS',
+        );
+    });
+
+    test('should throw ParseError for entry without name', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                warehouseConnection: { type: 'databricks' },
+                dbtConnection: { type: 'github' },
+            },
+        ]);
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Invalid LD_SETUP_PROJECTS',
+        );
+    });
+
+    test('should throw ParseError for entry without warehouseConnection', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                dbtConnection: { type: 'github' },
+            },
+        ]);
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Invalid LD_SETUP_PROJECTS',
+        );
+    });
+
+    test('should throw ParseError for entry without dbtConnection', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                warehouseConnection: { type: 'databricks' },
+            },
+        ]);
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Invalid LD_SETUP_PROJECTS',
+        );
+    });
+
+    test('should throw ParseError for invalid warehouse type', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                warehouseConnection: { type: 'banana' },
+                dbtConnection: { type: 'github' },
+            },
+        ]);
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Invalid warehouse type',
+        );
+    });
+
+    test('should throw ParseError for invalid dbt connection type', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Test',
+                warehouseConnection: { type: 'databricks' },
+                dbtConnection: { type: 'invalid' },
+            },
+        ]);
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Invalid dbt connection type',
+        );
+    });
+
+    test('should throw ParseError for duplicate project names', () => {
+        process.env.LD_SETUP_PROJECTS = JSON.stringify([
+            {
+                name: 'Duplicate',
+                warehouseConnection: { type: 'databricks' },
+                dbtConnection: { type: 'github' },
+            },
+            {
+                name: 'Duplicate',
+                warehouseConnection: { type: 'databricks' },
+                dbtConnection: { type: 'github' },
+            },
+        ]);
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Duplicate project name "Duplicate"',
+        );
+    });
+
+    test('should throw ParseError for invalid JSON', () => {
+        process.env.LD_SETUP_PROJECTS = 'not valid json';
+        expect(() => getMultiProjectSetupConfig()).toThrow(ParseError);
+        expect(() => getMultiProjectSetupConfig()).toThrow(
+            'Failed to parse LD_SETUP_PROJECTS',
+        );
+    });
+});
+
+describe('legacy feature-flag env vars (compat repair for trivial-batch)', () => {
+    // The change-chart-explore env-var parser was removed when that flag was
+    // migrated to DB-backed resolution. Re-translating it via the legacy
+    // enable list preserves backward compat for self-hosted deployments that
+    // set the var.
+    test.each([
+        ['CHANGE_CHART_EXPLORE_ENABLED', 'change-chart-explore'],
+        ['GOOGLE_CHAT_ENABLED', 'google-chat-enabled'],
+        ['USER_IMPERSONATION_ENABLED', 'user-impersonation'],
+        ['GROUPS_ENABLED', 'user-groups-enabled'],
+        ['SHOW_EXECUTION_TIME', 'show-execution-time'],
+        ['EMBEDDING_ENABLED', 'embedding'],
+        ['SERVICE_ACCOUNT_ENABLED', 'service-accounts'],
+        ['SCIM_ENABLED', 'scim-token-management'],
+        [
+            'ORGANIZATION_WAREHOUSE_CREDENTIALS_ENABLED',
+            'organization-warehouse-credentials',
+        ],
+        ['METRIC_DASHBOARD_FILTERS_ENABLED', 'metric-dashboard-filters'],
+    ])('legacy %s=true translates to enabledFeatureFlags', (envVar, flagId) => {
+        process.env[envVar] = 'true';
+        const config = parseConfig();
+        expect(config.enabledFeatureFlags.has(flagId)).toBe(true);
+    });
+});
+
+describe('feature flag env-var allowlists', () => {
+    test('LIGHTDASH_ENABLE_FEATURE_FLAGS populates enabledFeatureFlags', () => {
+        process.env.LIGHTDASH_ENABLE_FEATURE_FLAGS = 'foo, bar,baz';
+        const config = parseConfig();
+        expect([...config.enabledFeatureFlags].sort()).toEqual([
+            'bar',
+            'baz',
+            'foo',
+        ]);
+    });
+
+    test('LIGHTDASH_DISABLE_FEATURE_FLAGS populates disabledFeatureFlags', () => {
+        process.env.LIGHTDASH_DISABLE_FEATURE_FLAGS = 'killed-flag';
+        const config = parseConfig();
+        expect(config.disabledFeatureFlags.has('killed-flag')).toBe(true);
+    });
+
+    test('dashboardComments.enabled defaults to true when DISABLE_DASHBOARD_COMMENTS is unset', () => {
+        delete process.env.DISABLE_DASHBOARD_COMMENTS;
+        const config = parseConfig();
+        expect(config.dashboardComments.enabled).toBe(true);
+    });
+
+    test('DISABLE_DASHBOARD_COMMENTS=true disables dashboardComments', () => {
+        process.env.DISABLE_DASHBOARD_COMMENTS = 'true';
+        const config = parseConfig();
+        expect(config.dashboardComments.enabled).toBe(false);
+    });
+});
+
+describe('persistentDownloadUrls.enabled', () => {
+    test('defaults to false when PERSISTENT_DOWNLOAD_URLS_ENABLED is unset', () => {
+        const config = parseConfig();
+        expect(config.persistentDownloadUrls.enabled).toBe(false);
+    });
+
+    test('is true only when explicitly set to "true"', () => {
+        process.env.PERSISTENT_DOWNLOAD_URLS_ENABLED = 'true';
+        const config = parseConfig();
+        expect(config.persistentDownloadUrls.enabled).toBe(true);
+    });
+
+    test('is false when set to "false"', () => {
+        process.env.PERSISTENT_DOWNLOAD_URLS_ENABLED = 'false';
+        const config = parseConfig();
+        expect(config.persistentDownloadUrls.enabled).toBe(false);
+    });
+});
+
+describe('pgWire TLS configuration', () => {
+    test('defaults to require mode with no cert paths', () => {
+        const config = parseConfig();
+        expect(config.pgWire).toEqual({
+            port: undefined,
+            host: undefined,
+            ssl: { mode: 'require', certPath: undefined, keyPath: undefined },
+        });
+    });
+
+    test('throws when PGWIRE_PORT is set without TLS certs', () => {
+        process.env.PGWIRE_PORT = '5432';
+        expect(() => parseConfig()).toThrowError(ParseError);
+    });
+
+    test('throws when PGWIRE_PORT is set with only a cert (no key)', () => {
+        process.env.PGWIRE_PORT = '5432';
+        process.env.PGWIRE_SSL_CERT_PATH = '/certs/tls.crt';
+        expect(() => parseConfig()).toThrowError(ParseError);
+    });
+
+    test('accepts PGWIRE_PORT with cert and key paths', () => {
+        process.env.PGWIRE_PORT = '5432';
+        process.env.PGWIRE_SSL_CERT_PATH = '/certs/tls.crt';
+        process.env.PGWIRE_SSL_KEY_PATH = '/certs/tls.key';
+        const config = parseConfig();
+        expect(config.pgWire.ssl).toEqual({
+            mode: 'require',
+            certPath: '/certs/tls.crt',
+            keyPath: '/certs/tls.key',
+        });
+    });
+
+    test('accepts PGWIRE_PORT without certs when TLS is explicitly disabled', () => {
+        process.env.PGWIRE_PORT = '5432';
+        process.env.PGWIRE_SSL_MODE = 'disabled';
+        const config = parseConfig();
+        expect(config.pgWire.ssl.mode).toBe('disabled');
+    });
+
+    test('throws on an invalid PGWIRE_SSL_MODE', () => {
+        process.env.PGWIRE_SSL_MODE = 'prefer';
+        expect(() => parseConfig()).toThrowError(ParseError);
+    });
+});

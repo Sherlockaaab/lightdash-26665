@@ -1,0 +1,242 @@
+import { type AnyType } from './any';
+import { OrganizationMemberRole } from './organizationMemberProfile';
+import { ProjectMemberRole } from './projectMemberRole';
+import { type ProjectType, type WarehouseTypes } from './projects';
+
+/**
+ * Details of a user's Organization
+ */
+export type Organization = {
+    /**
+     * The unique identifier of the organization
+     * @format uuid
+     */
+    organizationUuid: string;
+    /**
+     * The name of the organization
+     */
+    name: string;
+
+    /**
+     * The default color palette for all projects in the organization
+     */
+    chartColors?: string[];
+
+    /**
+     * The default dark color palette for all projects in the organization
+     */
+    chartDarkColors?: string[];
+
+    /**
+     * The active color palette uuid for all projects in the organization
+     */
+    colorPaletteUuid?: string;
+
+    /**
+     * The organization needs a project if it doesn't have at least one project.
+     */
+    needsProject?: boolean;
+    /**
+     * The project a user sees when they first log in to the organization
+     */
+    defaultProjectUuid?: string;
+    createdAt?: Date;
+
+    /**
+     * Postgres wire protocol connection details for the semantic layer, only
+     * populated on the authenticated `GET /org` response (not the public health
+     * endpoint). `enabled` reflects whether the instance exposes a pgwire port
+     * and is returned to every org member; `host`/`port` are the infra endpoint
+     * clients connect to and are only populated for org admins (null otherwise).
+     */
+    pgWire?: {
+        enabled: boolean;
+        /** Whether the server requires TLS (clients must use sslmode=require
+         * or stricter). False only on instances that explicitly opted out.
+         * Optional for API backwards compatibility — the server always
+         * returns it; treat absence as true. */
+        tlsRequired?: boolean;
+        host: string | null;
+        port: number | null;
+    };
+};
+
+export type CreateOrganization = Pick<Organization, 'name'>;
+
+export type UpdateOrganization = Partial<
+    Omit<Organization, 'organizationUuid' | 'needsProject'>
+>;
+
+export type ApiOrganization = {
+    status: 'ok';
+    results: Organization;
+};
+
+/**
+ * Summary of a project under an organization
+ */
+export type OrganizationProject = {
+    /**
+     * The unique identifier of the project
+     * @format uuid
+     */
+    projectUuid: string;
+    name: string;
+    type: ProjectType;
+    createdByUserUuid: string | null;
+    createdByUserName: string | null;
+    createdAt: Date;
+    upstreamProjectUuid: string | null;
+    warehouseType?: WarehouseTypes;
+    expiresAt: Date | null;
+    provisioningSource?: string | null;
+};
+
+/**
+ * List of projects in the current organization
+ */
+export type ApiOrganizationProjects = {
+    status: 'ok';
+    results: OrganizationProject[];
+};
+
+export type OnbordingRecord = {
+    ranQueryAt: Date | null;
+    shownSuccessAt: Date | null;
+    playgroundProjectDeletedAt?: Date | null;
+};
+
+export type OnboardingStatus = {
+    ranQuery: boolean;
+};
+
+export type ApiOnboardingStatusResponse = {
+    status: 'ok';
+    results: OnboardingStatus;
+};
+
+export type AllowedEmailDomainsRole =
+    | OrganizationMemberRole.EDITOR
+    | OrganizationMemberRole.INTERACTIVE_VIEWER
+    | OrganizationMemberRole.VIEWER
+    | OrganizationMemberRole.MEMBER;
+
+export const AllowedEmailDomainsRoles: Array<AllowedEmailDomainsRole> = [
+    OrganizationMemberRole.EDITOR,
+    OrganizationMemberRole.INTERACTIVE_VIEWER,
+    OrganizationMemberRole.VIEWER,
+    OrganizationMemberRole.MEMBER,
+];
+
+export function isAllowedEmailDomainsRole(
+    role: OrganizationMemberRole,
+): role is AllowedEmailDomainsRole {
+    return AllowedEmailDomainsRoles.includes(role as AnyType);
+}
+
+export type AllowedEmailDomainProjectsRole =
+    | ProjectMemberRole.EDITOR
+    | ProjectMemberRole.INTERACTIVE_VIEWER
+    | ProjectMemberRole.VIEWER;
+
+export const AllowedEmailDomainProjectRoles: Array<AllowedEmailDomainProjectsRole> =
+    [
+        ProjectMemberRole.EDITOR,
+        ProjectMemberRole.INTERACTIVE_VIEWER,
+        ProjectMemberRole.VIEWER,
+    ];
+
+export function isAllowedEmailDomainProjectRole(
+    role: ProjectMemberRole | OrganizationMemberRole,
+): role is AllowedEmailDomainProjectsRole {
+    return (AllowedEmailDomainProjectRoles as unknown[]).includes(role);
+}
+
+export type AllowedEmailDomains = {
+    organizationUuid: string;
+    emailDomains: string[];
+    role: AllowedEmailDomainsRole;
+    projects: Array<{
+        projectUuid: string;
+        role: AllowedEmailDomainProjectsRole;
+    }>;
+};
+
+export type UpdateAllowedEmailDomains = Omit<
+    AllowedEmailDomains,
+    'organizationUuid'
+>;
+
+export type ApiOrganizationAllowedEmailDomains = {
+    status: 'ok';
+    results: AllowedEmailDomains;
+};
+
+export type OrganizationColorPalette = {
+    colorPaletteUuid: string;
+    organizationUuid: string;
+    name: string;
+    colors: string[];
+    darkColors: string[] | null;
+    createdAt: Date;
+};
+
+export type OrganizationColorPaletteWithIsActive = OrganizationColorPalette & {
+    isActive: boolean;
+};
+
+export type CreateColorPalette = {
+    name: string;
+    colors: string[];
+    darkColors?: string[];
+};
+
+export type UpdateColorPalette = {
+    uuid: string;
+    name?: string;
+    colors?: string[];
+    darkColors?: string[];
+};
+
+export type ApiColorPaletteResponse = {
+    status: 'ok';
+    results: OrganizationColorPalette;
+};
+
+export type ApiColorPalettesResponse = {
+    status: 'ok';
+    results: OrganizationColorPaletteWithIsActive[];
+};
+
+export type ApiCreatedColorPaletteResponse = {
+    status: 'ok';
+    results: OrganizationColorPalette;
+};
+
+/**
+ * Where a resolved colour palette came from. The `config` and `default` cases
+ * carry no entity reference; the rest expose the UUID and human-readable name
+ * of the entity (organization, project, space, dashboard or chart) that owns
+ * the winning palette in the resolution chain.
+ */
+export type ColorPaletteSource =
+    | { type: 'config' }
+    | { type: 'default' }
+    | { type: 'organization'; uuid: string; name: string }
+    | { type: 'project'; uuid: string; name: string }
+    | { type: 'space'; uuid: string; name: string }
+    | { type: 'dashboard'; uuid: string; name: string }
+    | { type: 'chart'; uuid: string; name: string };
+
+export type ResolvedProjectColorPalette = {
+    colors: string[];
+    darkColors: string[] | null;
+    paletteUuid: string | null;
+    paletteName: string | null;
+    source: ColorPaletteSource;
+};
+
+export type ApiProjectColorPaletteResponse = {
+    status: 'ok';
+    results: ResolvedProjectColorPalette;
+};

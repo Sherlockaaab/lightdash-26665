@@ -1,0 +1,297 @@
+import {
+    ApiGithubUserCredentialResponse,
+    ApiSuccessEmpty,
+    assertRegisteredAccount,
+    GitIntegrationConfiguration,
+    GitRepo,
+} from '@lightdash/common';
+import {
+    Body,
+    Delete,
+    Get,
+    Middlewares,
+    OperationId,
+    Post,
+    Query,
+    Request,
+    Route,
+    SuccessResponse,
+} from '@tsoa/runtime';
+import express from 'express';
+import { toSessionUser } from '../auth/account';
+import { isAuthenticated, unauthorisedInDemo } from './authentication';
+import { BaseController } from './baseController';
+
+/** HOW it works
+ *
+ * First install the app in the org
+ * using /api/v1/github/install
+ *
+ * This will redirect to the github app to the callback page
+ * Write down the refresh token (not sure if we need it) and installation_id (currently hardcoded)
+ *
+ * and then you can use it on /api/v1/github/list
+ * or /api/v1/github/create-branch to create a branch and push some code.
+ */
+@Route('/api/v1/github')
+export class GithubInstallController extends BaseController {
+    /**
+     * Install the Lightdash GitHub App and link to an organization
+     * @summary Install GitHub App
+     * @param redirect The url to redirect to after installation
+     * @param req express request
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @SuccessResponse('302', 'Not found')
+    @Get('/install')
+    @OperationId('installGithubAppForOrganization')
+    async installGithubAppForOrganization(
+        @Request() req: express.Request,
+    ): Promise<void> {
+        assertRegisteredAccount(req.account);
+        const context = await this.services
+            .getGithubAppService()
+            .installRedirect(toSessionUser(req.account));
+
+        req.session.oauth = {};
+        req.session.oauth.returnTo = context.returnToUrl;
+        req.session.oauth.state = context.state;
+        req.session.oauth.inviteCode = context.inviteCode;
+        req.session.oauth.githubFlow = 'installation';
+
+        this.setStatus(302);
+        this.setHeader('Location', context.installUrl);
+    }
+
+    /**
+     * Link the authenticated user's personal GitHub account so write-backs
+     * can be authored as them instead of the Lightdash GitHub App
+     * @summary Link GitHub account
+     * @param redirect Optional path to return to after authorization
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @SuccessResponse('302', 'Redirect to GitHub')
+    @Get('/user/authorize')
+    @OperationId('authorizeGithubUser')
+    async authorizeGithubUser(
+        @Request() req: express.Request,
+        @Query() redirect?: string,
+    ): Promise<void> {
+        assertRegisteredAccount(req.account);
+        const context = await this.services
+            .getGithubAppService()
+            .linkUserRedirect(toSessionUser(req.account), redirect);
+
+        req.session.oauth = {};
+        req.session.oauth.returnTo = context.returnToUrl;
+        req.session.oauth.state = context.state;
+        req.session.oauth.githubFlow = 'user_link';
+
+        this.setStatus(302);
+        this.setHeader('Location', context.authorizeUrl);
+    }
+
+    /**
+     * Get the authenticated user's linked GitHub account, if any
+     * @summary Get linked GitHub account
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @SuccessResponse('200')
+    @Get('/user')
+    @OperationId('getGithubUserCredential')
+    async getGithubUserCredential(
+        @Request() req: express.Request,
+    ): Promise<ApiGithubUserCredentialResponse> {
+        assertRegisteredAccount(req.account);
+        const credential = await this.services
+            .getGithubAppService()
+            .getUserCredential(toSessionUser(req.account));
+        return {
+            status: 'ok',
+            results: credential,
+        };
+    }
+
+    /**
+     * Unlink the authenticated user's GitHub account and revoke its token
+     * @summary Unlink GitHub account
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @Delete('/user')
+    @OperationId('unlinkGithubUser')
+    async unlinkGithubUser(
+        @Request() req: express.Request,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        await this.services
+            .getGithubAppService()
+            .unlinkUser(toSessionUser(req.account));
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    /**
+     * Get GitHub App configuration for the organization
+     * @summary Get GitHub App configuration
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @SuccessResponse('200')
+    @Get('/config')
+    @OperationId('configurationGithubAppForOrganization')
+    async configurationGithubAppForOrganization(
+        @Request() req: express.Request,
+    ): Promise<{
+        status: 'ok';
+        results: GitIntegrationConfiguration;
+    }> {
+        assertRegisteredAccount(req.account);
+        const config = await this.services
+            .getGitIntegrationService()
+            .getConfiguration(toSessionUser(req.account));
+
+        return {
+            status: 'ok',
+            results: config,
+        };
+    }
+
+    /**
+     * Callback URL for GitHub App Authorization also used for GitHub App Installation with combined Authorization
+     * @summary GitHub OAuth callback
+     * @param req {express.Request} express request
+     * @param code {string} authorization code from GitHub
+     * @param state {string} oauth state parameter
+     * @param installation_id {string} installation id from GitHub
+     * @param setup_action {string} setup action from GitHub
+     */
+    @Get('/oauth/callback')
+    @OperationId('githubOauthCallback')
+    async githubOauthCallback(
+        @Request() req: express.Request,
+        @Query() code?: string,
+        @Query() state?: string,
+        @Query() installation_id?: string,
+        @Query() setup_action?: string,
+    ): Promise<void> {
+        assertRegisteredAccount(req.account);
+        if (!state || state !== req.session.oauth?.state) {
+            this.setStatus(400);
+            throw new Error('State does not match');
+        }
+        // GitHub Apps share one OAuth callback URL between the installation
+        // flow and the user-link flow; the session flag set at redirect time
+        // tells them apart.
+        const redirectUrl =
+            req.session.oauth.githubFlow === 'user_link'
+                ? await this.services
+                      .getGithubAppService()
+                      .linkUserCallback(
+                          toSessionUser(req.account),
+                          req.session.oauth,
+                          code,
+                          state,
+                      )
+                : await this.services
+                      .getGithubAppService()
+                      .installCallback(
+                          toSessionUser(req.account),
+                          req.session.oauth,
+                          code,
+                          state,
+                          installation_id,
+                          setup_action,
+                      );
+        this.setStatus(302);
+        this.setHeader('Location', redirectUrl);
+    }
+
+    /**
+     * Uninstall the GitHub App from the organization
+     * @summary Uninstall GitHub App
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @Delete('/uninstall')
+    @OperationId('uninstallGithubAppForOrganization')
+    async uninstallGithubAppForOrganization(
+        @Request() req: express.Request,
+    ): Promise<ApiSuccessEmpty> {
+        assertRegisteredAccount(req.account);
+        await this.services
+            .getGithubAppService()
+            .deleteAppInstallation(toSessionUser(req.account));
+
+        this.setStatus(200);
+        return {
+            status: 'ok',
+            results: undefined,
+        };
+    }
+
+    /**
+     * List GitHub repositories accessible via the installed app
+     * @summary List GitHub repositories
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @SuccessResponse('200')
+    @Get('/repos/list')
+    @OperationId('getGithubListRepositories')
+    async getGithubListRepositories(@Request() req: express.Request): Promise<{
+        status: 'ok';
+        results: Array<GitRepo>;
+    }> {
+        assertRegisteredAccount(req.account);
+        this.setStatus(200);
+
+        return {
+            status: 'ok',
+            results: await this.services
+                .getGithubAppService()
+                .getRepos(toSessionUser(req.account)),
+        };
+    }
+
+    /**
+     * Create a new GitHub repository via the installed app
+     * @summary Create GitHub repository
+     */
+    @Middlewares([isAuthenticated, unauthorisedInDemo])
+    @SuccessResponse('201', 'Created')
+    @Post('/repos')
+    @OperationId('createGithubRepository')
+    async createGithubRepository(
+        @Request() req: express.Request,
+        @Body()
+        body: {
+            name: string;
+            description?: string;
+            isPrivate?: boolean;
+        },
+    ): Promise<{
+        status: 'ok';
+        results: {
+            owner: string;
+            repo: string;
+            fullName: string;
+            defaultBranch: string;
+        };
+    }> {
+        assertRegisteredAccount(req.account);
+        const result = await this.services
+            .getGithubAppService()
+            .createRepository(
+                toSessionUser(req.account),
+                body.name,
+                body.description,
+                body.isPrivate,
+            );
+
+        this.setStatus(201);
+        return {
+            status: 'ok',
+            results: result,
+        };
+    }
+}

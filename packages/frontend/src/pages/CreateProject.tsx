@@ -1,0 +1,177 @@
+import { FeatureFlags } from '@lightdash/common';
+import { useState, type FC } from 'react';
+import { Navigate, useNavigate, useParams } from 'react-router';
+import Page from '../components/common/Page/Page';
+import PageSpinner from '../components/PageSpinner';
+import ConnectManually from '../components/ProjectConnection/ProjectConnectFlow/ConnectManually';
+import ConnectManuallyStep2 from '../components/ProjectConnection/ProjectConnectFlow/ConnectManually/ConnectManuallyStep2';
+import ConnectSuccess from '../components/ProjectConnection/ProjectConnectFlow/ConnectSuccess';
+import ConnectUsingAgent from '../components/ProjectConnection/ProjectConnectFlow/ConnectUsingAgent';
+import ConnectUsingCLI from '../components/ProjectConnection/ProjectConnectFlow/ConnectUsingCLI';
+import SelectConnectMethod from '../components/ProjectConnection/ProjectConnectFlow/SelectConnectMethod';
+import SelectWarehouse from '../components/ProjectConnection/ProjectConnectFlow/SelectWarehouse';
+import {
+    ConnectMethod,
+    OtherWarehouse,
+    type SelectedWarehouse,
+} from '../components/ProjectConnection/ProjectConnectFlow/types';
+import UnsupportedWarehouse from '../components/ProjectConnection/ProjectConnectFlow/UnsupportedWarehouse';
+import { ProjectFormProvider } from '../components/ProjectConnection/ProjectFormProvider';
+import { useOrganization } from '../hooks/organization/useOrganization';
+import useSearchParams from '../hooks/useSearchParams';
+import { useServerFeatureFlag } from '../hooks/useServerOrClientFeatureFlag';
+import useApp from '../providers/App/useApp';
+
+const CreateProject: FC = () => {
+    const navigate = useNavigate();
+    const { isInitialLoading: isLoadingOrganization, data: organization } =
+        useOrganization();
+
+    const {
+        health: { data: health, isInitialLoading: isLoadingHealth },
+    } = useApp();
+
+    const { method } = useParams<{ method: ConnectMethod }>();
+    const projectUuid = useSearchParams('projectUuid');
+    const codingAgentOnboardingFlag = useServerFeatureFlag(
+        FeatureFlags.CodingAgentOnboarding,
+    );
+
+    const [warehouse, setWarehouse] = useState<SelectedWarehouse>();
+
+    if (
+        isLoadingHealth ||
+        !health ||
+        isLoadingOrganization ||
+        !organization ||
+        codingAgentOnboardingFlag.isInitialLoading
+    ) {
+        return <PageSpinner />;
+    }
+
+    const isCodingAgentOnboardingEnabled =
+        codingAgentOnboardingFlag.data?.enabled === true;
+
+    if (method === ConnectMethod.AGENT && !isCodingAgentOnboardingEnabled) {
+        return <Navigate to="/createProject" replace />;
+    }
+
+    const isCreatingFirstProject = !!organization.needsProject;
+
+    return (
+        <ProjectFormProvider>
+            <Page title="Create project" withFixedContent withPaddedContent>
+                {method && projectUuid ? (
+                    <ConnectSuccess projectUuid={projectUuid} />
+                ) : (
+                    <>
+                        {!warehouse ? (
+                            <SelectWarehouse
+                                isCreatingFirstProject={isCreatingFirstProject}
+                                onSelect={setWarehouse}
+                            />
+                        ) : warehouse === OtherWarehouse.Other ? (
+                            <UnsupportedWarehouse
+                                onBack={() => {
+                                    setWarehouse(undefined);
+                                    void navigate('/createProject', {
+                                        replace: true,
+                                    });
+                                }}
+                            />
+                        ) : (
+                            <>
+                                {warehouse && !method && (
+                                    <SelectConnectMethod
+                                        isCreatingFirstProject={
+                                            isCreatingFirstProject
+                                        }
+                                        isCodingAgentOnboardingEnabled={
+                                            isCodingAgentOnboardingEnabled
+                                        }
+                                        onSelect={(newMethod) => {
+                                            void navigate(
+                                                `/createProject/${newMethod}`,
+                                                { replace: true },
+                                            );
+                                        }}
+                                        onBack={() => {
+                                            setWarehouse(undefined);
+                                        }}
+                                    />
+                                )}
+
+                                {warehouse && method === ConnectMethod.CLI && (
+                                    <ConnectUsingCLI
+                                        siteUrl={health.siteUrl}
+                                        version={health.version}
+                                        onBack={() => {
+                                            void navigate('/createProject', {
+                                                replace: true,
+                                            });
+                                        }}
+                                    />
+                                )}
+
+                                {warehouse &&
+                                    method === ConnectMethod.AGENT && (
+                                        <ConnectUsingAgent
+                                            selectedWarehouse={warehouse}
+                                            siteUrl={health.siteUrl}
+                                            onBack={() => {
+                                                void navigate(
+                                                    '/createProject',
+                                                    {
+                                                        replace: true,
+                                                    },
+                                                );
+                                            }}
+                                        />
+                                    )}
+
+                                {warehouse &&
+                                    method === ConnectMethod.MANUAL && (
+                                        <ConnectManually
+                                            isCreatingFirstProject={
+                                                isCreatingFirstProject
+                                            }
+                                            selectedWarehouse={warehouse}
+                                            onBack={() => {
+                                                void navigate(
+                                                    '/createProject',
+                                                    {
+                                                        replace: true,
+                                                    },
+                                                );
+                                            }}
+                                        />
+                                    )}
+
+                                {warehouse &&
+                                    method === ConnectMethod.WAREHOUSE && (
+                                        <ConnectManuallyStep2
+                                            isCreatingFirstProject={
+                                                isCreatingFirstProject
+                                            }
+                                            selectedWarehouse={warehouse}
+                                            warehouseOnly
+                                            onBack={() => {
+                                                void navigate(
+                                                    '/createProject',
+                                                    {
+                                                        replace: true,
+                                                    },
+                                                );
+                                            }}
+                                        />
+                                    )}
+                            </>
+                        )}
+                    </>
+                )}
+            </Page>
+        </ProjectFormProvider>
+    );
+};
+
+export default CreateProject;

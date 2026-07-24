@@ -1,0 +1,1133 @@
+import { ForbiddenError } from '@lightdash/common';
+import express, { Express } from 'express';
+import { AppArguments } from '../App';
+import {
+    createBranch,
+    createPullRequest,
+    createPullRequestComment,
+    createSignedCommitOnBranch,
+    getBranchHeadSha,
+    getInstallationToken,
+    getPullRequest,
+    getRepoDefaultBranch,
+    getRepoWorkflowFiles,
+} from '../clients/github/Github';
+import { lightdashConfig } from '../config/lightdashConfig';
+import Logger from '../logging/logger';
+import { McpContextModel } from '../models/McpContextModel';
+import { registerPreAggregateStream } from '../nats/natsConfig';
+import { AsyncQueryService } from '../services/AsyncQueryService/AsyncQueryService';
+import { DeployService } from '../services/DeployService';
+import { InstanceConfigurationService } from '../services/InstanceConfigurationService/InstanceConfigurationService';
+import { ProjectService } from '../services/ProjectService/ProjectService';
+import { RolesService } from '../services/RolesService/RolesService';
+import { EncryptionUtil } from '../utils/EncryptionUtil/EncryptionUtil';
+import { AiModelCatalog } from './clients/Ai/AiModelCatalog';
+import { AiDeepResearchClient } from './clients/AiDeepResearchClient';
+import LicenseClient from './clients/License/LicenseClient';
+import { ManagedAgentClient } from './clients/ManagedAgentClient';
+import OpenAi from './clients/OpenAi';
+import { CommercialSlackClient } from './clients/Slack/SlackClient';
+import { AgentOnboardingRunModel } from './models/AgentOnboardingRunModel';
+import { AiAgentDocumentModel } from './models/AiAgentDocumentModel';
+import { AiAgentModel } from './models/AiAgentModel';
+import { AiAgentReviewClassifierModel } from './models/AiAgentReviewClassifierModel';
+import { AiAgentReviewNotificationModel } from './models/AiAgentReviewNotificationModel';
+import { AiDeepResearchRunModel } from './models/AiDeepResearchRunModel';
+import { AiOrganizationSettingsModel } from './models/AiOrganizationSettingsModel';
+import { AiRouterModel } from './models/AiRouterModel';
+import { AiWritebackRunModel } from './models/AiWritebackRunModel';
+import { AiWritebackThreadModel } from './models/AiWritebackThreadModel';
+import { CommercialFeatureFlagModel } from './models/CommercialFeatureFlagModel';
+import { CommercialSlackAuthenticationModel } from './models/CommercialSlackAuthenticationModel';
+import { DashboardSummaryModel } from './models/DashboardSummaryModel';
+import { EmbedModel } from './models/EmbedModel';
+import { ExternalConnectionModel } from './models/ExternalConnectionModel';
+import { ManagedAgentModel } from './models/ManagedAgentModel';
+import { McpToolCallModel } from './models/McpToolCallModel';
+import { ProjectCiStatusModel } from './models/ProjectCiStatusModel';
+import { ProjectContextModel } from './models/ProjectContextModel';
+import { ProjectHomepageModel } from './models/ProjectHomepageModel';
+import { SandboxRegistryModel } from './models/SandboxRegistryModel';
+import { SchedulerAiAugmentationModel } from './models/SchedulerAiAugmentationModel';
+import { ServiceAccountModel } from './models/ServiceAccountModel';
+import { createLightdashPgWireHandlers } from './postgresWire/lightdashHandlers';
+import { PostgresWireServer } from './postgresWire/PostgresWireServer';
+import { enhanceExploresForPreAggregates } from './preAggregates/enhanceExploresForPreAggregates';
+import { preAggregatePostProcessor } from './preAggregates/postProcessor';
+import { CommercialSchedulerClient } from './scheduler/SchedulerClient';
+import { CommercialSchedulerWorker } from './scheduler/SchedulerWorker';
+import { OrgAiCopilotConfigResolver } from './services/ai/OrgAiCopilotConfigResolver';
+import { BuiltInSkills } from './services/ai/skills/builtInSkills';
+import { AiAgentContentValidation } from './services/ai/utils/AiAgentContentValidation';
+import { AiAgentAdminService } from './services/AiAgentAdminService';
+import { AiAgentCoderService } from './services/AiAgentCoderService/AiAgentCoderService';
+import { AiAgentDocumentService } from './services/AiAgentDocumentService';
+import { AiAgentReviewClassifierService } from './services/AiAgentReviewClassifierService';
+import { AiAgentReviewNotificationService } from './services/AiAgentReviewNotificationService';
+import { AiAgentService } from './services/AiAgentService/AiAgentService';
+import { AiAgentToolsService } from './services/AiAgentToolsService/AiAgentToolsService';
+import { AiDeepResearchExecutor } from './services/AiDeepResearchService/AiDeepResearchExecutor';
+import { AiDeepResearchService } from './services/AiDeepResearchService/AiDeepResearchService';
+import { AiOrganizationSettingsService } from './services/AiOrganizationSettingsService';
+import { AiRouterService } from './services/AiRouterService/AiRouterService';
+import { AiService } from './services/AiService/AiService';
+import { AiWritebackService } from './services/AiWritebackService/AiWritebackService';
+import { WritebackPreviewService } from './services/AiWritebackService/WritebackPreviewService';
+import { AppGenerateService } from './services/AppGenerateService/AppGenerateService';
+import { PreAggregateStrategy } from './services/AsyncQueryService/PreAggregateStrategy';
+import { PreAggregationDuckDbClient } from './services/AsyncQueryService/PreAggregationDuckDbClient';
+import { CommercialCacheService } from './services/CommercialCacheService';
+import { CommercialSlackIntegrationService } from './services/CommercialSlackIntegrationService';
+import { EmbedService } from './services/EmbedService/EmbedService';
+import { ExternalConnectionService } from './services/ExternalConnectionService/ExternalConnectionService';
+import { GoogleServiceAccountTokenProvider } from './services/ExternalConnectionService/GoogleServiceAccountTokenProvider';
+import { ManagedAgentService } from './services/ManagedAgentService/ManagedAgentService';
+import { McpService } from './services/McpService/McpService';
+import { OnboardingAgentService } from './services/OnboardingAgentService/OnboardingAgentService';
+import { OrganizationWarehouseCredentialsService } from './services/OrganizationWarehouseCredentialsService';
+import { PreviewDeploySetupService } from './services/PreviewDeploySetupService/PreviewDeploySetupService';
+import { ProjectContextService } from './services/ProjectContextService/ProjectContextService';
+import { ProjectHomepageService } from './services/ProjectHomepageService';
+import { provisionOnboardingHomepage } from './services/ProjectService/provisionOnboardingHomepage';
+import { provisionPlaygroundProject } from './services/ProjectService/provisionPlaygroundProject';
+import { SchedulerAiAugmentationService } from './services/SchedulerAiAugmentationService/SchedulerAiAugmentationService';
+import { ScimService } from './services/ScimService/ScimService';
+import { ServiceAccountService } from './services/ServiceAccountService/ServiceAccountService';
+import { CommercialSlackService } from './services/SlackService/SlackService';
+import { SupportService } from './services/SupportService/SupportService';
+
+type EnterpriseAppArguments = Pick<
+    AppArguments,
+    | 'schedulerWorkerFactory'
+    | 'clientProviders'
+    | 'serviceProviders'
+    | 'modelProviders'
+    | 'customExpressMiddlewares'
+    | 'pgWireServerFactory'
+>;
+
+// Shared instance so the per-key model list cache is shared across resolvers
+const aiModelCatalog = new AiModelCatalog();
+
+export async function getEnterpriseAppArguments(): Promise<EnterpriseAppArguments> {
+    if (!lightdashConfig.license.licenseKey) {
+        return {};
+    }
+
+    const licenseClient = new LicenseClient({});
+
+    const license = await licenseClient.get(lightdashConfig.license.licenseKey);
+    if (license.isValid) {
+        Logger.info(
+            `Enterprise license for ${lightdashConfig.siteUrl} is valid.`,
+        );
+    } else {
+        throw new ForbiddenError(
+            `Enterprise license for ${lightdashConfig.siteUrl} ${license.detail} [${license.code}]`,
+        );
+    }
+
+    // Register EE-specific NATS streams
+    registerPreAggregateStream();
+
+    return {
+        serviceProviders: {
+            projectHomepageService: ({
+                models,
+                repository,
+                clients,
+                context,
+            }) =>
+                new ProjectHomepageService({
+                    projectHomepageModel:
+                        models.getProjectHomepageModel<ProjectHomepageModel>(),
+                    featureFlagService: repository.getFeatureFlagService(),
+                    groupsModel: models.getGroupsModel(),
+                    projectModel: models.getProjectModel(),
+                    fileStorageClient: clients.getFileStorageClient(),
+                    persistentDownloadFileService:
+                        repository.getPersistentDownloadFileService(),
+                    slackClient: clients.getSlackClient(),
+                    slackAuthenticationModel:
+                        models.getSlackAuthenticationModel(),
+                    lightdashConfig: context.lightdashConfig,
+                }),
+            aiDeepResearchService: ({
+                models,
+                clients,
+                context,
+                repository,
+            }) => {
+                const aiDeepResearchRunModel =
+                    models.getAiDeepResearchRunModel<AiDeepResearchRunModel>();
+                const executor = new AiDeepResearchExecutor({
+                    lightdashConfig: context.lightdashConfig,
+                    aiAgentModel: models.getAiAgentModel<AiAgentModel>(),
+                    aiDeepResearchClient: new AiDeepResearchClient({
+                        lightdashConfig: context.lightdashConfig,
+                    }),
+                    aiDeepResearchRunModel,
+                    personalAccessTokenService:
+                        repository.getPersonalAccessTokenService(),
+                    userService: repository.getUserService(),
+                });
+
+                return new AiDeepResearchService({
+                    aiDeepResearchRunModel,
+                    aiAgentModel: models.getAiAgentModel<AiAgentModel>(),
+                    projectModel: models.getProjectModel(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                    schedulerClient:
+                        clients.getSchedulerClient() as CommercialSchedulerClient,
+                    asyncQueryService: repository.getAsyncQueryService(),
+                    queryHistoryModel: models.getQueryHistoryModel(),
+                    resultsFileStorageClient:
+                        clients.getResultsFileStorageClient(),
+                    executor: executor.execute,
+                });
+            },
+            projectContextService: ({ models }) =>
+                new ProjectContextService({
+                    projectModel: models.getProjectModel(),
+                    githubAppInstallationsModel:
+                        models.getGithubAppInstallationsModel(),
+                    projectContextModel:
+                        models.getProjectContextModel<ProjectContextModel>(),
+                }),
+            aiWritebackService: ({
+                context,
+                models,
+                repository,
+                prometheusMetrics,
+                clients,
+            }) =>
+                new AiWritebackService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    projectModel: models.getProjectModel(),
+                    projectDbtSourcesModel: models.getProjectDbtSourcesModel(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                    githubAppInstallationsModel:
+                        models.getGithubAppInstallationsModel(),
+                    githubAppService: repository.getGithubAppService(),
+                    gitlabAppInstallationsModel:
+                        models.getGitlabAppInstallationsModel(),
+                    aiWritebackThreadModel:
+                        models.getAiWritebackThreadModel<AiWritebackThreadModel>(),
+                    aiWritebackRunModel:
+                        models.getAiWritebackRunModel<AiWritebackRunModel>(),
+                    sandboxRegistryModel:
+                        models.getSandboxRegistryModel<SandboxRegistryModel>(),
+                    pullRequestsModel: models.getPullRequestsModel(),
+                    prometheusMetrics,
+                    ciService: repository.getCiService(),
+                    projectService: repository.getProjectService(),
+                    userModel: models.getUserModel(),
+                    schedulerClient:
+                        clients.getSchedulerClient() as CommercialSchedulerClient,
+                }),
+            onboardingAgentService: ({
+                context,
+                models,
+                repository,
+                clients,
+            }) =>
+                new OnboardingAgentService({
+                    lightdashConfig: context.lightdashConfig,
+                    agentOnboardingRunModel:
+                        models.getAgentOnboardingRunModel<AgentOnboardingRunModel>(),
+                    sandboxRegistryModel:
+                        models.getSandboxRegistryModel<SandboxRegistryModel>(),
+                    projectModel: models.getProjectModel(),
+                    personalAccessTokenService:
+                        repository.getPersonalAccessTokenService(),
+                    promptService: repository.getPromptService(),
+                    userService: repository.getUserService(),
+                    schedulerClient:
+                        clients.getSchedulerClient() as CommercialSchedulerClient,
+                }),
+            previewDeploySetupService: ({ context, models }) =>
+                new PreviewDeploySetupService({
+                    lightdashConfig: context.lightdashConfig,
+                    projectModel: models.getProjectModel(),
+                    githubAppInstallationsModel:
+                        models.getGithubAppInstallationsModel(),
+                    pullRequestsModel: models.getPullRequestsModel(),
+                    projectCiStatusModel:
+                        models.getProjectCiStatusModel<ProjectCiStatusModel>(),
+                    githubClient: {
+                        createBranch,
+                        createPullRequest,
+                        createSignedCommitOnBranch,
+                        getBranchHeadSha,
+                        getRepoDefaultBranch,
+                        getRepoWorkflowFiles,
+                    },
+                }),
+            writebackPreviewService: ({ context, models, repository }) =>
+                new WritebackPreviewService({
+                    lightdashConfig: context.lightdashConfig,
+                    projectModel: models.getProjectModel(),
+                    projectService: repository.getProjectService(),
+                    githubAppInstallationsModel:
+                        models.getGithubAppInstallationsModel(),
+                    githubClient: {
+                        createPullRequestComment,
+                        getInstallationToken,
+                        getPullRequest,
+                    },
+                }),
+            appGenerateService: ({ context, models, clients, repository }) =>
+                new AppGenerateService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    analyticsModel: models.getAnalyticsModel(),
+                    catalogModel: models.getCatalogModel(),
+                    appModel: models.getAppModel(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                    organizationDesignModel:
+                        models.getOrganizationDesignModel(),
+                    pinnedListModel: models.getPinnedListModel(),
+                    projectModel: models.getProjectModel(),
+                    projectParametersModel: models.getProjectParametersModel(),
+                    spaceModel: models.getSpaceModel(),
+                    schedulerClient:
+                        clients.getSchedulerClient() as CommercialSchedulerClient,
+                    savedChartService: repository.getSavedChartService(),
+                    spacePermissionService:
+                        repository.getSpacePermissionService(),
+                    dashboardService: repository.getDashboardService(),
+                    projectService: repository.getProjectService(),
+                    promoteService: repository.getPromoteService(),
+                    externalConnectionModel:
+                        models.getExternalConnectionModel(),
+                    sandboxRegistryModel:
+                        models.getSandboxRegistryModel<SandboxRegistryModel>(),
+                    orgAiCopilotConfigResolver: new OrgAiCopilotConfigResolver({
+                        lightdashConfig: context.lightdashConfig,
+                        aiOrganizationSettingsModel:
+                            models.getAiOrganizationSettingsModel(),
+                        featureFlagService: repository.getFeatureFlagService(),
+                        aiModelCatalog,
+                    }),
+                }),
+            embedService: ({ repository, context, models }) =>
+                new EmbedService({
+                    analytics: context.lightdashAnalytics,
+                    lightdashConfig: context.lightdashConfig,
+                    encryptionUtil: new EncryptionUtil({
+                        lightdashConfig: context.lightdashConfig,
+                    }),
+                    projectService: repository.getProjectService(),
+                    spacePermissionService:
+                        repository.getSpacePermissionService(),
+                    asyncQueryService: repository.getAsyncQueryService(),
+                    permissionsService: repository.getPermissionsService(),
+                    dashboardModel: models.getDashboardModel(),
+                    embedModel: models.getEmbedModel(),
+                    projectModel: models.getProjectModel(),
+                    savedChartModel: models.getSavedChartModel(),
+                    savedSqlModel: models.getSavedSqlModel(),
+                    userAttributesModel: models.getUserAttributesModel(),
+                    userModel: models.getUserModel(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                    organizationModel: models.getOrganizationModel(),
+                }),
+            aiService: ({ repository, context, models }) =>
+                new AiService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    dashboardModel: models.getDashboardModel(),
+                    dashboardSummaryModel: models.getDashboardSummaryModel(),
+                    savedChartModel: models.getSavedChartModel(),
+                    projectService: repository.getProjectService(),
+                    asyncQueryService: repository.getAsyncQueryService(),
+                    featureFlagService: repository.getFeatureFlagService(),
+                    openAi: new OpenAi(
+                        context.lightdashConfig.ai.copilot.providers.openai,
+                    ), // TODO This should go in client repository as soon as it is available
+                    orgAiCopilotConfigResolver: new OrgAiCopilotConfigResolver({
+                        lightdashConfig: context.lightdashConfig,
+                        aiOrganizationSettingsModel:
+                            models.getAiOrganizationSettingsModel(),
+                        featureFlagService: repository.getFeatureFlagService(),
+                        aiModelCatalog,
+                    }),
+                }),
+            aiAgentCoderService: ({ models, context }) =>
+                new AiAgentCoderService({
+                    lightdashConfig: context.lightdashConfig,
+                    aiAgentModel: models.getAiAgentModel(),
+                    projectModel: models.getProjectModel(),
+                }),
+            aiAgentToolsService: ({ models, repository, context }) =>
+                new AiAgentToolsService({
+                    builtInSkills: BuiltInSkills,
+                    lightdashConfig: context.lightdashConfig,
+                    projectModel: models.getProjectModel(),
+                    projectService: repository.getProjectService(),
+                    jobModel: models.getJobModel(),
+                    userAttributesModel: models.getUserAttributesModel(),
+                    asyncQueryService: repository.getAsyncQueryService(),
+                    catalogService: repository.getCatalogService(),
+                    contentVerificationModel:
+                        models.getContentVerificationModel(),
+                    searchModel: models.getSearchModel(),
+                    searchService: repository.getSearchService(),
+                    spaceService: repository.getSpaceService(),
+                    spaceModel: models.getSpaceModel(),
+                    dashboardService: repository.getDashboardService(),
+                    dashboardModel: models.getDashboardModel(),
+                    savedChartService: repository.getSavedChartService(),
+                    savedChartModel: models.getSavedChartModel(),
+                    coderService: repository.getCoderService(),
+                    contentService: repository.getContentService(),
+                    aiAgentContentValidation: new AiAgentContentValidation(),
+                    projectContextModel:
+                        models.getProjectContextModel<ProjectContextModel>(),
+                    aiAgentDocumentModel:
+                        models.getAiAgentDocumentModel<AiAgentDocumentModel>(),
+                    featureFlagService: repository.getFeatureFlagService(),
+                    previewDeploySetupService:
+                        repository.getPreviewDeploySetupService<PreviewDeploySetupService>(),
+                    shareService: repository.getShareService(),
+                    userService: repository.getUserService(),
+                    getSchedulerAiAugmentationService: () =>
+                        repository.getSchedulerAiAugmentationService<SchedulerAiAugmentationService>(),
+                }),
+            aiAgentService: ({
+                models,
+                repository,
+                clients,
+                context,
+                prometheusMetrics,
+            }) =>
+                new AiAgentService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    userModel: models.getUserModel(),
+                    aiAgentModel: models.getAiAgentModel(),
+                    aiAgentDocumentModel:
+                        models.getAiAgentDocumentModel<AiAgentDocumentModel>(),
+                    projectContextModel:
+                        models.getProjectContextModel<ProjectContextModel>(),
+                    catalogModel: models.getCatalogModel(),
+                    contentVerificationModel:
+                        models.getContentVerificationModel(),
+                    groupsModel: models.getGroupsModel(),
+                    rolesModel: models.getRolesModel(),
+                    featureFlagService: repository.getFeatureFlagService(),
+                    slackClient: clients.getSlackClient(),
+                    projectService: repository.getProjectService(),
+                    catalogService: repository.getCatalogService(),
+                    asyncQueryService: repository.getAsyncQueryService(),
+                    userAttributesModel: models.getUserAttributesModel(),
+                    searchModel: models.getSearchModel(),
+                    searchService: repository.getSearchService(),
+                    slackAuthenticationModel:
+                        models.getSlackAuthenticationModel() as CommercialSlackAuthenticationModel,
+                    schedulerClient:
+                        clients.getSchedulerClient() as CommercialSchedulerClient,
+                    openIdIdentityModel: models.getOpenIdIdentityModel(),
+                    spaceService: repository.getSpaceService(),
+                    spaceModel: models.getSpaceModel(),
+                    projectModel: models.getProjectModel(),
+                    coderService: repository.getCoderService(),
+                    dashboardService: repository.getDashboardService(),
+                    savedChartService: repository.getSavedChartService(),
+                    contentService: repository.getContentService(),
+                    aiOrganizationSettingsService:
+                        repository.getAiOrganizationSettingsService(),
+                    orgAiCopilotConfigResolver: new OrgAiCopilotConfigResolver({
+                        lightdashConfig: context.lightdashConfig,
+                        aiOrganizationSettingsModel:
+                            models.getAiOrganizationSettingsModel(),
+                        featureFlagService: repository.getFeatureFlagService(),
+                        aiModelCatalog,
+                    }),
+                    shareService: repository.getShareService(),
+                    fileStorageClient: clients.getFileStorageClient(),
+                    downloadFileModel: models.getDownloadFileModel(),
+                    slackUnfurlImageModel: models.getSlackUnfurlImageModel(),
+                    persistentDownloadFileService:
+                        repository.getPersistentDownloadFileService(),
+                    aiAgentContentValidation: new AiAgentContentValidation(),
+                    aiWritebackService:
+                        repository.getAiWritebackService<AiWritebackService>(),
+                    projectContextService:
+                        repository.getProjectContextService<ProjectContextService>(),
+                    writebackPreviewService:
+                        repository.getWritebackPreviewService<WritebackPreviewService>(),
+                    previewDeploySetupService:
+                        repository.getPreviewDeploySetupService<PreviewDeploySetupService>(),
+                    githubAppInstallationsModel:
+                        models.getGithubAppInstallationsModel(),
+                    githubAppService: repository.getGithubAppService(),
+                    aiAgentToolsService:
+                        repository.getAiAgentToolsService<AiAgentToolsService>(),
+                    pullRequestsModel: models.getPullRequestsModel(),
+                    aiAgentReviewClassifierModel:
+                        models.getAiAgentReviewClassifierModel<AiAgentReviewClassifierModel>(),
+                    aiAgentReviewNotificationModel:
+                        models.getAiAgentReviewNotificationModel<AiAgentReviewNotificationModel>(),
+                    prometheusMetrics,
+                }),
+            aiAgentAdminService: ({ models, repository, context, clients }) =>
+                new AiAgentAdminService({
+                    analytics: context.lightdashAnalytics,
+                    aiAgentModel: models.getAiAgentModel(),
+                    aiAgentReviewClassifierModel:
+                        models.getAiAgentReviewClassifierModel<AiAgentReviewClassifierModel>(),
+                    aiAgentReviewClassifierService:
+                        repository.getAiAgentReviewClassifierService<AiAgentReviewClassifierService>(),
+                    aiAgentReviewNotificationModel:
+                        models.getAiAgentReviewNotificationModel<AiAgentReviewNotificationModel>(),
+                    aiAgentReviewNotificationService:
+                        repository.getAiAgentReviewNotificationService<AiAgentReviewNotificationService>(),
+                    aiAgentService:
+                        repository.getAiAgentService<AiAgentService>(),
+                    featureFlagService: repository.getFeatureFlagService(),
+                    aiOrganizationSettingsService:
+                        repository.getAiOrganizationSettingsService(),
+                    mcpToolCallModel:
+                        models.getMcpToolCallModel<McpToolCallModel>(),
+                    projectModel: models.getProjectModel(),
+                    projectService: repository.getProjectService(),
+                    projectContextService:
+                        repository.getProjectContextService<ProjectContextService>(),
+                    pullRequestsModel: models.getPullRequestsModel(),
+                    githubAppInstallationsModel:
+                        models.getGithubAppInstallationsModel(),
+                    gitlabAppInstallationsModel:
+                        models.getGitlabAppInstallationsModel(),
+                    schedulerClient:
+                        clients.getSchedulerClient() as CommercialSchedulerClient,
+                    userModel: models.getUserModel(),
+                    lightdashConfig: context.lightdashConfig,
+                    writebackPreviewService:
+                        repository.getWritebackPreviewService<WritebackPreviewService>(),
+                    jobModel: models.getJobModel(),
+                }),
+            aiAgentReviewNotificationService: ({ models, clients }) =>
+                new AiAgentReviewNotificationService({
+                    notificationsModel: models.getNotificationsModel(),
+                    schedulerClient:
+                        clients.getSchedulerClient() as CommercialSchedulerClient,
+                    aiAgentReviewClassifierModel:
+                        models.getAiAgentReviewClassifierModel<AiAgentReviewClassifierModel>(),
+                    organizationMemberProfileModel:
+                        models.getOrganizationMemberProfileModel(),
+                }),
+            aiRouterService: ({ models, repository, context }) =>
+                new AiRouterService({
+                    analytics: context.lightdashAnalytics,
+                    lightdashConfig: context.lightdashConfig,
+                    aiRouterModel: models.getAiRouterModel<AiRouterModel>(),
+                    aiAgentService:
+                        repository.getAiAgentService<AiAgentService>(),
+                    orgAiCopilotConfigResolver: new OrgAiCopilotConfigResolver({
+                        lightdashConfig: context.lightdashConfig,
+                        aiOrganizationSettingsModel:
+                            models.getAiOrganizationSettingsModel(),
+                        featureFlagService: repository.getFeatureFlagService(),
+                        aiModelCatalog,
+                    }),
+                }),
+            aiAgentDocumentService: ({ models, repository, context }) =>
+                new AiAgentDocumentService({
+                    analytics: context.lightdashAnalytics,
+                    aiAgentDocumentModel:
+                        models.getAiAgentDocumentModel<AiAgentDocumentModel>(),
+                    aiAgentService:
+                        repository.getAiAgentService<AiAgentService>(),
+                    lightdashConfig: context.lightdashConfig,
+                    orgAiCopilotConfigResolver: new OrgAiCopilotConfigResolver({
+                        lightdashConfig: context.lightdashConfig,
+                        aiOrganizationSettingsModel:
+                            models.getAiOrganizationSettingsModel(),
+                        featureFlagService: repository.getFeatureFlagService(),
+                        aiModelCatalog,
+                    }),
+                }),
+            aiAgentReviewClassifierService: ({ models, repository, context }) =>
+                new AiAgentReviewClassifierService({
+                    aiAgentReviewClassifierModel:
+                        models.getAiAgentReviewClassifierModel<AiAgentReviewClassifierModel>(),
+                    aiAgentModel: models.getAiAgentModel<AiAgentModel>(),
+                    aiAgentDocumentModel:
+                        models.getAiAgentDocumentModel<AiAgentDocumentModel>(),
+                    aiOrganizationSettingsModel:
+                        models.getAiOrganizationSettingsModel(),
+                    orgAiCopilotConfigResolver: new OrgAiCopilotConfigResolver({
+                        lightdashConfig: context.lightdashConfig,
+                        aiOrganizationSettingsModel:
+                            models.getAiOrganizationSettingsModel(),
+                        featureFlagService: repository.getFeatureFlagService(),
+                        aiModelCatalog,
+                    }),
+                    catalogModel: models.getCatalogModel(),
+                    projectModel: models.getProjectModel(),
+                    lightdashConfig: context.lightdashConfig,
+                    aiAgentReviewNotificationService:
+                        repository.getAiAgentReviewNotificationService<AiAgentReviewNotificationService>(),
+                }),
+            aiOrganizationSettingsService: ({ models, context, repository }) =>
+                new AiOrganizationSettingsService({
+                    aiOrganizationSettingsModel:
+                        models.getAiOrganizationSettingsModel(),
+                    organizationModel: models.getOrganizationModel(),
+                    commercialFeatureFlagModel:
+                        models.getFeatureFlagModel() as CommercialFeatureFlagModel,
+                    lightdashConfig: context.lightdashConfig,
+                    orgAiCopilotConfigResolver: new OrgAiCopilotConfigResolver({
+                        lightdashConfig: context.lightdashConfig,
+                        aiOrganizationSettingsModel:
+                            models.getAiOrganizationSettingsModel(),
+                        featureFlagService: repository.getFeatureFlagService(),
+                        aiModelCatalog,
+                    }),
+                }),
+            schedulerAiAugmentationService: ({ models, repository }) =>
+                new SchedulerAiAugmentationService({
+                    schedulerAiAugmentationModel:
+                        models.getSchedulerAiAugmentationModel<SchedulerAiAugmentationModel>(),
+                    schedulerService: repository.getSchedulerService(),
+                    userModel: models.getUserModel(),
+                    dashboardModel: models.getDashboardModel(),
+                    asyncQueryService: repository.getAsyncQueryService(),
+                    aiAgentService:
+                        repository.getAiAgentService<AiAgentService>(),
+                    aiService: repository.getAiService<AiService>(),
+                }),
+            scimService: ({ models, context }) =>
+                new ScimService({
+                    lightdashConfig: context.lightdashConfig,
+                    organizationMemberProfileModel:
+                        models.getOrganizationMemberProfileModel(),
+                    userModel: models.getUserModel(),
+                    emailModel: models.getEmailModel(),
+                    analytics: context.lightdashAnalytics,
+                    groupsModel: models.getGroupsModel(),
+                    serviceAccountModel: models.getServiceAccountModel(),
+                    commercialFeatureFlagModel:
+                        models.getFeatureFlagModel() as CommercialFeatureFlagModel,
+                    rolesModel: models.getRolesModel(),
+                    projectModel: models.getProjectModel(),
+                    openIdIdentityModel: models.getOpenIdIdentityModel(),
+                }),
+            serviceAccountService: ({ models, context }) =>
+                new ServiceAccountService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    serviceAccountModel: models.getServiceAccountModel(),
+                    commercialFeatureFlagModel:
+                        models.getFeatureFlagModel() as CommercialFeatureFlagModel,
+                    projectModel: models.getProjectModel(),
+                }),
+            externalConnectionService: ({ models, context, repository }) =>
+                new ExternalConnectionService({
+                    analytics: context.lightdashAnalytics,
+                    externalConnectionModel:
+                        models.getExternalConnectionModel(),
+                    appModel: models.getAppModel(),
+                    spacePermissionService:
+                        repository.getSpacePermissionService(),
+                    googleTokenProvider:
+                        new GoogleServiceAccountTokenProvider(),
+                }),
+            slackIntegrationService: ({ models, context, clients }) =>
+                new CommercialSlackIntegrationService({
+                    slackAuthenticationModel:
+                        models.getSlackAuthenticationModel() as CommercialSlackAuthenticationModel,
+                    analytics: context.lightdashAnalytics,
+                    slackClient: clients.getSlackClient(),
+                    aiAgentModel: models.getAiAgentModel(),
+                }),
+            supportService: ({ models, context, repository, clients }) =>
+                new SupportService({
+                    analytics: context.lightdashAnalytics,
+                    projectModel: models.getProjectModel(),
+                    savedChartModel: models.getSavedChartModel(),
+                    dashboardModel: models.getDashboardModel(),
+                    spaceModel: models.getSpaceModel(),
+                    fileStorageClient: clients.getFileStorageClient(),
+                    organizationModel: models.getOrganizationModel(),
+                    unfurlService: repository.getUnfurlService(),
+                    projectService: repository.getProjectService(),
+                    lightdashConfig: context.lightdashConfig,
+                }),
+            organizationWarehouseCredentialsService: ({ models, context }) =>
+                new OrganizationWarehouseCredentialsService({
+                    analytics: context.lightdashAnalytics,
+                    organizationWarehouseCredentialsModel:
+                        models.getOrganizationWarehouseCredentialsModel(),
+                    userOAuthGrantsModel: models.getUserOAuthGrantsModel(),
+                }),
+            projectService: ({ models, context, clients, utils, repository }) =>
+                new ProjectService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    projectModel: models.getProjectModel(),
+                    projectDbtSourcesModel: models.getProjectDbtSourcesModel(),
+                    preAggregateModel: models.getPreAggregateModel(),
+                    onboardingModel: models.getOnboardingModel(),
+                    savedChartModel: models.getSavedChartModel(),
+                    jobModel: models.getJobModel(),
+                    emailClient: clients.getEmailClient(),
+                    spaceModel: models.getSpaceModel(),
+                    sshKeyPairModel: models.getSshKeyPairModel(),
+                    userAttributesModel: models.getUserAttributesModel(),
+                    s3CacheClient: clients.getS3CacheClient(),
+                    analyticsModel: models.getAnalyticsModel(),
+                    dashboardModel: models.getDashboardModel(),
+                    userWarehouseCredentialsModel:
+                        models.getUserWarehouseCredentialsModel(),
+                    warehouseAvailableTablesModel:
+                        models.getWarehouseAvailableTablesModel(),
+                    emailModel: models.getEmailModel(),
+                    schedulerClient: clients.getSchedulerClient(),
+                    natsClient: clients.getNatsClient(),
+                    downloadFileModel: models.getDownloadFileModel(),
+                    fileStorageClient: clients.getFileStorageClient(),
+                    groupsModel: models.getGroupsModel(),
+                    tagsModel: models.getTagsModel(),
+                    catalogModel: models.getCatalogModel(),
+                    contentModel: models.getContentModel(),
+                    encryptionUtil: utils.getEncryptionUtil(),
+                    userModel: models.getUserModel(),
+                    userOAuthGrantsModel: models.getUserOAuthGrantsModel(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                    projectParametersModel: models.getProjectParametersModel(),
+                    organizationWarehouseCredentialsModel:
+                        models.getOrganizationWarehouseCredentialsModel(),
+                    organizationModel: models.getOrganizationModel(),
+                    projectCompileLogModel: models.getProjectCompileLogModel(),
+                    adminNotificationService:
+                        repository.getAdminNotificationService(),
+                    spacePermissionService:
+                        repository.getSpacePermissionService(),
+                    contentVerificationModel:
+                        models.getContentVerificationModel(),
+                    organizationSettingsModel:
+                        models.getOrganizationSettingsModel(),
+                    githubAppInstallationsModel:
+                        models.getGithubAppInstallationsModel(),
+                    projectContextModel:
+                        models.getProjectContextModel<ProjectContextModel>(),
+                    isProjectContextEnabled: async ({ organizationUuid }) =>
+                        repository
+                            .getAiOrganizationSettingsService<AiOrganizationSettingsService>()
+                            .isAiAgentReviewsEnabled({
+                                organizationUuid,
+                            }),
+                    // Lazy accessor (not the instance) to duplicate the
+                    // upstream project's data apps when a preview is created.
+                    // AppGenerateService depends on ProjectService, so resolving
+                    // it eagerly here would cycle. The EE projectService
+                    // provider overrides the core one, so the thunk must be
+                    // wired here too — otherwise preview app duplication is a
+                    // silent no-op in EE builds.
+                    getAppGenerateService: () =>
+                        repository.getAppGenerateService<AppGenerateService>(),
+                    getAiAgentService: () =>
+                        repository.getAiAgentService<AiAgentService>(),
+                    onProjectCreated: ({ user, projectUuid, projectType }) =>
+                        provisionOnboardingHomepage({
+                            user,
+                            projectUuid,
+                            projectType,
+                            featureFlagService:
+                                repository.getFeatureFlagService(),
+                            projectModel: models.getProjectModel(),
+                            projectHomepageModel:
+                                models.getProjectHomepageModel<ProjectHomepageModel>(),
+                            analytics: context.lightdashAnalytics,
+                        }),
+                    provisionPlaygroundProject: ({
+                        user,
+                        projectService,
+                        canViewProject,
+                    }) =>
+                        provisionPlaygroundProject({
+                            user,
+                            projectService,
+                            canViewProject,
+                            featureFlagService:
+                                repository.getFeatureFlagService(),
+                            projectModel: models.getProjectModel(),
+                            onboardingModel: models.getOnboardingModel(),
+                            catalogService: repository.getCatalogService(),
+                            analytics: context.lightdashAnalytics,
+                        }),
+                }),
+            instanceConfigurationService: ({
+                models,
+                context,
+                repository,
+                utils,
+            }) =>
+                new InstanceConfigurationService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    organizationModel: models.getOrganizationModel(),
+                    projectModel: models.getProjectModel(),
+                    userModel: models.getUserModel(),
+                    organizationAllowedEmailDomainsModel:
+                        models.getOrganizationAllowedEmailDomainsModel(),
+                    personalAccessTokenModel:
+                        models.getPersonalAccessTokenModel(),
+                    emailModel: models.getEmailModel(),
+                    projectService: repository.getProjectService(),
+                    serviceAccountModel: models.getServiceAccountModel(),
+                    embedModel: models.getEmbedModel(),
+                    encryptionUtil: utils.getEncryptionUtil(),
+                    userAttributesModel: models.getUserAttributesModel(),
+                    groupsModel: models.getGroupsModel(),
+                    rolesModel: models.getRolesModel(),
+                }),
+            asyncQueryService: ({
+                models,
+                context,
+                clients,
+                utils,
+                repository,
+                prometheusMetrics,
+            }) =>
+                new AsyncQueryService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    projectModel: models.getProjectModel(),
+                    projectDbtSourcesModel: models.getProjectDbtSourcesModel(),
+                    preAggregateModel: models.getPreAggregateModel(),
+                    onboardingModel: models.getOnboardingModel(),
+                    savedChartModel: models.getSavedChartModel(),
+                    jobModel: models.getJobModel(),
+                    emailClient: clients.getEmailClient(),
+                    spaceModel: models.getSpaceModel(),
+                    sshKeyPairModel: models.getSshKeyPairModel(),
+                    userAttributesModel: models.getUserAttributesModel(),
+                    s3CacheClient: clients.getS3CacheClient(),
+                    analyticsModel: models.getAnalyticsModel(),
+                    dashboardModel: models.getDashboardModel(),
+                    userWarehouseCredentialsModel:
+                        models.getUserWarehouseCredentialsModel(),
+                    warehouseAvailableTablesModel:
+                        models.getWarehouseAvailableTablesModel(),
+                    emailModel: models.getEmailModel(),
+                    schedulerClient: clients.getSchedulerClient(),
+                    natsClient: clients.getNatsClient(),
+                    downloadFileModel: models.getDownloadFileModel(),
+                    fileStorageClient: clients.getFileStorageClient(),
+                    groupsModel: models.getGroupsModel(),
+                    tagsModel: models.getTagsModel(),
+                    catalogModel: models.getCatalogModel(),
+                    contentModel: models.getContentModel(),
+                    encryptionUtil: utils.getEncryptionUtil(),
+                    userModel: models.getUserModel(),
+                    userOAuthGrantsModel: models.getUserOAuthGrantsModel(),
+                    queryHistoryModel: models.getQueryHistoryModel(),
+                    downloadAuditModel: models.getDownloadAuditModel(),
+                    cacheService: repository.getCacheService(),
+                    savedSqlModel: models.getSavedSqlModel(),
+                    resultsStorageClient: clients.getResultsFileStorageClient(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                    projectParametersModel: models.getProjectParametersModel(),
+                    organizationWarehouseCredentialsModel:
+                        models.getOrganizationWarehouseCredentialsModel(),
+                    organizationModel: models.getOrganizationModel(),
+                    pivotTableService: repository.getPivotTableService(),
+                    prometheusMetrics,
+                    permissionsService: repository.getPermissionsService(),
+                    persistentDownloadFileService:
+                        repository.getPersistentDownloadFileService(),
+                    organizationAccessService:
+                        repository.getOrganizationAccessService(),
+                    preAggregateStrategy: new PreAggregateStrategy({
+                        preAggregationDuckDbClient:
+                            new PreAggregationDuckDbClient({
+                                lightdashConfig: context.lightdashConfig,
+                                preAggregateModel:
+                                    models.getPreAggregateModel(),
+                                projectModel: models.getProjectModel(),
+                                prometheusMetrics,
+                                sharedResourceLimits: context.lightdashConfig
+                                    .preAggregates.duckdbQueryMemoryLimit
+                                    ? {
+                                          memoryLimit:
+                                              context.lightdashConfig
+                                                  .preAggregates
+                                                  .duckdbQueryMemoryLimit,
+                                      }
+                                    : undefined,
+                            }),
+                        preAggregateDailyStatsModel:
+                            models.getPreAggregateDailyStatsModel(),
+                        preAggregateResultsStorageClient:
+                            clients.getPreAggregateResultsFileStorageClient(),
+                        isEnabled: () =>
+                            context.lightdashConfig.preAggregates.enabled,
+                        dashboardModel: models.getDashboardModel(),
+                        savedChartModel: models.getSavedChartModel(),
+                        projectService: repository.getProjectService(),
+                    }),
+                    projectCompileLogModel: models.getProjectCompileLogModel(),
+                    adminNotificationService:
+                        repository.getAdminNotificationService(),
+                    spacePermissionService:
+                        repository.getSpacePermissionService(),
+                    organizationSettingsModel:
+                        models.getOrganizationSettingsModel(),
+                }),
+            cacheService: ({ models, context, clients }) =>
+                new CommercialCacheService({
+                    queryHistoryModel: models.getQueryHistoryModel(),
+                    lightdashConfig: context.lightdashConfig,
+                    storageClient: clients.getResultsFileStorageClient(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                }),
+            mcpService: ({ context, repository, models }) =>
+                new McpService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    asyncQueryService: repository.getAsyncQueryService(),
+                    catalogService: repository.getCatalogService(),
+                    contentVerificationService:
+                        repository.getContentVerificationService(),
+                    projectService: repository.getProjectService(),
+                    shareService: repository.getShareService(),
+                    userAttributesModel: models.getUserAttributesModel(),
+                    searchModel: models.getSearchModel(),
+                    spaceService: repository.getSpaceService(),
+                    mcpContextModel: models.getMcpContextModel(),
+                    mcpToolCallModel:
+                        models.getMcpToolCallModel<McpToolCallModel>(),
+                    projectModel: models.getProjectModel(),
+                    featureFlagService: repository.getFeatureFlagService(),
+                    aiOrganizationSettingsService:
+                        repository.getAiOrganizationSettingsService(),
+                    aiAgentService: repository.getAiAgentService(),
+                    aiAgentToolsService:
+                        repository.getAiAgentToolsService<AiAgentToolsService>(),
+                    aiRouterService:
+                        repository.getAiRouterService<AiRouterService>(),
+                    aiWritebackService: repository.getAiWritebackService(),
+                }),
+            slackService: ({ repository, clients }) =>
+                new CommercialSlackService({
+                    slackClient: clients.getSlackClient(),
+                    unfurlService: repository.getUnfurlService(),
+                    aiAgentService: repository.getAiAgentService(),
+                }),
+            managedAgentService: ({ context, models, clients, repository }) =>
+                new ManagedAgentService({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    managedAgentModel: models.getManagedAgentModel(),
+                    analyticsModel: models.getAnalyticsModel(),
+                    organizationModel: models.getOrganizationModel(),
+                    projectModel: models.getProjectModel(),
+                    validationModel: models.getValidationModel(),
+                    savedChartModel: models.getSavedChartModel(),
+                    dashboardModel: models.getDashboardModel(),
+                    spaceModel: models.getSpaceModel(),
+                    spacePermissionService:
+                        repository.getSpacePermissionService(),
+                    userModel: models.getUserModel(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                    serviceAccountModel: models.getServiceAccountModel(),
+                    schedulerClient: clients.getSchedulerClient(),
+                    slackClient: clients.getSlackClient(),
+                    managedAgentClient: new ManagedAgentClient({
+                        lightdashConfig: context.lightdashConfig,
+                    }),
+                }),
+            deployService: ({ models, clients, repository, context }) =>
+                new DeployService({
+                    deploySessionModel: models.getDeploySessionModel(),
+                    projectModel: models.getProjectModel(),
+                    projectService: repository.getProjectService(),
+                    schedulerClient: clients.getSchedulerClient(),
+                    exploreEnhancer: (explores) =>
+                        enhanceExploresForPreAggregates({
+                            explores,
+                            enabled:
+                                context.lightdashConfig.preAggregates.enabled,
+                        }),
+                }),
+        },
+        modelProviders: {
+            projectHomepageModel: ({ database }) =>
+                new ProjectHomepageModel({ database }),
+            aiAgentModel: ({ database, utils }) =>
+                new AiAgentModel({
+                    database,
+                    lightdashConfig,
+                    encryptionUtil: utils.getEncryptionUtil(),
+                }),
+            aiAgentDocumentModel: ({ database }) =>
+                new AiAgentDocumentModel({ database }),
+            aiWritebackThreadModel: ({ database }) =>
+                new AiWritebackThreadModel({ database }),
+            aiWritebackRunModel: ({ database }) =>
+                new AiWritebackRunModel({ database }),
+            aiDeepResearchRunModel: ({ database }) =>
+                new AiDeepResearchRunModel({ database }),
+            agentOnboardingRunModel: ({ database }) =>
+                new AgentOnboardingRunModel({ database }),
+            sandboxRegistryModel: ({ database }) =>
+                new SandboxRegistryModel({ database }),
+            projectCiStatusModel: ({ database }) =>
+                new ProjectCiStatusModel({ database }),
+            aiAgentReviewClassifierModel: ({ database }) =>
+                new AiAgentReviewClassifierModel({ database }),
+            aiAgentReviewNotificationModel: ({ database }) =>
+                new AiAgentReviewNotificationModel({ database }),
+            projectContextModel: ({ database }) =>
+                new ProjectContextModel({ database }),
+            schedulerAiAugmentationModel: ({ database }) =>
+                new SchedulerAiAugmentationModel({ database }),
+            aiRouterModel: ({ database }) => new AiRouterModel({ database }),
+            mcpToolCallModel: ({ database }) =>
+                new McpToolCallModel({ database }),
+            aiOrganizationSettingsModel: ({ database, utils }) =>
+                new AiOrganizationSettingsModel({
+                    database,
+                    encryptionUtil: utils.getEncryptionUtil(),
+                }),
+            embedModel: ({ database }) => new EmbedModel({ database }),
+            mcpContextModel: ({ database }) => new McpContextModel(database),
+            dashboardSummaryModel: ({ database }) =>
+                new DashboardSummaryModel({ database }),
+            slackAuthenticationModel: ({ database }) =>
+                new CommercialSlackAuthenticationModel({ database }),
+            serviceAccountModel: ({ database }) =>
+                new ServiceAccountModel({ database }),
+            externalConnectionModel: ({ database, utils }) =>
+                new ExternalConnectionModel({
+                    database,
+                    encryptionUtil: utils.getEncryptionUtil(),
+                }),
+            managedAgentModel: ({ database, utils }) =>
+                new ManagedAgentModel({
+                    database,
+                    encryptionUtil: utils.getEncryptionUtil(),
+                }),
+            featureFlagModel: ({ database }) =>
+                new CommercialFeatureFlagModel({ database, lightdashConfig }),
+        },
+        customExpressMiddlewares: [
+            (expressApp: Express) => {
+                expressApp.use(
+                    express.json({
+                        limit: lightdashConfig.maxPayloadSize,
+                        type: ['application/scim+json'],
+                    }),
+                );
+            },
+        ],
+        schedulerWorkerFactory: (context) =>
+            new CommercialSchedulerWorker({
+                lightdashConfig: context.lightdashConfig,
+                analytics: context.analytics,
+                slackClient: context.clients.getSlackClient(),
+                unfurlService: context.serviceRepository.getUnfurlService(),
+                csvService: context.serviceRepository.getCsvService(),
+                dashboardService:
+                    context.serviceRepository.getDashboardService(),
+                deployService: context.serviceRepository.getDeployService(),
+                projectService: context.serviceRepository.getProjectService(),
+                schedulerService:
+                    context.serviceRepository.getSchedulerService(),
+                validationService:
+                    context.serviceRepository.getValidationService(),
+                userService: context.serviceRepository.getUserService(),
+                emailClient: context.clients.getEmailClient(),
+                googleDriveClient: context.clients.getGoogleDriveClient(),
+                fileStorageClient: context.clients.getFileStorageClient(),
+                schedulerClient: context.clients.getSchedulerClient(),
+                schedulerAiAugmentation:
+                    context.serviceRepository.getSchedulerAiAugmentationService<SchedulerAiAugmentationService>(),
+                aiAgentService: context.serviceRepository.getAiAgentService(),
+                aiWritebackService:
+                    context.serviceRepository.getAiWritebackService<AiWritebackService>(),
+                aiDeepResearchService:
+                    context.serviceRepository.getAiDeepResearchService<AiDeepResearchService>(),
+                onboardingAgentService:
+                    context.serviceRepository.getOnboardingAgentService<OnboardingAgentService>(),
+                catalogService: context.serviceRepository.getCatalogService(),
+                encryptionUtil: context.utils.getEncryptionUtil(),
+                msTeamsClient: context.clients.getMsTeamsClient(),
+                googleChatClient: context.clients.getGoogleChatClient(),
+                renameService: context.serviceRepository.getRenameService(),
+                asyncQueryService:
+                    context.serviceRepository.getAsyncQueryService(),
+                embedService: context.serviceRepository.getEmbedService(),
+                featureFlagService:
+                    context.serviceRepository.getFeatureFlagService(),
+                persistentDownloadFileService:
+                    context.serviceRepository.getPersistentDownloadFileService(),
+                preAggregateModel: context.models.getPreAggregateModel(),
+                preAggregateMaterializationService:
+                    context.serviceRepository.getPreAggregateMaterializationService(),
+                organizationSettingsModel:
+                    context.models.getOrganizationSettingsModel(),
+                emailWhitelabelService:
+                    context.serviceRepository.getEmailWhitelabelService(),
+                managedAgentService:
+                    context.serviceRepository.getManagedAgentService<ManagedAgentService>(),
+                appGenerateService:
+                    context.serviceRepository.getAppGenerateService(),
+                workerHealth: context.workerHealth,
+                aiAgentReviewClassifierService:
+                    context.serviceRepository.getAiAgentReviewClassifierService(),
+                aiAgentReviewClassifierModel:
+                    context.models.getAiAgentReviewClassifierModel<AiAgentReviewClassifierModel>(),
+                aiAgentReviewNotificationModel:
+                    context.models.getAiAgentReviewNotificationModel<AiAgentReviewNotificationModel>(),
+                aiAgentReviewNotificationService:
+                    context.serviceRepository.getAiAgentReviewNotificationService<AiAgentReviewNotificationService>(),
+                aiAgentAdminService:
+                    context.serviceRepository.getAiAgentAdminService<AiAgentAdminService>(),
+                projectContextService:
+                    context.serviceRepository.getProjectContextService<ProjectContextService>(),
+                projectModel: context.models.getProjectModel(),
+                openIdIdentityModel: context.models.getOpenIdIdentityModel(),
+                mcpToolCallModel:
+                    context.models.getMcpToolCallModel<McpToolCallModel>(),
+                prometheusMetrics: context.prometheusMetrics,
+            }),
+        clientProviders: {
+            schedulerClient: ({ context, models }) =>
+                new CommercialSchedulerClient({
+                    lightdashConfig: context.lightdashConfig,
+                    analytics: context.lightdashAnalytics,
+                    schedulerModel: models.getSchedulerModel(),
+                    featureFlagModel: models.getFeatureFlagModel(),
+                }),
+            slackClient: ({ context, models, repository }) =>
+                new CommercialSlackClient({
+                    analytics: context.lightdashAnalytics,
+                    lightdashConfig: context.lightdashConfig,
+                    slackAuthenticationModel:
+                        models.getSlackAuthenticationModel() as CommercialSlackAuthenticationModel,
+                    slackChannelCacheModel: models.getSlackChannelCacheModel(),
+                    schedulerClient: repository.getSchedulerClient(),
+                }),
+        },
+        pgWireServerFactory: (serviceRepository) => {
+            // parseConfig fail-fasts when PGWIRE_PORT is set in `require` mode
+            // without cert/key, so missing paths here can only mean the
+            // explicit `disabled` opt-out (plaintext).
+            const { ssl } = lightdashConfig.pgWire;
+            const tlsOptions =
+                ssl.mode === 'require' && ssl.certPath && ssl.keyPath
+                    ? { certPath: ssl.certPath, keyPath: ssl.keyPath }
+                    : undefined;
+            return new PostgresWireServer(
+                createLightdashPgWireHandlers(serviceRepository),
+                { tls: tlsOptions },
+            );
+        },
+    };
+}

@@ -1,0 +1,670 @@
+import {
+    closestCenter,
+    DndContext,
+    KeyboardSensor,
+    PointerSensor,
+    useSensor,
+    useSensors,
+    type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+    SortableContext,
+    sortableKeyboardCoordinates,
+    useSortable,
+    verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import {
+    DEFAULT_SPOTLIGHT_TABLE_COLUMN_CONFIG,
+    SpotlightTableColumns,
+    type CatalogCategoryFilterMode,
+    type CatalogField,
+} from '@lightdash/common';
+import {
+    TextInput,
+    Box,
+    Center,
+    Divider,
+    Group,
+    Stack,
+    type GroupProps,
+    Text,
+    Button,
+    ActionIcon,
+    SegmentedControl,
+    Badge,
+    Popover,
+    Tooltip,
+} from '@mantine-8/core';
+import {
+    IconEye,
+    IconEyeOff,
+    IconGripVertical,
+    IconList,
+    IconSearch,
+    IconSitemap,
+    IconX,
+} from '@tabler/icons-react';
+import isEqual from 'lodash/isEqual';
+import { memo, useCallback, useMemo, useState, type FC } from 'react';
+import { useLocation, useNavigate } from 'react-router';
+import { useDebounce } from 'react-use';
+import {
+    getColumnHeaderLabel,
+    type ContentTableInstance,
+} from '../../../../components/common/ContentTable';
+import MantineIcon from '../../../../components/common/MantineIcon';
+import useEmbed from '../../../../ee/providers/Embed/useEmbed';
+import useTracking from '../../../../providers/Tracking/useTracking';
+import { TotalMetricsDot } from '../../../../svgs/metricsCatalog';
+import { EventName } from '../../../../types/Events';
+import { useAppDispatch, useAppSelector } from '../../../sqlRunner/store/hooks';
+import {
+    useCreateSpotlightTableConfig,
+    useResetSpotlightTableConfig,
+    useSpotlightTableConfig,
+} from '../../hooks/useSpotlightTable';
+import {
+    convertStateToTableColumnConfig,
+    convertTableColumnConfigToState,
+    setColumnConfig,
+    setColumnOrder,
+    setColumnVisibility,
+} from '../../store/metricsCatalogSlice';
+import { MetricCatalogView } from '../../types';
+import CategoriesFilter from './CategoriesFilter';
+import classes from './MetricsTableTopToolbar.module.css';
+import OwnersFilter from './OwnersFilter';
+import TableFilter from './TableFilter';
+type MetricsTableTopToolbarProps = GroupProps & {
+    search: string | undefined;
+    setSearch: (search: string) => void;
+    selectedCategories: CatalogField['categories'][number]['tagUuid'][];
+    setSelectedCategories: (
+        categories: CatalogField['categories'][number]['tagUuid'][],
+    ) => void;
+    categoryFilterMode: CatalogCategoryFilterMode;
+    setCategoryFilterMode: (mode: CatalogCategoryFilterMode) => void;
+    selectedTables: string[];
+    setSelectedTables: (tables: string[]) => void;
+    selectedOwners: string[];
+    setSelectedOwners: (owners: string[]) => void;
+    totalResults: number;
+    showCategoriesFilter?: boolean;
+    metricCatalogView: MetricCatalogView;
+    table: ContentTableInstance<CatalogField>;
+};
+
+const SortableColumn: FC<{
+    column: { name: string; uuid: string; visible: boolean; frozen: boolean };
+    onToggleVisibility: () => void;
+}> = ({ column, onToggleVisibility }) => {
+    const { attributes, listeners, setNodeRef, transform, transition } =
+        useSortable({
+            id: column.uuid,
+        });
+
+    const style = {
+        transform: CSS.Transform.toString(transform),
+        transition,
+    };
+
+    return (
+        <Group ref={setNodeRef} style={style} justify="space-between" h={28}>
+            <Group gap={4}>
+                <Tooltip
+                    disabled={!column.frozen}
+                    label={`The ${column.name} column is pinned for usability`}
+                    position="top"
+                >
+                    <Box>
+                        <ActionIcon
+                            variant="subtle"
+                            size="xs"
+                            color="ldGray.5"
+                            {...attributes}
+                            {...listeners}
+                            disabled={column.frozen}
+                        >
+                            <MantineIcon icon={IconGripVertical} />
+                        </ActionIcon>
+                    </Box>
+                </Tooltip>
+                <Text fz={13} fw={500} c="ldDark.9">
+                    {column.name}
+                </Text>
+            </Group>
+            <ActionIcon
+                variant="subtle"
+                size="xs"
+                color="ldGray.5"
+                style={{
+                    visibility: column.frozen ? 'hidden' : 'visible',
+                }}
+                onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+                    e.stopPropagation();
+                    onToggleVisibility();
+                }}
+            >
+                <MantineIcon icon={column.visible ? IconEye : IconEyeOff} />
+            </ActionIcon>
+        </Group>
+    );
+};
+
+export const MetricsTableTopToolbar: FC<MetricsTableTopToolbarProps> = memo(
+    ({
+        search: _search,
+        setSearch: _setSearch,
+        totalResults,
+        selectedCategories,
+        setSelectedCategories,
+        categoryFilterMode,
+        setCategoryFilterMode,
+        selectedTables,
+        setSelectedTables,
+        selectedOwners,
+        setSelectedOwners,
+        showCategoriesFilter,
+        metricCatalogView,
+        table,
+        ...props
+    }) => {
+        const [search, setSearch] = useState(_search);
+        const { embedToken } = useEmbed();
+
+        useDebounce(
+            () => {
+                _setSearch(search ?? '');
+            },
+            300,
+            [search],
+        );
+
+        const userUuid = useAppSelector(
+            (state) => state.metricsCatalog.user?.userUuid,
+        );
+        const organizationUuid = useAppSelector(
+            (state) => state.metricsCatalog.organizationUuid,
+        );
+        const projectUuid = useAppSelector(
+            (state) => state.metricsCatalog.projectUuid,
+        );
+        const canManageSpotlight = useAppSelector(
+            (state) => state.metricsCatalog.abilities.canManageSpotlight,
+        );
+        const columnConfig = useAppSelector(
+            (state) => state.metricsCatalog.columnConfig,
+        );
+        const dispatch = useAppDispatch();
+        const { track } = useTracking();
+        const location = useLocation();
+        const navigate = useNavigate();
+        const clearSearch = useCallback(() => setSearch(''), [setSearch]);
+        const { data: savedTableConfig } = useSpotlightTableConfig({
+            projectUuid,
+        });
+
+        const sensors = useSensors(
+            useSensor(PointerSensor),
+            useSensor(KeyboardSensor, {
+                coordinateGetter: sortableKeyboardCoordinates,
+            }),
+        );
+
+        const {
+            mutate: createSpotlightConfig,
+            isLoading: isCreatingSpotlightConfig,
+        } = useCreateSpotlightTableConfig();
+
+        const { mutate: resetSpotlightConfig } = useResetSpotlightTableConfig();
+
+        const handleDragEnd = useCallback(
+            (event: DragEndEvent) => {
+                const { active, over } = event;
+
+                if (active.id !== over?.id) {
+                    const columns = table.getAllLeafColumns();
+                    const oldIndex = columns.findIndex(
+                        (col) => col.id === active.id,
+                    );
+                    const newIndex = columns.findIndex(
+                        (col) => col.id === over?.id,
+                    );
+
+                    // Prevent reordering if trying to move around the metric column
+                    if (
+                        active.id === SpotlightTableColumns.METRIC ||
+                        over?.id === SpotlightTableColumns.METRIC
+                    ) {
+                        return;
+                    }
+
+                    // Get current column order or default to column ids if no order is set
+                    const currentOrder =
+                        table.getState().columnOrder.length > 0
+                            ? table.getState().columnOrder
+                            : columns.map((col) => col.id);
+
+                    const newColumnOrder = [...currentOrder];
+                    const [removed] = newColumnOrder.splice(oldIndex, 1);
+                    newColumnOrder.splice(newIndex, 0, removed);
+
+                    dispatch(setColumnOrder(newColumnOrder));
+                }
+            },
+            [table, dispatch],
+        );
+
+        const handleVisibilityChange = useCallback(
+            (columnId: string, isVisible: boolean) => {
+                const visibleColumns = table.getState().columnVisibility;
+
+                dispatch(
+                    setColumnVisibility({
+                        ...visibleColumns,
+                        [columnId]: isVisible,
+                    }),
+                );
+            },
+            [table, dispatch],
+        );
+
+        const handleSave = useCallback(() => {
+            // Save for everyone
+            if (projectUuid) {
+                createSpotlightConfig({
+                    projectUuid,
+                    data: {
+                        columnConfig:
+                            convertStateToTableColumnConfig(columnConfig),
+                    },
+                });
+            }
+        }, [projectUuid, createSpotlightConfig, columnConfig]);
+
+        const hasConfigChanges = useMemo(() => {
+            const referenceConfig =
+                savedTableConfig?.columnConfig ??
+                DEFAULT_SPOTLIGHT_TABLE_COLUMN_CONFIG;
+
+            const referenceFormatted =
+                convertTableColumnConfigToState(referenceConfig);
+
+            const orderChanged = !isEqual(
+                columnConfig.columnOrder,
+                referenceFormatted.columnOrder,
+            );
+            const visibilityChanged = !isEqual(
+                columnConfig.columnVisibility,
+                referenceFormatted.columnVisibility,
+            );
+
+            return orderChanged || visibilityChanged;
+        }, [savedTableConfig, columnConfig]);
+
+        const isDefaultConfig = useMemo(() => {
+            const currentConfig = convertStateToTableColumnConfig(columnConfig);
+
+            return isEqual(
+                currentConfig,
+                DEFAULT_SPOTLIGHT_TABLE_COLUMN_CONFIG,
+            );
+        }, [columnConfig]);
+
+        const handleReset = useCallback(() => {
+            if (!canManageSpotlight || !projectUuid) {
+                dispatch(setColumnConfig(savedTableConfig));
+                return;
+            }
+
+            if (hasConfigChanges) {
+                dispatch(setColumnConfig(savedTableConfig));
+            } else {
+                resetSpotlightConfig({ projectUuid });
+            }
+        }, [
+            canManageSpotlight,
+            dispatch,
+            hasConfigChanges,
+            projectUuid,
+            resetSpotlightConfig,
+            savedTableConfig,
+        ]);
+
+        return (
+            <Group {...props}>
+                <Group gap="xs">
+                    {/* Search input */}
+                    <TextInput
+                        size="xs"
+                        radius="md"
+                        classNames={{ input: classes.searchInput }}
+                        styles={(theme) => ({
+                            input: {
+                                height: 32,
+                                width: 309,
+                                paddingBlock: theme.spacing.xs,
+                                textOverflow: 'ellipsis',
+                                fontSize: theme.fontSizes.sm,
+                                fontWeight: 400,
+                                color: search
+                                    ? theme.colors.ldGray[8]
+                                    : theme.colors.ldGray[5],
+                                boxShadow: theme.shadows.subtle,
+                            },
+                        })}
+                        type="search"
+                        variant="default"
+                        placeholder="Search by name or description"
+                        value={search ?? ''}
+                        leftSection={
+                            <MantineIcon
+                                size="md"
+                                color="ldGray.6"
+                                icon={IconSearch}
+                            />
+                        }
+                        onChange={(e) => setSearch(e.target.value)}
+                        rightSectionPointerEvents="all"
+                        rightSection={
+                            search && (
+                                <ActionIcon
+                                    aria-label="Clear search"
+                                    onMouseDown={(event) =>
+                                        event.preventDefault()
+                                    }
+                                    onClick={clearSearch}
+                                    variant="transparent"
+                                    size="xs"
+                                    color="ldGray.5"
+                                >
+                                    <MantineIcon icon={IconX} />
+                                </ActionIcon>
+                            )
+                        }
+                    />
+
+                    {/* Categories filter */}
+                    {showCategoriesFilter && (
+                        <Divider
+                            orientation="vertical"
+                            w={1}
+                            h={20}
+                            color="ldGray.3"
+                            style={{
+                                alignSelf: 'center',
+                            }}
+                        />
+                    )}
+                    {showCategoriesFilter && (
+                        <CategoriesFilter
+                            selectedCategories={selectedCategories}
+                            setSelectedCategories={setSelectedCategories}
+                            categoryFilterMode={categoryFilterMode}
+                            setCategoryFilterMode={setCategoryFilterMode}
+                        />
+                    )}
+
+                    {/* TODO :: permissions for table filter */}
+                    <TableFilter
+                        selectedTables={selectedTables}
+                        setSelectedTables={setSelectedTables}
+                    />
+
+                    <OwnersFilter
+                        selectedOwners={selectedOwners}
+                        setSelectedOwners={setSelectedOwners}
+                    />
+                </Group>
+                <Group gap="xs">
+                    <Badge
+                        bg="ldGray.1"
+                        c="ldGray.8"
+                        radius={6}
+                        py="sm"
+                        px="xs"
+                        tt="none"
+                        h={32}
+                    >
+                        <Group gap={6}>
+                            <TotalMetricsDot />
+                            <Text fz="sm" fw={500}>
+                                {totalResults} metrics
+                            </Text>
+                        </Group>
+                    </Badge>
+                    <Popover shadow="subtle" withArrow>
+                        <Popover.Target>
+                            <Tooltip
+                                withinPortal
+                                multiline
+                                maw={150}
+                                label="Manage column visibility"
+                                position="top"
+                            >
+                                <ActionIcon
+                                    variant="transparent"
+                                    size="xs"
+                                    color="ldGray.5"
+                                    display={embedToken ? 'none' : undefined}
+                                >
+                                    <MantineIcon icon={IconEye} />
+                                </ActionIcon>
+                            </Tooltip>
+                        </Popover.Target>
+                        <Popover.Dropdown p="sm" miw={270}>
+                            <Stack gap="sm">
+                                <Stack gap={2}>
+                                    <DndContext
+                                        sensors={sensors}
+                                        collisionDetection={closestCenter}
+                                        onDragEnd={handleDragEnd}
+                                    >
+                                        <SortableContext
+                                            items={table
+                                                .getAllLeafColumns()
+                                                .map((col) => col.id)}
+                                            strategy={
+                                                verticalListSortingStrategy
+                                            }
+                                        >
+                                            {table
+                                                .getAllLeafColumns()
+                                                .map((column) => (
+                                                    <SortableColumn
+                                                        key={column.id}
+                                                        column={{
+                                                            name: getColumnHeaderLabel(
+                                                                column,
+                                                            ),
+                                                            uuid: column.id,
+                                                            visible:
+                                                                column.getIsVisible(),
+                                                            frozen:
+                                                                column.id ===
+                                                                SpotlightTableColumns.METRIC,
+                                                        }}
+                                                        onToggleVisibility={() => {
+                                                            handleVisibilityChange(
+                                                                column.id,
+                                                                !column.getIsVisible(),
+                                                            );
+                                                        }}
+                                                    />
+                                                ))}
+                                        </SortableContext>
+                                    </DndContext>
+                                </Stack>
+
+                                <Divider color="ldGray.1" />
+                                <Group justify="space-between" mt={4}>
+                                    {canManageSpotlight ? (
+                                        <>
+                                            <Tooltip
+                                                position="bottom"
+                                                withinPortal
+                                                label={
+                                                    hasConfigChanges
+                                                        ? 'Discard unsaved changes'
+                                                        : 'Reset configuration for everyone'
+                                                }
+                                            >
+                                                <Button
+                                                    size="xs"
+                                                    variant="default"
+                                                    radius="md"
+                                                    h={28}
+                                                    onClick={handleReset}
+                                                    style={(theme) => ({
+                                                        border: `1px solid ${theme.colors.ldGray[2]}`,
+                                                        boxShadow:
+                                                            theme.shadows
+                                                                .subtle,
+                                                    })}
+                                                    disabled={
+                                                        isDefaultConfig &&
+                                                        !hasConfigChanges
+                                                    }
+                                                >
+                                                    {hasConfigChanges
+                                                        ? 'Discard'
+                                                        : 'Reset'}
+                                                </Button>
+                                            </Tooltip>
+
+                                            <Button
+                                                size="xs"
+                                                h={28}
+                                                variant="dark"
+                                                onClick={handleSave}
+                                                loading={
+                                                    isCreatingSpotlightConfig
+                                                }
+                                            >
+                                                Save for everyone
+                                            </Button>
+                                        </>
+                                    ) : (
+                                        <Tooltip
+                                            position="bottom"
+                                            withinPortal
+                                            label={'Discard unsaved changes'}
+                                        >
+                                            <Button
+                                                fullWidth
+                                                size="xs"
+                                                h={28}
+                                                radius="md"
+                                                variant="default"
+                                                onClick={handleReset}
+                                                disabled={!hasConfigChanges}
+                                                style={(theme) => ({
+                                                    border: `1px solid ${theme.colors.ldGray[2]}`,
+                                                    boxShadow:
+                                                        theme.shadows.subtle,
+                                                })}
+                                            >
+                                                Discard
+                                            </Button>
+                                        </Tooltip>
+                                    )}
+                                </Group>
+                            </Stack>
+                        </Popover.Dropdown>
+                    </Popover>
+                    <Divider
+                        orientation="vertical"
+                        w={1}
+                        h={20}
+                        color="#DEE2E6"
+                        display={embedToken ? 'none' : undefined}
+                        style={{
+                            alignSelf: 'center',
+                        }}
+                    />
+                    <SegmentedControl
+                        size="xs"
+                        value={metricCatalogView}
+                        styles={(theme) => ({
+                            root: {
+                                display: embedToken ? 'none' : undefined,
+                                borderRadius: theme.radius.md,
+                                gap: theme.spacing.two,
+                                padding: theme.spacing.xxs,
+                            },
+                            indicator: {
+                                borderRadius: theme.radius.md,
+                                border: `1px solid ${theme.colors.ldGray[2]}`,
+                                backgroundColor: theme.colors.background[0],
+                                boxShadow: theme.shadows.subtle,
+                            },
+                        })}
+                        data={[
+                            {
+                                label: (
+                                    <Tooltip
+                                        withinPortal
+                                        label="List view"
+                                        position="bottom-end"
+                                    >
+                                        <Center>
+                                            <MantineIcon
+                                                icon={IconList}
+                                                size="md"
+                                            />
+                                        </Center>
+                                    </Tooltip>
+                                ),
+                                value: MetricCatalogView.LIST,
+                            },
+                            {
+                                label: (
+                                    <Tooltip
+                                        withinPortal
+                                        label="Canvas"
+                                        position="bottom-end"
+                                    >
+                                        <Center>
+                                            <MantineIcon
+                                                icon={IconSitemap}
+                                                size="md"
+                                            />
+                                        </Center>
+                                    </Tooltip>
+                                ),
+                                value: MetricCatalogView.CANVAS,
+                            },
+                        ]}
+                        onChange={(value) => {
+                            const view = value as MetricCatalogView;
+
+                            switch (view) {
+                                case MetricCatalogView.LIST:
+                                    void navigate({
+                                        pathname: `/projects/${projectUuid}/metrics`,
+                                        search: location.search,
+                                    });
+                                    break;
+                                case MetricCatalogView.CANVAS:
+                                    track({
+                                        name: EventName.METRICS_CATALOG_TREES_CANVAS_MODE_CLICKED,
+                                        properties: {
+                                            userId: userUuid,
+                                            organizationId: organizationUuid,
+                                            projectId: projectUuid,
+                                        },
+                                    });
+                                    void navigate({
+                                        pathname: `/projects/${projectUuid}/metrics/canvas`,
+                                        search: location.search,
+                                    });
+                                    break;
+                            }
+                        }}
+                    />
+                </Group>
+            </Group>
+        );
+    },
+);

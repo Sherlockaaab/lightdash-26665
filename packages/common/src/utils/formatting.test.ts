@@ -1,0 +1,3620 @@
+import dayjs from 'dayjs';
+import moment from 'moment';
+import momentTz from 'moment-timezone';
+import {
+    Compact,
+    CustomFormatType,
+    DimensionType,
+    FieldType,
+    Format,
+    MetricType,
+    NumberSeparator,
+    TableCalculationType,
+    type CustomFormat,
+    type Dimension,
+    type Metric,
+    type TableCalculation,
+} from '../types/field';
+import { TimeFrames } from '../types/timeFrames';
+import {
+    applyCustomFormat,
+    applyDefaultFormat,
+    convertCustomFormatToFormatExpression,
+    currencies,
+    formatDate,
+    formatItemValue,
+    formatNumberValue,
+    formatTemporalCellForSpreadsheet,
+    formatTimestamp,
+    formatValueWithExpression,
+    getCustomFormatFromLegacy,
+    getEffectiveSeparator,
+    getFieldFormatOverrideProps,
+    getFormatExpressionLocale,
+    getFormatterTimezone,
+    isCalendarValueItem,
+    isItemTimezoneAffected,
+    isMomentInput,
+    isTimestampString,
+    shouldShiftItemTimezone,
+    toIsoWithProjectOffset,
+} from './formatting';
+import {
+    additionalMetric,
+    dimension,
+    metric,
+    tableCalculation,
+} from './formatting.mock';
+
+describe('Formatting', () => {
+    describe('getFormatterTimezone (unified shift decision)', () => {
+        const tz = 'America/Anchorage';
+        const tsString = '2025-01-15T17:00:00.000Z';
+        const dateOnly = '2025-01-15';
+
+        test('returns undefined when no project timezone is supplied', () => {
+            expect(
+                getFormatterTimezone(
+                    { ...dimension, type: DimensionType.TIMESTAMP },
+                    tsString,
+                    undefined,
+                ),
+            ).toBeUndefined();
+        });
+
+        test('TIMESTAMP dimension shifts by shape (value-independent)', () => {
+            const item = { ...dimension, type: DimensionType.TIMESTAMP };
+            expect(getFormatterTimezone(item, tsString, tz)).toEqual(tz);
+            // shape says shift even for a value the by-value gate would reject
+            expect(getFormatterTimezone(item, 12345, tz)).toEqual(tz);
+        });
+
+        test('bare DATE dimension never shifts (calendar guard)', () => {
+            expect(
+                getFormatterTimezone(
+                    { ...dimension, type: DimensionType.DATE },
+                    dateOnly,
+                    tz,
+                ),
+            ).toBeUndefined();
+        });
+
+        test('DATE dimension truncated from a TIMESTAMP base does NOT shift (GLITCH-452: real DATE)', () => {
+            const dateBaseTs: Dimension = {
+                ...dimension,
+                type: DimensionType.DATE,
+                timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+            };
+            // GLITCH-452: the cast makes this a real DATE (calendar value), so it
+            // is no longer a bucketed instant and must not be timezone-shifted.
+            expect(
+                getFormatterTimezone(dateBaseTs, tsString, tz),
+            ).toBeUndefined();
+        });
+
+        test('skipTimezoneConversion opts out even for a TIMESTAMP', () => {
+            const skipTzDim: Dimension = {
+                ...dimension,
+                type: DimensionType.TIMESTAMP,
+                skipTimezoneConversion: true,
+            };
+            expect(
+                getFormatterTimezone(skipTzDim, tsString, tz),
+            ).toBeUndefined();
+        });
+
+        test('MIN/MAX over a timestamp shifts via the by-value fallback', () => {
+            const maxMetric = { ...additionalMetric, type: MetricType.MAX };
+            expect(getFormatterTimezone(maxMetric, tsString, tz)).toEqual(tz);
+            expect(
+                getFormatterTimezone(maxMetric, new Date(tsString), tz),
+            ).toEqual(tz);
+        });
+
+        test('MIN/MAX over a calendar date does NOT shift (date-only value)', () => {
+            expect(
+                getFormatterTimezone(
+                    { ...additionalMetric, type: MetricType.MAX },
+                    dateOnly,
+                    tz,
+                ),
+            ).toBeUndefined();
+        });
+
+        test('MIN/MAX over a number does NOT shift', () => {
+            expect(
+                getFormatterTimezone(
+                    { ...additionalMetric, type: MetricType.MAX },
+                    42,
+                    tz,
+                ),
+            ).toBeUndefined();
+        });
+
+        // With a known base type the decision no longer depends on the value
+        // shape — a DATE base never shifts even for a midnight ISO instant.
+        test('MIN/MAX with a DATE base does NOT shift, even for a midnight ISO value', () => {
+            const item: Metric = {
+                ...metric,
+                type: MetricType.MAX,
+                baseDimensionType: DimensionType.DATE,
+            };
+            expect(
+                getFormatterTimezone(item, '2025-01-15T00:00:00.000Z', tz),
+            ).toBeUndefined();
+            expect(
+                getFormatterTimezone(
+                    item,
+                    new Date('2025-01-15T00:00:00.000Z'),
+                    tz,
+                ),
+            ).toBeUndefined();
+        });
+
+        test('MIN/MAX with a TIMESTAMP base shifts (unchanged)', () => {
+            const item: Metric = {
+                ...metric,
+                type: MetricType.MAX,
+                baseDimensionType: DimensionType.TIMESTAMP,
+            };
+            expect(getFormatterTimezone(item, tsString, tz)).toEqual(tz);
+        });
+
+        test('MIN/MAX with no known base falls back to value shape (unchanged)', () => {
+            const item: Metric = { ...metric, type: MetricType.MAX };
+            expect(getFormatterTimezone(item, tsString, tz)).toEqual(tz);
+            expect(getFormatterTimezone(item, dateOnly, tz)).toBeUndefined();
+        });
+
+        test('STRING item carrying a timestamp value does NOT shift', () => {
+            // The by-value fallback is scoped to MIN/MAX; a known non-temporal
+            // type is trusted even when the value looks like an instant.
+            expect(
+                getFormatterTimezone(
+                    { ...dimension, type: DimensionType.STRING },
+                    tsString,
+                    tz,
+                ),
+            ).toBeUndefined();
+            expect(
+                getFormatterTimezone(
+                    { ...dimension, type: DimensionType.STRING },
+                    new Date(tsString),
+                    tz,
+                ),
+            ).toBeUndefined();
+        });
+
+        test('DATE table calc does NOT shift even with a midnight-ISO value', () => {
+            // The bug: a date-typed table calc whose value arrives as a full
+            // timestamp must stay a calendar day (no off-by-one under -ve UTC).
+            const dateTableCalc = {
+                name: 'date_tc',
+                displayName: 'date_tc',
+                sql: '${orders.order_date_day}',
+                type: TableCalculationType.DATE,
+            } as TableCalculation;
+            expect(
+                getFormatterTimezone(dateTableCalc, tsString, tz),
+            ).toBeUndefined();
+        });
+
+        test('TIMESTAMP table calc shifts', () => {
+            const tsTableCalc = {
+                name: 'ts_tc',
+                displayName: 'ts_tc',
+                sql: '${orders.order_date_day}',
+                type: TableCalculationType.TIMESTAMP,
+            } as TableCalculation;
+            expect(getFormatterTimezone(tsTableCalc, tsString, tz)).toEqual(tz);
+        });
+    });
+
+    describe('convert legacy Format type', () => {
+        [Format.KM, Format.MI].forEach((format) => {
+            test(`when it is ${format.toUpperCase()} getCustomFormatFromLegacy should return the correct CustomFormat options`, () => {
+                expect(getCustomFormatFromLegacy({ format })).toEqual({
+                    type: CustomFormatType.NUMBER,
+                    suffix: ` ${format}`,
+                    compact: undefined,
+                    round: undefined,
+                });
+            });
+        });
+
+        [Format.EUR, Format.GBP, Format.USD].forEach((format) => {
+            test(`when it is ${format.toUpperCase()} getCustomFormatFromLegacy should return the correct CustomFormat options`, () => {
+                expect(getCustomFormatFromLegacy({ format })).toEqual({
+                    type: CustomFormatType.CURRENCY,
+                    currency: format.toUpperCase(),
+                    compact: undefined,
+                    round: undefined,
+                });
+            });
+        });
+
+        test(`when it is ${Format.PERCENT.toUpperCase()} getCustomFormatFromLegacy should return the correct CustomFormat options`, () => {
+            expect(
+                getCustomFormatFromLegacy({ format: Format.PERCENT }),
+            ).toEqual({
+                type: CustomFormatType.PERCENT,
+                compact: undefined,
+                round: undefined,
+            });
+        });
+
+        test(`when it is ${Format.ID.toUpperCase()} getCustomFormatFromLegacy should return the correct CustomFormat options`, () => {
+            expect(getCustomFormatFromLegacy({ format: Format.ID })).toEqual({
+                type: CustomFormatType.ID,
+            });
+        });
+
+        test(`when it is ${Format.SI.toUpperCase()} getCustomFormatFromLegacy should return the correct CustomFormat options`, () => {
+            expect(getCustomFormatFromLegacy({ format: Format.SI })).toEqual({
+                type: CustomFormatType.NUMBER,
+                compact: Compact.AUTO,
+                round: undefined,
+            });
+        });
+    });
+
+    describe('applying CustomFormat to value', () => {
+        describe('timezone threading (GLITCH-498)', () => {
+            const utcInstant = new Date('2025-01-15T17:00:00.000Z'); // 06:00 in Pago_Pago (UTC-11)
+            const tz = 'Pacific/Pago_Pago';
+
+            test('TIMESTAMP format shifts a Date value into the timezone', () => {
+                expect(
+                    applyCustomFormat(
+                        utcInstant,
+                        { type: CustomFormatType.TIMESTAMP },
+                        tz,
+                    ),
+                ).toEqual('2025-01-15, 06:00:00:000 (-11:00)');
+            });
+
+            test('TIMESTAMP format shifts a timestamp string into the timezone', () => {
+                expect(
+                    applyCustomFormat(
+                        '2025-01-15 17:00:00',
+                        { type: CustomFormatType.TIMESTAMP },
+                        tz,
+                    ),
+                ).toEqual('2025-01-15, 06:00:00:000 (-11:00)');
+            });
+
+            test('early Date branch (non-temporal format type) shifts via formatTimestamp', () => {
+                // value is a Date and format.type is PERCENT -> hits the early
+                // `value instanceof Date` branch (formatting.ts:708-715)
+                expect(
+                    applyCustomFormat(
+                        utcInstant,
+                        { type: CustomFormatType.PERCENT },
+                        tz,
+                    ),
+                ).toEqual('2025-01-15, 06:00:00:000 (-11:00)');
+            });
+
+            test('CUSTOM expression on a timestamp string shifts into the timezone', () => {
+                expect(
+                    applyCustomFormat(
+                        '2025-01-15 17:00:00',
+                        {
+                            type: CustomFormatType.CUSTOM,
+                            custom: 'yyyy-mm-dd hh:mm:ss',
+                        },
+                        tz,
+                    ),
+                ).toEqual('2025-01-15 06:00:00');
+            });
+
+            test('DATE format on a date-only string does NOT shift (by-value gate)', () => {
+                // isTimestampString('2025-01-15') === false -> no time component ->
+                // effectiveTimezone is undefined -> calendar day is preserved
+                expect(
+                    applyCustomFormat(
+                        '2025-01-15',
+                        { type: CustomFormatType.DATE },
+                        tz,
+                    ),
+                ).toEqual('2025-01-15');
+            });
+
+            test('numeric formats ignore timezone (no-op)', () => {
+                expect(
+                    applyCustomFormat(
+                        5000,
+                        { type: CustomFormatType.NUMBER },
+                        tz,
+                    ),
+                ).toEqual('5,000');
+                expect(
+                    applyCustomFormat(
+                        0.05,
+                        { type: CustomFormatType.PERCENT },
+                        tz,
+                    ),
+                ).toEqual('5%');
+            });
+        });
+
+        // A custom date format on a month dimension double-counted a month for
+        // viewers in a summer-DST timezone. In tz-aware mode month values arrive
+        // as bare `YYYY-MM-DD` strings; the custom-format path parsed them in the
+        // viewer's local zone but read back UTC fields, rolling post-DST months
+        // back one (e.g. Apr -> Mar, giving two "Mar" bars). vitest runs in
+        // TZ=UTC where the two parses match, so override moment's default zone.
+        describe('custom date format across a DST boundary', () => {
+            afterEach(() => momentTz.tz.setDefault());
+
+            // Both are UTC+0 in winter, UTC+1 from ~Mar 29 (DST) — the boundary
+            // that split correct (Jan-Mar) from shifted (Apr+) months.
+            test.each(['Europe/London', 'Europe/Lisbon'])(
+                'month-truncated date-only values keep their own month in %s',
+                (viewerZone) => {
+                    momentTz.tz.setDefault(viewerZone);
+                    const months: [string, string][] = [
+                        ['2026-01-01', 'Jan'],
+                        ['2026-02-01', 'Feb'],
+                        ['2026-03-01', 'Mar'],
+                        ['2026-04-01', 'Apr'], // pre-fix rolled back to 'Mar'
+                        ['2026-05-01', 'May'],
+                        ['2026-06-01', 'Jun'],
+                    ];
+                    months.forEach(([value, expected]) => {
+                        expect(formatValueWithExpression('mmm', value)).toEqual(
+                            expected,
+                        );
+                    });
+                },
+            );
+
+            test('offset-less timestamp strings are not shifted across the boundary', () => {
+                momentTz.tz.setDefault('Europe/London');
+                expect(
+                    formatValueWithExpression('mmm', '2026-04-01T00:00:00'),
+                ).toEqual('Apr');
+            });
+
+            test('Z-suffixed values remain correct', () => {
+                momentTz.tz.setDefault('Europe/London');
+                expect(
+                    formatValueWithExpression('mmm', '2026-04-01T00:00:00Z'),
+                ).toEqual('Apr');
+            });
+
+            test('formatItemValue on a DATE month dimension does not duplicate a month', () => {
+                momentTz.tz.setDefault('Europe/London');
+                const monthDimension: Dimension = {
+                    ...dimension,
+                    type: DimensionType.DATE,
+                    timeInterval: TimeFrames.MONTH,
+                    format: 'mmm',
+                };
+                // Mirrors the axis formatter: convertToUTC=true, project tz='UTC'.
+                const labels = ['2026-03-01', '2026-04-01', '2026-05-01'].map(
+                    (value) =>
+                        formatItemValue(
+                            monthDimension,
+                            value,
+                            true,
+                            undefined,
+                            'UTC',
+                            'UTC',
+                        ),
+                );
+                expect(labels).toEqual(['Mar', 'Apr', 'May']);
+            });
+        });
+
+        describe('when using legacy format', () => {
+            test('if Format is legacy distance unit it should return the right format', () => {
+                expect(
+                    applyCustomFormat(
+                        5,
+                        getCustomFormatFromLegacy({ format: Format.KM }),
+                    ),
+                ).toEqual('5 km');
+
+                expect(
+                    applyCustomFormat(
+                        5,
+                        getCustomFormatFromLegacy({
+                            format: Format.MI,
+                        }),
+                    ),
+                ).toEqual('5 mi');
+            });
+
+            test('if Format is currency unit it should return the right format', () => {
+                expect(
+                    applyCustomFormat(5, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.USD,
+                    }),
+                ).toEqual('$5.00');
+                expect(
+                    applyCustomFormat(5, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.GBP,
+                    }),
+                ).toEqual('£5.00');
+                expect(
+                    applyCustomFormat(5, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.EUR,
+                    }),
+                ).toEqual('€5.00');
+                expect(
+                    applyCustomFormat(5, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.JPY,
+                    }),
+                ).toEqual('¥5');
+                expect(
+                    applyCustomFormat(5, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.DKK,
+                    }),
+                ).toEqual('DKK 5.00');
+            });
+
+            test('if Format is percent it should return the right format', () => {
+                const percentFormat: CustomFormat = {
+                    type: CustomFormatType.PERCENT,
+                };
+
+                expect(applyCustomFormat(5, percentFormat)).toEqual('500%');
+                expect(applyCustomFormat(0.05, percentFormat)).toEqual('5%');
+                expect(applyCustomFormat('5', percentFormat)).toEqual('500%');
+                expect(applyCustomFormat('foo', percentFormat)).toEqual('foo');
+                expect(applyCustomFormat(false, percentFormat)).toEqual(
+                    'false',
+                );
+            });
+
+            test('if Format is undefined it should return the right format', () => {
+                expect(applyCustomFormat(1103)).toEqual('1,103');
+                expect(applyCustomFormat(5)).toEqual('5');
+            });
+
+            test('if Format is id it should return the right format', () => {
+                // ids are not comma separated
+                expect(
+                    applyCustomFormat(1019, { type: CustomFormatType.ID }),
+                ).toEqual('1019');
+            });
+        });
+
+        describe('when applying round', () => {
+            test('if round is undefined and custom format is not number format it should keep up to 3 decimal places', () => {
+                expect(applyCustomFormat(5.9)).toEqual('5.9');
+                expect(applyCustomFormat(5.99)).toEqual('5.99');
+                expect(applyCustomFormat(5.999)).toEqual('5.999');
+                expect(applyCustomFormat(5.9999)).toEqual('6');
+                expect(applyCustomFormat(5.99999)).toEqual('6');
+                expect(
+                    applyCustomFormat(5.9, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.USD,
+                    }),
+                ).toEqual('$5.90');
+            });
+
+            test('if round is undefined and format is number it should keep up to 3 decimal places', () => {
+                expect(
+                    applyCustomFormat(5.9, { type: CustomFormatType.NUMBER }),
+                ).toEqual('5.9');
+            });
+
+            test('when round zero it should return the right round', () => {
+                const roundZeroFormat: CustomFormat = {
+                    type: CustomFormatType.NUMBER,
+                    round: 0,
+                };
+
+                expect(applyCustomFormat(1, roundZeroFormat)).toEqual('1');
+                expect(applyCustomFormat(10, roundZeroFormat)).toEqual('10');
+                expect(applyCustomFormat(100, roundZeroFormat)).toEqual('100');
+                expect(applyCustomFormat(5, roundZeroFormat)).toEqual('5');
+                expect(applyCustomFormat(5.001, roundZeroFormat)).toEqual('5');
+                expect(applyCustomFormat(0.001, roundZeroFormat)).toEqual('0');
+                expect(applyCustomFormat(1000, roundZeroFormat)).toEqual(
+                    '1,000',
+                );
+                expect(applyCustomFormat(10000, roundZeroFormat)).toEqual(
+                    '10,000',
+                );
+                expect(applyCustomFormat(100000, roundZeroFormat)).toEqual(
+                    '100,000',
+                );
+                expect(applyCustomFormat(1000000, roundZeroFormat)).toEqual(
+                    '1,000,000',
+                );
+                expect(applyCustomFormat(5.9999999, roundZeroFormat)).toEqual(
+                    '6',
+                );
+            });
+
+            test('when round is positive number it should return the right round', () => {
+                const roundTwoFormat: CustomFormat = {
+                    type: CustomFormatType.NUMBER,
+                    round: 2,
+                };
+
+                expect(applyCustomFormat(5, roundTwoFormat)).toEqual('5.00');
+                expect(applyCustomFormat('foo', roundTwoFormat)).toEqual('foo');
+                expect(applyCustomFormat(5.001, roundTwoFormat)).toEqual(
+                    '5.00',
+                );
+                expect(applyCustomFormat(5.555, roundTwoFormat)).toEqual(
+                    '5.56',
+                );
+                expect(applyCustomFormat(5.5555, roundTwoFormat)).toEqual(
+                    '5.56',
+                );
+                expect(applyCustomFormat(5.9999999, roundTwoFormat)).toEqual(
+                    '6.00',
+                );
+                expect(applyCustomFormat(false, roundTwoFormat)).toEqual(
+                    'false',
+                );
+
+                const roundTenFormat: CustomFormat = {
+                    type: CustomFormatType.NUMBER,
+                    round: 10,
+                };
+
+                expect(applyCustomFormat(5, roundTenFormat)).toEqual(
+                    '5.0000000000',
+                );
+                expect(applyCustomFormat(5.001, roundTenFormat)).toEqual(
+                    '5.0010000000',
+                );
+                expect(applyCustomFormat(5.9999999, roundTenFormat)).toEqual(
+                    '5.9999999000',
+                );
+            });
+
+            test('when round is negative number it should return the right round', () => {
+                const number = 123456789.12345;
+
+                expect(
+                    formatNumberValue(number, {
+                        type: CustomFormatType.DEFAULT,
+                        round: -1,
+                    }),
+                ).toEqual('123,456,790');
+                expect(
+                    formatNumberValue(number, {
+                        type: CustomFormatType.DEFAULT,
+                        round: -2,
+                    }),
+                ).toEqual('123,456,800');
+                expect(
+                    formatNumberValue(number, {
+                        type: CustomFormatType.DEFAULT,
+                        round: -3,
+                    }),
+                ).toEqual('123,457,000');
+                expect(
+                    formatNumberValue(number, {
+                        type: CustomFormatType.DEFAULT,
+                        round: -99,
+                    }),
+                ).toEqual('100,000,000');
+            });
+        });
+
+        test('applyCustomFormat should return the right format and round', () => {
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.NUMBER,
+                    suffix: ` ${Format.KM}`,
+                    round: 2,
+                }),
+            ).toEqual('5.00 km');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.NUMBER,
+                    suffix: ` ${Format.KM}`,
+                    round: -2,
+                }),
+            ).toEqual('5 km');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.NUMBER,
+                    suffix: ` ${Format.MI}`,
+                    round: 4,
+                }),
+            ).toEqual('5.0000 mi');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.NUMBER,
+                    suffix: ` ${Format.MI}`,
+                    round: -4,
+                }),
+            ).toEqual('5 mi');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    round: 2,
+                }),
+            ).toEqual('$5.00');
+            expect(
+                applyCustomFormat(5.0, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    round: 0,
+                }),
+            ).toEqual('$5');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    round: -2,
+                }),
+            ).toEqual('$5');
+            expect(
+                applyCustomFormat(5.25, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    round: -1,
+                }),
+            ).toEqual('$5');
+            expect(
+                applyCustomFormat('5.0000', {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    round: 2,
+                }),
+            ).toEqual('$5.00');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.GBP,
+                    round: 2,
+                }),
+            ).toEqual('£5.00');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.GBP,
+                    round: -2,
+                }),
+            ).toEqual('£5');
+            expect(
+                applyCustomFormat(5.25, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.GBP,
+                    round: -2,
+                }),
+            ).toEqual('£5');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.EUR,
+                    round: 2,
+                }),
+            ).toEqual('€5.00');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.EUR,
+                    round: -2,
+                }),
+            ).toEqual('€5');
+            expect(
+                applyCustomFormat(5.25, {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.EUR,
+                    round: -1,
+                }),
+            ).toEqual('€5');
+            expect(
+                applyCustomFormat(5, {
+                    type: CustomFormatType.PERCENT,
+                    round: 2,
+                }),
+            ).toEqual('500.00%');
+            expect(
+                applyCustomFormat(0.05, {
+                    type: CustomFormatType.PERCENT,
+                    round: 2,
+                }),
+            ).toEqual('5.00%');
+            expect(
+                applyCustomFormat('5', {
+                    type: CustomFormatType.PERCENT,
+                    round: 2,
+                }),
+            ).toEqual('500.00%');
+            expect(
+                applyCustomFormat(0.0511, {
+                    type: CustomFormatType.PERCENT,
+                    round: 2,
+                }),
+            ).toEqual('5.11%');
+            expect(
+                applyCustomFormat(0.0511, {
+                    type: CustomFormatType.PERCENT,
+                    round: 4,
+                }),
+            ).toEqual('5.1100%');
+            expect(
+                applyCustomFormat('foo', {
+                    type: CustomFormatType.PERCENT,
+                    round: 2,
+                }),
+            ).toEqual('foo');
+            expect(
+                applyCustomFormat(false, {
+                    type: CustomFormatType.PERCENT,
+                    round: 2,
+                }),
+            ).toEqual('false');
+            expect(
+                applyCustomFormat(0.05, {
+                    type: CustomFormatType.PERCENT,
+                    round: -2,
+                }),
+            ).toEqual('5%');
+            expect(
+                applyCustomFormat('5', {
+                    type: CustomFormatType.PERCENT,
+                    round: -2,
+                }),
+            ).toEqual('500%');
+        });
+
+        describe('when applying compact', () => {
+            const {
+                AUTO,
+                THOUSANDS: K,
+                MILLIONS: M,
+                BILLIONS: B,
+                TRILLIONS: T,
+            } = Compact;
+            const autoConfig = {
+                type: CustomFormatType.NUMBER,
+                compact: AUTO,
+            };
+
+            const thousandsConfig = {
+                type: CustomFormatType.NUMBER,
+                compact: K,
+            };
+            const millionsConfig = {
+                type: CustomFormatType.NUMBER,
+                compact: M,
+            };
+            const billionsConfig = {
+                type: CustomFormatType.NUMBER,
+                compact: B,
+            };
+            const trillionsConfig = {
+                type: CustomFormatType.NUMBER,
+                compact: T,
+            };
+
+            test('it should return the right style', () => {
+                expect(applyCustomFormat(5, thousandsConfig)).toEqual('0.005K');
+                expect(applyCustomFormat(5, millionsConfig)).toEqual('0M');
+                expect(applyCustomFormat(500000, billionsConfig)).toEqual(
+                    '0.001B',
+                );
+                expect(applyCustomFormat(5, billionsConfig)).toEqual('0B');
+                expect(applyCustomFormat(5000000000, trillionsConfig)).toEqual(
+                    '0.005T',
+                );
+            });
+
+            test('it should dynamically pick the compact style', () => {
+                expect(applyCustomFormat(999, autoConfig)).toEqual('999');
+                expect(applyCustomFormat(1000, autoConfig)).toEqual('1K');
+                expect(applyCustomFormat(1200, autoConfig)).toEqual('1.2K');
+                expect(applyCustomFormat(1200000, autoConfig)).toEqual('1.2M');
+                expect(applyCustomFormat(-1200000, autoConfig)).toEqual(
+                    '-1.2M',
+                );
+            });
+
+            test('it should apply dynamic compact with round, separators, prefix and suffix', () => {
+                expect(
+                    applyCustomFormat(1200, { ...autoConfig, round: 0 }),
+                ).toEqual('1K');
+                expect(
+                    applyCustomFormat(1234567890123456, {
+                        ...autoConfig,
+                        separator: NumberSeparator.COMMA_PERIOD,
+                        prefix: '~',
+                        suffix: ' total',
+                    }),
+                ).toEqual('~1,234.568T total');
+            });
+
+            test('it should apply dynamic compact with currency', () => {
+                expect(
+                    applyCustomFormat(1200, {
+                        type: CustomFormatType.CURRENCY,
+                        compact: AUTO,
+                        currency: 'USD',
+                        round: 1,
+                    }),
+                ).toEqual('$1.2K');
+            });
+
+            test('when applying round it should return the right style', () => {
+                expect(
+                    applyCustomFormat(5, { ...millionsConfig, round: 2 }),
+                ).toEqual('0.00M');
+                expect(
+                    applyCustomFormat(5400000, { ...millionsConfig, round: 0 }),
+                ).toEqual('5M');
+                expect(
+                    applyCustomFormat(4956789123, {
+                        ...trillionsConfig,
+                        round: -1,
+                    }),
+                ).toEqual('0.005T');
+            });
+
+            test('with legacy distance format it should return the right format', () => {
+                expect(
+                    applyCustomFormat(
+                        5000,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.KM,
+                        }),
+                    ),
+                ).toEqual('5.00K km');
+
+                expect(
+                    applyCustomFormat(
+                        50000,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 4,
+                            format: Format.MI,
+                        }),
+                    ),
+                ).toEqual('50.0000K mi');
+            });
+
+            test('with legacy currency format it should return the right format', () => {
+                expect(
+                    applyCustomFormat(
+                        5000,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5.00K');
+
+                expect(
+                    applyCustomFormat(
+                        5000000,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5,000.00K');
+
+                expect(
+                    applyCustomFormat(
+                        5000000,
+                        getCustomFormatFromLegacy({
+                            compact: M,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5.00M');
+
+                expect(
+                    applyCustomFormat(
+                        4,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$0.00K');
+
+                expect(
+                    applyCustomFormat(
+                        4,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 3,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$0.004K');
+
+                expect(
+                    applyCustomFormat(
+                        4000,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$4.00K');
+
+                expect(
+                    applyCustomFormat(
+                        5000000,
+                        getCustomFormatFromLegacy({
+                            compact: M,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5.00M');
+
+                expect(
+                    applyCustomFormat(
+                        5000000000,
+                        getCustomFormatFromLegacy({
+                            compact: M,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5,000.00M');
+
+                expect(
+                    applyCustomFormat(
+                        5000000000,
+                        getCustomFormatFromLegacy({
+                            compact: B,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5.00B');
+
+                expect(
+                    applyCustomFormat(
+                        5000.0,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 0,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5K');
+
+                expect(
+                    applyCustomFormat(
+                        '5000',
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.USD,
+                        }),
+                    ),
+                ).toEqual('$5.00K');
+
+                expect(
+                    applyCustomFormat(
+                        5000,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.GBP,
+                        }),
+                    ),
+                ).toEqual('£5.00K');
+
+                expect(
+                    applyCustomFormat(
+                        5000,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.EUR,
+                        }),
+                    ),
+                ).toEqual('€5.00K');
+            });
+
+            test('with legacy percent format it should return the right format', () => {
+                expect(
+                    applyCustomFormat(
+                        0.05,
+                        getCustomFormatFromLegacy({
+                            compact: K,
+                            round: 2,
+                            format: Format.PERCENT,
+                        }),
+                    ),
+                ).toEqual('5.00%');
+            });
+
+            test('suports compact alias', () => {
+                expect(
+                    applyCustomFormat(1000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'K',
+                    }),
+                ).toEqual('1K');
+
+                expect(
+                    applyCustomFormat(1000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'thousand',
+                    }),
+                ).toEqual('1K');
+
+                expect(
+                    applyCustomFormat(1000000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'M',
+                    }),
+                ).toEqual('1M');
+
+                expect(
+                    applyCustomFormat(1000000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'million',
+                    }),
+                ).toEqual('1M');
+
+                expect(
+                    applyCustomFormat(1000000000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'B',
+                    }),
+                ).toEqual('1B');
+
+                expect(
+                    applyCustomFormat(1000000000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'billion',
+                    }),
+                ).toEqual('1B');
+
+                expect(
+                    applyCustomFormat(1000000000000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'T',
+                    }),
+                ).toEqual('1T');
+
+                expect(
+                    applyCustomFormat(1000000000000, {
+                        type: CustomFormatType.NUMBER,
+                        compact: 'trillion',
+                    }),
+                ).toEqual('1T');
+            });
+        });
+    });
+
+    describe('isTimestampString', () => {
+        test('true only for strings with a date AND a time component', () => {
+            expect(isTimestampString('2018-10-31T06:44:22.667Z')).toBe(true);
+            expect(isTimestampString('2020-08-11 16:44:00')).toBe(true);
+        });
+
+        test('false for date-only, numbers, Dates, and non-temporal strings', () => {
+            // bare date — must not be timezone-shifted, so excluded
+            expect(isTimestampString('2018-10-31')).toBe(false);
+            // date-shaped but no time component
+            expect(isTimestampString('2018-13-99')).toBe(false);
+            expect(isTimestampString('42')).toBe(false);
+            expect(isTimestampString(5000)).toBe(false);
+            expect(isTimestampString('hello')).toBe(false);
+            // type-guard is for strings only; Date instances are handled separately
+            expect(
+                isTimestampString(new Date('2018-10-31T06:44:22.667Z')),
+            ).toBe(false);
+            expect(isTimestampString(undefined)).toBe(false);
+        });
+    });
+
+    describe('isCalendarValueItem', () => {
+        const dateBaseColumn: Dimension = {
+            ...dimension,
+            type: DimensionType.DATE,
+        };
+        const dateOverDateDay: Dimension = {
+            ...dimension,
+            type: DimensionType.DATE,
+            timeInterval: TimeFrames.DAY,
+            timeIntervalBaseDimensionType: DimensionType.DATE,
+        };
+        const dateOverDateWeek: Dimension = {
+            ...dimension,
+            type: DimensionType.DATE,
+            timeInterval: TimeFrames.WEEK,
+            timeIntervalBaseDimensionType: DimensionType.DATE,
+        };
+        const dateOverTimestampDay: Dimension = {
+            ...dimension,
+            type: DimensionType.DATE,
+            timeInterval: TimeFrames.DAY,
+            timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+        };
+        const timestampRaw: Dimension = {
+            ...dimension,
+            type: DimensionType.TIMESTAMP,
+        };
+        const timestampHour: Dimension = {
+            ...dimension,
+            type: DimensionType.TIMESTAMP,
+            timeInterval: TimeFrames.HOUR,
+            timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+        };
+        const dateMetric: Metric = {
+            ...metric,
+            type: MetricType.DATE,
+        };
+
+        test('treats wall-clock DATE values as calendar values', () => {
+            // plain DATE column (no interval, base undefined)
+            expect(isCalendarValueItem(dateBaseColumn)).toBe(true);
+            // DATE truncated from a DATE base — any grain
+            expect(isCalendarValueItem(dateOverDateDay)).toBe(true);
+            expect(isCalendarValueItem(dateOverDateWeek)).toBe(true);
+            // GLITCH-452: a DATE truncated from a TIMESTAMP base now compiles to a
+            // real DATE (CAST(... AS DATE)), so it is a calendar value too.
+            expect(isCalendarValueItem(dateOverTimestampDay)).toBe(true);
+            // A date-typed metric (MetricType.DATE) — not a Dimension, still calendar
+            expect(isCalendarValueItem(dateMetric)).toBe(true);
+        });
+
+        test('treats real instants as non-calendar values', () => {
+            // plain + sub-day TIMESTAMP are real instants
+            expect(isCalendarValueItem(timestampRaw)).toBe(false);
+            expect(isCalendarValueItem(timestampHour)).toBe(false);
+        });
+
+        test('skipTimezoneConversion does not make a TIMESTAMP a calendar value', () => {
+            // The trap: convert_timezone:false is TZ-immune but still an instant.
+            const timestampRawOptOut: Dimension = {
+                ...timestampRaw,
+                skipTimezoneConversion: true,
+            };
+            // A DATE stays a calendar value regardless of the marker
+            const dateOptOut: Dimension = {
+                ...dateOverDateDay,
+                skipTimezoneConversion: true,
+            };
+            expect(isCalendarValueItem(timestampRawOptOut)).toBe(false);
+            expect(isCalendarValueItem(dateOptOut)).toBe(true);
+        });
+
+        test('non-temporal items and undefined are not calendar values', () => {
+            expect(isCalendarValueItem(undefined)).toBe(false);
+            expect(isCalendarValueItem(dimension)).toBe(false); // STRING
+            expect(isCalendarValueItem(metric)).toBe(false); // COUNT
+        });
+
+        test('classifies table calculations by their declared type', () => {
+            // Table calcs are not fields, but their `type` is reliable, so a
+            // DATE table calc is a calendar value (must not shift) while a
+            // TIMESTAMP one is a real instant.
+            const dateTableCalc = {
+                name: 'date_tc',
+                displayName: 'date_tc',
+                sql: '${orders.order_date_day}',
+                type: TableCalculationType.DATE,
+            } as TableCalculation;
+            const timestampTableCalc = {
+                name: 'ts_tc',
+                displayName: 'ts_tc',
+                sql: '${orders.order_date_day}',
+                type: TableCalculationType.TIMESTAMP,
+            } as TableCalculation;
+            expect(isCalendarValueItem(dateTableCalc)).toBe(true);
+            expect(isCalendarValueItem(timestampTableCalc)).toBe(false);
+        });
+    });
+
+    describe('isItemTimezoneAffected', () => {
+        const timestampBase: Dimension = {
+            ...dimension,
+            type: DimensionType.TIMESTAMP,
+        };
+        const timestampHour: Dimension = {
+            ...dimension,
+            type: DimensionType.TIMESTAMP,
+            timeInterval: TimeFrames.HOUR,
+            timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+        };
+        const dateOverTimestampDay: Dimension = {
+            ...dimension,
+            type: DimensionType.DATE,
+            timeInterval: TimeFrames.DAY,
+            timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+        };
+        const dateBase: Dimension = {
+            ...dimension,
+            type: DimensionType.DATE,
+        };
+        const dateOverDateDay: Dimension = {
+            ...dimension,
+            type: DimensionType.DATE,
+            timeInterval: TimeFrames.DAY,
+            timeIntervalBaseDimensionType: DimensionType.DATE,
+        };
+
+        test('any grain of a TIMESTAMP base is timezone-affected', () => {
+            expect(isItemTimezoneAffected(timestampBase)).toBe(true);
+            expect(isItemTimezoneAffected(timestampHour)).toBe(true);
+            // GLITCH-452: a day-or-coarser trunc of a TIMESTAMP base compiles to
+            // a real DATE but is still shifted server-side, so it IS affected.
+            expect(isItemTimezoneAffected(dateOverTimestampDay)).toBe(true);
+        });
+
+        test('DATE bases are not timezone-affected', () => {
+            expect(isItemTimezoneAffected(dateBase)).toBe(false);
+            expect(isItemTimezoneAffected(dateOverDateDay)).toBe(false);
+        });
+
+        test('skipTimezoneConversion opts out a TIMESTAMP base', () => {
+            const timestampBaseOptOut: Dimension = {
+                ...timestampBase,
+                skipTimezoneConversion: true,
+            };
+            const dateOverTimestampDayOptOut: Dimension = {
+                ...dateOverTimestampDay,
+                skipTimezoneConversion: true,
+            };
+            expect(isItemTimezoneAffected(timestampBaseOptOut)).toBe(false);
+            expect(isItemTimezoneAffected(dateOverTimestampDayOptOut)).toBe(
+                false,
+            );
+        });
+
+        test('non-dimensions classify by their resolved type', () => {
+            const maxMetric: Metric = { ...metric, type: MetricType.MAX };
+            expect(isItemTimezoneAffected(undefined)).toBe(false);
+            expect(isItemTimezoneAffected(dimension)).toBe(false); // STRING
+            expect(isItemTimezoneAffected(metric)).toBe(false); // COUNT
+            expect(isItemTimezoneAffected(maxMetric)).toBe(false);
+        });
+    });
+
+    describe('formatItemValue', () => {
+        test('formatItemValue should return the right format when field is undefined', () => {
+            expect(formatItemValue(undefined, undefined)).toEqual('-');
+            expect(formatItemValue(undefined, null)).toEqual('∅');
+            expect(formatItemValue(undefined, '5')).toEqual('5');
+            expect(formatItemValue(undefined, 5)).toEqual('5');
+        });
+
+        test('formatItemValue should return the right format when field is Dimension', () => {
+            expect(formatItemValue(dimension, undefined)).toEqual('-');
+            expect(formatItemValue(dimension, null)).toEqual('∅');
+            expect(
+                formatItemValue(
+                    { ...dimension, type: DimensionType.STRING },
+                    '5',
+                ),
+            ).toEqual('5');
+            expect(
+                formatItemValue(
+                    { ...dimension, type: DimensionType.NUMBER },
+                    5,
+                ),
+            ).toEqual('5');
+            expect(
+                formatItemValue(
+                    { ...dimension, type: DimensionType.STRING },
+                    132323123,
+                ),
+            ).toEqual('132323123');
+            expect(
+                formatItemValue(
+                    { ...dimension, type: DimensionType.BOOLEAN },
+                    true,
+                ),
+            ).toEqual('True');
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        type: DimensionType.DATE,
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10');
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        type: DimensionType.TIMESTAMP,
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10, 00:00:00:000 (+00:00)');
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        timeInterval: TimeFrames.YEAR_NUM,
+                        type: DimensionType.NUMBER,
+                    },
+                    2021,
+                ),
+            ).toEqual('2021');
+        });
+
+        test('formatItemValue DATE ignores display timezone for DATE-backed dimensions', () => {
+            const value = new Date('2026-03-03T00:00:00.000Z');
+            // DATE base: timezone must be ignored (no day-shift in negative offsets)
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        type: DimensionType.DATE,
+                        timeInterval: TimeFrames.DAY,
+                        timeIntervalBaseDimensionType: DimensionType.DATE,
+                    },
+                    value,
+                    false,
+                    undefined,
+                    'Pacific/Pago_Pago',
+                ),
+            ).toEqual('2026-03-03');
+            // TIMESTAMP base: GLITCH-452 — now a real DATE (calendar value), so the
+            // display timezone no longer applies (no negative-offset roll-back).
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        type: DimensionType.DATE,
+                        timeInterval: TimeFrames.DAY,
+                        timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+                    },
+                    value,
+                    false,
+                    undefined,
+                    'Pacific/Pago_Pago',
+                ),
+            ).toEqual('2026-03-03');
+        });
+
+        test('formatItemValue DATE ignores display timezone for plain DATE columns and DATE metrics', () => {
+            const value = new Date('2026-03-03T00:00:00.000Z');
+            // Plain DATE column (no interval, base undefined) is a calendar
+            // value — a negative-offset zone must NOT roll the day back.
+            expect(
+                formatItemValue(
+                    { ...dimension, type: DimensionType.DATE },
+                    value,
+                    false,
+                    undefined,
+                    'Pacific/Pago_Pago',
+                ),
+            ).toEqual('2026-03-03');
+            // A date-typed metric (MetricType.DATE) is likewise a calendar value.
+            expect(
+                formatItemValue(
+                    { ...metric, type: MetricType.DATE },
+                    value,
+                    false,
+                    undefined,
+                    'Pacific/Pago_Pago',
+                ),
+            ).toEqual('2026-03-03');
+        });
+
+        test('formatItemValue ignores display timezone when skipTimezoneConversion is set', () => {
+            const value = new Date('2026-03-03T01:30:00.000Z');
+            // TIMESTAMP dim with skipTimezoneConversion renders in raw UTC
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        type: DimensionType.TIMESTAMP,
+                        skipTimezoneConversion: true,
+                    },
+                    value,
+                    false,
+                    undefined,
+                    'Pacific/Pago_Pago',
+                ),
+            ).toEqual('2026-03-03, 01:30:00:000 (+00:00)');
+            // DATE-base-TIMESTAMP child also opts out
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        type: DimensionType.DATE,
+                        timeInterval: TimeFrames.DAY,
+                        timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+                        skipTimezoneConversion: true,
+                    },
+                    value,
+                    false,
+                    undefined,
+                    'Pacific/Pago_Pago',
+                ),
+            ).toEqual('2026-03-03');
+            // Sanity: same dim without the marker (default) still shifts
+            expect(
+                formatItemValue(
+                    {
+                        ...dimension,
+                        type: DimensionType.TIMESTAMP,
+                    },
+                    value,
+                    false,
+                    undefined,
+                    'Pacific/Pago_Pago',
+                ),
+            ).toEqual('2026-03-02, 14:30:00:000 (-11:00)');
+        });
+
+        test('shouldShiftItemTimezone respects skipTimezoneConversion', () => {
+            // The function is part of the public formatting surface used by
+            // pivot exports + Google Sheets — opt-out must short-circuit.
+            const tsBase: Dimension = {
+                ...dimension,
+                type: DimensionType.TIMESTAMP,
+            };
+            const tsBaseOptOut: Dimension = {
+                ...tsBase,
+                skipTimezoneConversion: true,
+            };
+            expect(shouldShiftItemTimezone(tsBase)).toBe(true);
+            expect(shouldShiftItemTimezone(tsBaseOptOut)).toBe(false);
+
+            const dateOverTs: Dimension = {
+                ...dimension,
+                type: DimensionType.DATE,
+                timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+            };
+            const dateOverTsOptOut: Dimension = {
+                ...dateOverTs,
+                skipTimezoneConversion: true,
+            };
+            // GLITCH-452: a DATE-over-TIMESTAMP trunc is now a real DATE — it no
+            // longer shifts (only TIMESTAMP instants do).
+            expect(shouldShiftItemTimezone(dateOverTs)).toBe(false);
+            expect(shouldShiftItemTimezone(dateOverTsOptOut)).toBe(false);
+        });
+
+        test('shouldShiftItemTimezone classifies table calcs by type', () => {
+            // Non-field items are keyed off getItemType: a TIMESTAMP table calc
+            // is a real instant (shift), a DATE one is a calendar value (stay).
+            const tsTableCalc = {
+                name: 'ts_tc',
+                displayName: 'ts_tc',
+                sql: '${orders.order_date_day}',
+                type: TableCalculationType.TIMESTAMP,
+            } as TableCalculation;
+            const dateTableCalc = {
+                name: 'date_tc',
+                displayName: 'date_tc',
+                sql: '${orders.order_date_day}',
+                type: TableCalculationType.DATE,
+            } as TableCalculation;
+            expect(shouldShiftItemTimezone(tsTableCalc)).toBe(true);
+            expect(shouldShiftItemTimezone(dateTableCalc)).toBe(false);
+        });
+
+        test('formatItemValue should return the right format when field is Metric', () => {
+            expect(formatItemValue(metric, undefined)).toEqual('-');
+            expect(formatItemValue(metric, null)).toEqual('∅');
+            expect(
+                formatItemValue({ ...metric, type: MetricType.AVERAGE }, 5),
+            ).toEqual('5');
+            expect(
+                formatItemValue({ ...metric, type: MetricType.COUNT }, 5),
+            ).toEqual('5');
+            expect(
+                formatItemValue(
+                    { ...metric, type: MetricType.COUNT_DISTINCT },
+                    5,
+                ),
+            ).toEqual('5');
+            expect(
+                formatItemValue({ ...metric, type: MetricType.SUM }, 5),
+            ).toEqual('5');
+            expect(
+                formatItemValue({ ...metric, type: MetricType.MIN }, 5000),
+            ).toEqual('5,000');
+            expect(
+                formatItemValue({ ...metric, type: MetricType.MAX }, 5000),
+            ).toEqual('5,000');
+            expect(
+                formatItemValue(
+                    { ...metric, type: MetricType.MIN },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10, 00:00:00:000 (+00:00)');
+            expect(
+                formatItemValue(
+                    { ...metric, type: MetricType.MAX },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10, 00:00:00:000 (+00:00)');
+            expect(
+                formatItemValue(
+                    {
+                        ...metric,
+                        type: MetricType.NUMBER,
+                        round: 2,
+                    },
+                    '1.123456123123',
+                ),
+            ).toEqual('1.12');
+            expect(
+                formatItemValue(
+                    {
+                        ...metric,
+                        type: MetricType.NUMBER,
+                        compact: Compact.THOUSANDS,
+                    },
+                    1000,
+                ),
+            ).toEqual('1K');
+        });
+
+        test('formatItemValue MIN/MAX timestamps format in project tz from a Date OR an ISO string (GLITCH-485)', () => {
+            const maxMetric = { ...metric, type: MetricType.MAX };
+            const isoString = '2018-10-31T06:44:22.667Z';
+            const asDate = new Date(isoString);
+            const tz = 'Asia/Tokyo'; // +09:00, no DST
+
+            // Fresh queries deliver a Date (already formatted); cached results
+            // rehydrate from S3 as ISO strings and must format identically —
+            // not fall through and show the raw UTC value.
+            const fromDate = formatItemValue(
+                maxMetric,
+                asDate,
+                false,
+                undefined,
+                tz,
+            );
+            const fromString = formatItemValue(
+                maxMetric,
+                isoString,
+                false,
+                undefined,
+                tz,
+            );
+            expect(fromDate).toEqual('2018-10-31, 15:44:22:667 (+09:00)');
+            expect(fromString).toEqual(fromDate);
+        });
+
+        test('formatItemValue MIN/MAX does not coerce non-timestamp values (GLITCH-485)', () => {
+            const tz = 'Pacific/Pago_Pago'; // -11:00, exposes any wrong shift
+            // Numeric aggregations stay numbers — fresh (number) or cached (string)
+            expect(
+                formatItemValue(
+                    { ...metric, type: MetricType.MAX },
+                    5000,
+                    false,
+                    undefined,
+                    tz,
+                ),
+            ).toEqual('5,000');
+            expect(
+                formatItemValue(
+                    { ...metric, type: MetricType.MIN },
+                    '42',
+                    false,
+                    undefined,
+                    tz,
+                ),
+            ).toEqual('42');
+            // A date-only aggregate is a wall-clock date — never tz-shifted
+            expect(
+                formatItemValue(
+                    { ...metric, type: MetricType.MAX },
+                    '2018-10-31',
+                    false,
+                    undefined,
+                    tz,
+                ),
+            ).toEqual('2018-10-31');
+        });
+
+        describe('formatItemValue MIN/MAX with a known base type', () => {
+            const tz = 'Pacific/Pago_Pago'; // -11:00, exposes any wrong shift
+
+            test('DATE base renders an unshifted calendar date at the base grain', () => {
+                const dayMax: Metric = {
+                    ...metric,
+                    type: MetricType.MAX,
+                    baseDimensionType: DimensionType.DATE,
+                    baseDimensionTimeInterval: TimeFrames.DAY,
+                };
+                const monthMax: Metric = {
+                    ...dayMax,
+                    baseDimensionTimeInterval: TimeFrames.MONTH,
+                };
+                const yearMax: Metric = {
+                    ...dayMax,
+                    baseDimensionTimeInterval: TimeFrames.YEAR,
+                };
+                // Both the fresh Date and the cached midnight-ISO string render
+                // the bare day, unshifted.
+                expect(
+                    formatItemValue(
+                        dayMax,
+                        '2026-03-03T00:00:00.000Z',
+                        false,
+                        undefined,
+                        tz,
+                    ),
+                ).toEqual('2026-03-03');
+                expect(
+                    formatItemValue(
+                        dayMax,
+                        new Date('2026-03-03T00:00:00.000Z'),
+                        false,
+                        undefined,
+                        tz,
+                    ),
+                ).toEqual('2026-03-03');
+                // Coarser grains follow the base dimension's format.
+                expect(
+                    formatItemValue(
+                        monthMax,
+                        '2026-03-01T00:00:00.000Z',
+                        false,
+                        undefined,
+                        tz,
+                    ),
+                ).toEqual('2026-03');
+                expect(
+                    formatItemValue(
+                        yearMax,
+                        '2026-01-01T00:00:00.000Z',
+                        false,
+                        undefined,
+                        tz,
+                    ),
+                ).toEqual('2026');
+            });
+
+            test('TIMESTAMP base still shifts into the project tz (unchanged)', () => {
+                const tsMax: Metric = {
+                    ...metric,
+                    type: MetricType.MAX,
+                    baseDimensionType: DimensionType.TIMESTAMP,
+                };
+                expect(
+                    formatItemValue(
+                        tsMax,
+                        '2018-10-31T06:44:22.667Z',
+                        false,
+                        undefined,
+                        'Asia/Tokyo', // +09:00
+                    ),
+                ).toEqual('2018-10-31, 15:44:22:667 (+09:00)');
+            });
+
+            test('DATE base with a date/timestamp formatOptions still renders the bare date (UI custom metric)', () => {
+                // The UI auto-stamps formatOptions {type: date} on a MAX over a
+                // date dim. Without this fix the ISO value falls through
+                // applyCustomFormat and renders raw. A timestamp formatOptions on a
+                // calendar value is likewise rendered as the bare date.
+                const dateFmt: Metric = {
+                    ...metric,
+                    type: MetricType.MAX,
+                    baseDimensionType: DimensionType.DATE,
+                    baseDimensionTimeInterval: TimeFrames.DAY,
+                    formatOptions: {
+                        type: CustomFormatType.DATE,
+                        timeInterval: TimeFrames.DAY,
+                    },
+                };
+                expect(
+                    formatItemValue(
+                        dateFmt,
+                        '2025-01-15T00:00:00.000Z',
+                        false,
+                        undefined,
+                        tz,
+                    ),
+                ).toEqual('2025-01-15');
+                expect(
+                    formatItemValue(
+                        {
+                            ...dateFmt,
+                            formatOptions: {
+                                type: CustomFormatType.TIMESTAMP,
+                                timeInterval: TimeFrames.RAW,
+                            },
+                        },
+                        '2025-01-15T00:00:00.000Z',
+                        false,
+                        undefined,
+                        tz,
+                    ),
+                ).toEqual('2025-01-15');
+            });
+
+            test('DATE base with a numeric value is NOT rendered as a date (soundness)', () => {
+                const dateMax: Metric = {
+                    ...metric,
+                    type: MetricType.MAX,
+                    baseDimensionType: DimensionType.DATE,
+                };
+                expect(
+                    formatItemValue(dateMax, 5000, false, undefined, tz),
+                ).toEqual('5,000');
+            });
+
+            test('flag off (no timezone) is byte-identical to an unknown base', () => {
+                // With no timezone the DATE-base branch is skipped, so a known
+                // base renders exactly like today's shape-based path.
+                const value = '2026-03-03T00:00:00.000Z';
+                const dateMax: Metric = {
+                    ...metric,
+                    type: MetricType.MAX,
+                    baseDimensionType: DimensionType.DATE,
+                    baseDimensionTimeInterval: TimeFrames.DAY,
+                };
+                const unknownMax: Metric = { ...metric, type: MetricType.MAX };
+                expect(formatItemValue(dateMax, value)).toEqual(
+                    formatItemValue(unknownMax, value),
+                );
+            });
+        });
+
+        test('formatItemValue shifts a custom-format timestamp into the project tz (GLITCH-492)', () => {
+            // A TIMESTAMP field with a custom date format expression must still
+            // render in the project timezone — the expression controls HOW the
+            // value is rendered, not WHICH zone it is rendered in.
+            const tsWithFormat = {
+                ...dimension,
+                type: DimensionType.TIMESTAMP,
+                format: 'yyyy-mm-dd hh:mm:ss',
+            };
+            const value = new Date('2024-01-14T20:00:00.000Z'); // 15:00 in NY (EST)
+
+            expect(
+                formatItemValue(
+                    tsWithFormat,
+                    value,
+                    false,
+                    undefined,
+                    'America/New_York',
+                ),
+            ).toEqual('2024-01-14 15:00:00');
+        });
+
+        test('formatItemValue custom-format timestamp stays UTC when flag is off (GLITCH-492)', () => {
+            // Flag-off orgs receive no timezone (the API sends a null
+            // resolvedTimezone), and an explicit UTC project must also not
+            // shift — output stays bit-identical to the raw value.
+            const tsWithFormat = {
+                ...dimension,
+                type: DimensionType.TIMESTAMP,
+                format: 'yyyy-mm-dd hh:mm:ss',
+            };
+            const value = new Date('2024-01-14T20:00:00.000Z');
+
+            expect(
+                formatItemValue(tsWithFormat, value, false, undefined),
+            ).toEqual('2024-01-14 20:00:00');
+            expect(
+                formatItemValue(tsWithFormat, value, false, undefined, 'UTC'),
+            ).toEqual('2024-01-14 20:00:00');
+        });
+
+        test('formatItemValue shifts a parameterized custom-format timestamp into the project tz (GLITCH-492)', () => {
+            const tsWithFormat = {
+                ...dimension,
+                type: DimensionType.TIMESTAMP,
+                format: '${ld.parameters.style=="long"?"yyyy-mm-dd hh:mm:ss":"yyyy-mm-dd"}',
+            };
+            const value = new Date('2024-01-14T20:00:00.000Z'); // 15:00 in NY (EST)
+
+            expect(
+                formatItemValue(
+                    tsWithFormat,
+                    value,
+                    false,
+                    { style: 'long' },
+                    'America/New_York',
+                ),
+            ).toEqual('2024-01-14 15:00:00');
+        });
+
+        test('formatItemValue custom-format timestamp respects skipTimezoneConversion (GLITCH-492)', () => {
+            const tsWithFormat = {
+                ...dimension,
+                type: DimensionType.TIMESTAMP,
+                skipTimezoneConversion: true,
+                format: 'yyyy-mm-dd hh:mm:ss',
+            };
+            const value = new Date('2024-01-14T20:00:00.000Z');
+
+            expect(
+                formatItemValue(
+                    tsWithFormat,
+                    value,
+                    false,
+                    undefined,
+                    'America/New_York',
+                ),
+            ).toEqual('2024-01-14 20:00:00');
+        });
+
+        test('formatItemValue does not shift a calendar DATE with a CUSTOM format (GLITCH-492)', () => {
+            // A bare calendar date has no instant — applying the project tz
+            // would drag it across midnight (off-by-one in negative offsets).
+            // The CUSTOM-format branch must honour the same calendar guard as
+            // the default DATE render.
+            const dateWithCustom = {
+                ...dimension,
+                type: DimensionType.DATE,
+                formatOptions: {
+                    type: CustomFormatType.CUSTOM,
+                    custom: 'yyyy-mm-dd',
+                },
+            };
+            const value = new Date('2024-01-15T00:00:00.000Z');
+
+            expect(
+                formatItemValue(
+                    dateWithCustom,
+                    value,
+                    false,
+                    undefined,
+                    'America/New_York',
+                ),
+            ).toEqual('2024-01-15');
+        });
+
+        describe('formatItemValue timestamp handling', () => {
+            const mockTimestampField = {
+                type: DimensionType.TIMESTAMP,
+                name: 'test_timestamp',
+                table: 'test',
+                fieldType: FieldType.DIMENSION,
+                label: 'Test Timestamp',
+                sql: 'test.timestamp',
+                tableLabel: 'Test',
+                hidden: false,
+            };
+
+            test('should handle valid timestamp formats', () => {
+                const validTimestamps = [
+                    '2020-08-11T16:44:00Z',
+                    '2020-08-11 16:44:00',
+                    '2020-08-11T16:44:00.123Z',
+                    new Date('2020-08-11T16:44:00Z'),
+                    moment('2020-08-11T16:44:00Z'),
+                ];
+
+                validTimestamps.forEach((timestamp) => {
+                    const result = formatItemValue(
+                        mockTimestampField,
+                        timestamp,
+                    );
+                    expect(result).not.toBe('NaT');
+                    expect(result).not.toContain('Invalid');
+                });
+            });
+
+            test('should return NaT for invalid formats', () => {
+                const invalidTimestamps = [
+                    'invalid-date-string',
+                    '2020-13-45',
+                    '2020-08-11T25:00:00',
+                    '',
+                    'not-a-date',
+                    '2025-07-08 23:59:58.656000 Asia/Bangkok',
+                ];
+
+                invalidTimestamps.forEach((timestamp) => {
+                    const result = formatItemValue(
+                        mockTimestampField,
+                        timestamp,
+                    );
+                    expect(result).toBe('NaT');
+                });
+            });
+        });
+    });
+    describe('additional metric formatting', () => {
+        describe('timezone shifting for MIN/MAX (GLITCH-498)', () => {
+            // MIN/MAX values arrive from query results as ISO datetime
+            // STRINGS (not Date objects), which is the case the explore table
+            // renders. Each must shift into the project timezone like the
+            // underlying dimension does.
+            test('TIMESTAMP format shifts a string value into the timezone', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...additionalMetric,
+                            type: MetricType.MAX,
+                            formatOptions: {
+                                type: CustomFormatType.TIMESTAMP,
+                                timeInterval: TimeFrames.RAW,
+                            },
+                        },
+                        '2025-01-15T17:00:00.000Z',
+                        false,
+                        undefined,
+                        'America/Anchorage', // -09:00 in January
+                    ),
+                ).toEqual('2025-01-15, 08:00:00:000 (-09:00)');
+            });
+
+            test('TIMESTAMP format shifts a Date value into the timezone', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...additionalMetric,
+                            type: MetricType.MIN,
+                            formatOptions: { type: CustomFormatType.TIMESTAMP },
+                        },
+                        new Date('2025-01-15T17:00:00.000Z'),
+                        false,
+                        undefined,
+                        'Asia/Tokyo', // +09:00, no DST
+                    ),
+                ).toEqual('2025-01-16, 02:00:00:000 (+09:00)');
+            });
+
+            test('CUSTOM expression shifts a string value into the timezone', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...additionalMetric,
+                            type: MetricType.MAX,
+                            formatOptions: {
+                                type: CustomFormatType.CUSTOM,
+                                custom: 'yyyy-mm-dd hh:mm:ss',
+                            },
+                        },
+                        '2025-01-15T17:00:00.000Z',
+                        false,
+                        undefined,
+                        'America/Anchorage',
+                    ),
+                ).toEqual('2025-01-15 08:00:00');
+            });
+
+            test('no timezone is bit-identical to pre-fix behaviour (flag-off parity)', () => {
+                // With no timezone the string still hits the valueIsNaN guard
+                // and renders raw, exactly as before this change.
+                expect(
+                    formatItemValue(
+                        {
+                            ...additionalMetric,
+                            type: MetricType.MAX,
+                            formatOptions: {
+                                type: CustomFormatType.TIMESTAMP,
+                                timeInterval: TimeFrames.RAW,
+                            },
+                        },
+                        '2025-01-15T17:00:00.000Z',
+                    ),
+                ).toEqual('2025-01-15T17:00:00.000Z');
+            });
+
+            test('DATE format over a date-only string is not shifted', () => {
+                // The by-value gate leaves a date-only string alone, so a
+                // MIN/MAX over a real DATE column keeps its calendar day.
+                expect(
+                    formatItemValue(
+                        {
+                            ...additionalMetric,
+                            type: MetricType.MAX,
+                            formatOptions: { type: CustomFormatType.DATE },
+                        },
+                        '2021-03-10',
+                        false,
+                        undefined,
+                        'Pacific/Pago_Pago', // -11:00, would roll the day back
+                    ),
+                ).toEqual('2021-03-10');
+            });
+        });
+
+        test('format additional metric with custom format DATE', () => {
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MIN,
+                        formatOptions: { type: CustomFormatType.DATE },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10');
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MAX,
+                        formatOptions: {
+                            type: CustomFormatType.DATE,
+                            timeInterval: TimeFrames.DAY,
+                        },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10');
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MIN,
+                        formatOptions: {
+                            type: CustomFormatType.DATE,
+                            timeInterval: TimeFrames.YEAR,
+                        },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021');
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MAX,
+                        formatOptions: {
+                            type: CustomFormatType.DATE,
+                            timeInterval: TimeFrames.MONTH,
+                        },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03');
+        });
+
+        test('format additional metric with custom format TIMESTAMP', () => {
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MIN,
+                        formatOptions: { type: CustomFormatType.TIMESTAMP },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10, 00:00:00:000 (+00:00)');
+
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MAX,
+                        formatOptions: {
+                            type: CustomFormatType.TIMESTAMP,
+                            timeInterval: TimeFrames.HOUR,
+                        },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10, 00 (+00:00)');
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MIN,
+                        formatOptions: {
+                            type: CustomFormatType.TIMESTAMP,
+                            timeInterval: TimeFrames.MINUTE,
+                        },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10, 00:00 (+00:00)');
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.MAX,
+                        formatOptions: {
+                            type: CustomFormatType.TIMESTAMP,
+                            timeInterval: TimeFrames.SECOND,
+                        },
+                    },
+                    new Date('2021-03-10T00:00:00.000Z'),
+                ),
+            ).toEqual('2021-03-10, 00:00:00 (+00:00)');
+        });
+    });
+
+    describe('format item value', () => {
+        test('formatItemValue should return the right format when field is undefined', () => {
+            expect(formatItemValue(undefined, undefined)).toEqual('-');
+            expect(formatItemValue(undefined, null)).toEqual('∅');
+            expect(formatItemValue(undefined, '5')).toEqual('5');
+            expect(formatItemValue(undefined, 5)).toEqual('5');
+        });
+        test('formatItemValue should return the right format when field is table calculation', () => {
+            expect(formatItemValue(tableCalculation, undefined)).toEqual('-');
+            expect(formatItemValue(tableCalculation, null)).toEqual('∅');
+            expect(formatItemValue(tableCalculation, '5')).toEqual('5');
+            expect(formatItemValue(tableCalculation, 5)).toEqual('5');
+        });
+    });
+
+    describe('format table calculation', () => {
+        test('table calculation with default format', () => {
+            const defaultFormat = {
+                ...tableCalculation,
+                format: { type: CustomFormatType.DEFAULT },
+            };
+            expect(formatItemValue(defaultFormat, undefined)).toEqual('-');
+            expect(formatItemValue(defaultFormat, null)).toEqual('∅');
+            expect(formatItemValue(defaultFormat, '5')).toEqual('5');
+            expect(formatItemValue(defaultFormat, 5)).toEqual('5');
+        });
+        test('table calculation with default format and extra arguments', () => {
+            // This round or separator should not affect default format
+            const withExtraFormat = {
+                ...tableCalculation,
+                format: {
+                    type: CustomFormatType.DEFAULT,
+                    round: 2,
+                    separator: NumberSeparator.COMMA_PERIOD,
+                },
+            };
+            expect(formatItemValue(withExtraFormat, undefined)).toEqual('-');
+            expect(formatItemValue(withExtraFormat, null)).toEqual('∅');
+            expect(formatItemValue(withExtraFormat, '5')).toEqual('5');
+            expect(formatItemValue(withExtraFormat, 5)).toEqual('5');
+        });
+
+        test('table calculation with percent format', () => {
+            const percentFormat = {
+                ...tableCalculation,
+                format: { type: CustomFormatType.PERCENT },
+            };
+            expect(formatItemValue(percentFormat, undefined)).toEqual('-');
+            expect(formatItemValue(percentFormat, null)).toEqual('∅');
+            expect(formatItemValue(percentFormat, '0.05')).toEqual('5%');
+            expect(formatItemValue(percentFormat, 0.05)).toEqual('5%');
+            expect(formatItemValue(percentFormat, 1)).toEqual('100%');
+            expect(formatItemValue(percentFormat, 5)).toEqual('500%');
+            expect(formatItemValue(percentFormat, '0.05123')).toEqual('5.123%');
+        });
+        test('table calculation with percent format and round', () => {
+            const percentFormat = {
+                ...tableCalculation,
+                format: { type: CustomFormatType.PERCENT, round: 1 },
+            };
+            expect(formatItemValue(percentFormat, undefined)).toEqual('-');
+            expect(formatItemValue(percentFormat, null)).toEqual('∅');
+            expect(formatItemValue(percentFormat, '0.05')).toEqual('5.0%');
+            expect(formatItemValue(percentFormat, 0.05)).toEqual('5.0%');
+            expect(formatItemValue(percentFormat, 1)).toEqual('100.0%');
+            expect(formatItemValue(percentFormat, 5)).toEqual('500.0%');
+            expect(formatItemValue(percentFormat, '0.05123')).toEqual('5.1%');
+        });
+        test('table calculation with percent format and number separator', () => {
+            const percentFormat = {
+                ...tableCalculation,
+                format: {
+                    type: CustomFormatType.PERCENT,
+                    round: 2,
+                    separator: NumberSeparator.PERIOD_COMMA,
+                },
+            };
+            expect(formatItemValue(percentFormat, undefined)).toEqual('-');
+            expect(formatItemValue(percentFormat, null)).toEqual('∅');
+            expect(formatItemValue(percentFormat, '0.05')).toEqual('5,00%');
+            expect(formatItemValue(percentFormat, '0.05123')).toEqual('5,12%');
+        });
+
+        test('format number separator', () => {
+            const number = 123456789.12345;
+            expect(
+                formatNumberValue(number, {
+                    type: CustomFormatType.DEFAULT,
+                    round: 0,
+                    separator: NumberSeparator.COMMA_PERIOD,
+                }),
+            ).toEqual('123,456,789');
+            expect(
+                formatNumberValue(number, {
+                    type: CustomFormatType.DEFAULT,
+                    round: 0,
+                    separator: NumberSeparator.PERIOD_COMMA,
+                }),
+            ).toEqual('123.456.789');
+            expect(
+                formatNumberValue(number, {
+                    type: CustomFormatType.DEFAULT,
+                    round: 2,
+                    separator: NumberSeparator.SPACE_PERIOD,
+                }),
+            ).toEqual('123 456 789.12');
+            expect(
+                formatNumberValue(number, {
+                    type: CustomFormatType.DEFAULT,
+                    round: 2,
+                    separator: NumberSeparator.NO_SEPARATOR_PERIOD,
+                }),
+            ).toEqual('123456789.12');
+            expect(
+                formatNumberValue(number, {
+                    type: CustomFormatType.DEFAULT,
+                    round: 2,
+                    separator: NumberSeparator.APOSTROPHE_PERIOD,
+                }),
+            ).toEqual("123'456'789.12");
+        });
+
+        test('available currencies', () => {
+            const symbols = currencies.map((currency) => {
+                const format = Intl.NumberFormat(undefined, {
+                    style: 'currency',
+                    currency,
+                });
+                return format.format(1).replace(' ', ' ');
+            });
+            expect(symbols).toEqual([
+                '$1.00',
+                '€1.00',
+                '£1.00',
+                '¥1',
+                'DKK 1.00',
+                'CHF 1.00',
+                'CA$1.00',
+                'A$1.00',
+                'CN¥1.00',
+                'ARS 1.00',
+                'R$1.00',
+                'CLP 1',
+                'COP 1.00',
+                'CZK 1.00',
+                'HK$1.00',
+                'HUF 1.00',
+                '₹1.00',
+                '₪1.00',
+                '₩1',
+                'MYR 1.00',
+                'MX$1.00',
+                'MAD 1.00',
+                'NZ$1.00',
+                'NOK 1.00',
+                '₱1.00',
+                'PLN 1.00',
+                'RUB 1.00',
+                'SAR 1.00',
+                'SGD 1.00',
+                'ZAR 1.00',
+                'SEK 1.00',
+                'NT$1.00',
+                'THB 1.00',
+                'TRY 1.00',
+                '₫1',
+            ]);
+        });
+        test('convert currencies with default settings', () => {
+            expect(
+                currencies.slice(0, 4).map((currency) =>
+                    applyCustomFormat(12345.1235, {
+                        type: CustomFormatType.CURRENCY,
+                        currency,
+                    }),
+                ),
+            ).toEqual(['$12,345.12', '€12,345.12', '£12,345.12', '¥12,345']);
+
+            // Number as string
+            expect(
+                currencies.slice(0, 4).map((currency) =>
+                    applyCustomFormat('12345.1235', {
+                        type: CustomFormatType.CURRENCY,
+                        currency,
+                    }),
+                ),
+            ).toEqual(['$12,345.12', '€12,345.12', '£12,345.12', '¥12,345']);
+        });
+        test('convert currencies with round', () => {
+            expect(
+                currencies.slice(0, 4).map((currency) =>
+                    applyCustomFormat(12345.1235, {
+                        type: CustomFormatType.CURRENCY,
+                        currency,
+                        round: 3,
+                    }),
+                ),
+            ).toEqual([
+                '$12,345.124',
+                '€12,345.124',
+                '£12,345.124',
+                '¥12,345.124',
+            ]);
+        });
+        test('convert currencies with separator', () => {
+            // Using PERIOD_COMMA changes the position of the currency symbol
+            expect(
+                currencies.slice(0, 4).map((currency) =>
+                    applyCustomFormat(12345.1235, {
+                        type: CustomFormatType.CURRENCY,
+                        currency,
+                        separator: NumberSeparator.PERIOD_COMMA,
+                    }),
+                ),
+            ).toEqual([
+                '12.345,12 $',
+                '12.345,12 €',
+                '12.345,12 £',
+                '12.345 ¥',
+            ]);
+        });
+        test('convert currencies with compact', () => {
+            expect(
+                currencies.slice(0, 4).map((currency) =>
+                    applyCustomFormat(12345.1235, {
+                        type: CustomFormatType.CURRENCY,
+                        currency,
+                        compact: Compact.THOUSANDS,
+                    }),
+                ),
+            ).toEqual(['$12.35K', '€12.35K', '£12.35K', '¥12K']);
+
+            expect(
+                currencies.slice(0, 4).map((currency) =>
+                    applyCustomFormat(123456789.1235, {
+                        type: CustomFormatType.CURRENCY,
+                        currency,
+                        compact: Compact.MILLIONS,
+                        round: 0,
+                    }),
+                ),
+            ).toEqual(['$123M', '€123M', '£123M', '¥123M']);
+        });
+
+        test('convert numbers', () => {
+            expect(
+                applyCustomFormat(12345.56789, {
+                    type: CustomFormatType.NUMBER,
+                }),
+            ).toEqual('12,345.568');
+            expect(
+                applyCustomFormat(12345.1235, {
+                    type: CustomFormatType.NUMBER,
+                    round: 2,
+                    prefix: 'foo ',
+                    suffix: ' bar',
+                    compact: Compact.THOUSANDS,
+                }),
+            ).toEqual('foo 12.35K bar');
+
+            // Number as string
+            expect(
+                applyCustomFormat('12345.1235', {
+                    type: CustomFormatType.NUMBER,
+                    prefix: 'foo ',
+                    suffix: ' bar',
+                }),
+            ).toEqual('foo 12,345.124 bar');
+        });
+
+        test('convert table calculation formats with invalid numbers', () => {
+            // This method should return the original value if the value is not a number
+            const values = [
+                'this is a string',
+                '',
+                undefined,
+                null,
+                true,
+                false,
+            ];
+            const expectedValue = [
+                'this is a string',
+                '',
+                '-',
+                '∅',
+                'true',
+                'false',
+            ];
+            values.map((value, i) =>
+                expect(
+                    applyCustomFormat(value, {
+                        type: CustomFormatType.DEFAULT,
+                    }),
+                ).toEqual(expectedValue[i]),
+            );
+
+            values.map((value, i) =>
+                expect(
+                    applyCustomFormat(value, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.USD,
+                    }),
+                ).toEqual(expectedValue[i]),
+            );
+            values.map((value, i) =>
+                expect(
+                    applyCustomFormat(value, {
+                        type: CustomFormatType.CURRENCY,
+                        currency: Format.USD,
+                        round: 2,
+                        compact: Compact.THOUSANDS,
+                        separator: NumberSeparator.PERIOD_COMMA,
+                    }),
+                ).toEqual(expectedValue[i]),
+            );
+
+            values.map((value, i) =>
+                expect(
+                    applyCustomFormat(value, {
+                        type: CustomFormatType.NUMBER,
+                    }),
+                ).toEqual(expectedValue[i]),
+            );
+            values.map((value, i) =>
+                expect(
+                    applyCustomFormat(value, {
+                        type: CustomFormatType.NUMBER,
+                        prefix: 'foo',
+                        suffix: 'bar',
+                        round: 2,
+                        compact: Compact.THOUSANDS,
+                        separator: NumberSeparator.PERIOD_COMMA,
+                    }),
+                ).toEqual(expectedValue[i]),
+            );
+
+            values.map((value, i) =>
+                expect(
+                    applyCustomFormat(value, {
+                        type: CustomFormatType.PERCENT,
+                    }),
+                ).toEqual(expectedValue[i]),
+            );
+            values.map((value, i) =>
+                expect(
+                    applyCustomFormat(value, {
+                        type: CustomFormatType.PERCENT,
+                        round: 2,
+                        separator: NumberSeparator.PERIOD_COMMA,
+                    }),
+                ).toEqual(expectedValue[i]),
+            );
+        });
+
+        test('formatValueWithExpression handles binary byte units correctly', () => {
+            // Test KIBIBYTES (should divide by 1024)
+            const kibibyteExpression = convertCustomFormatToFormatExpression({
+                type: CustomFormatType.BYTES_IEC,
+                compact: Compact.KIBIBYTES,
+            });
+            expect(kibibyteExpression).toEqual('#,##0.00"KiB"');
+            expect(
+                formatValueWithExpression(kibibyteExpression!, 2048),
+            ).toEqual('2.00KiB');
+
+            // Test MEBIBYTES (should divide by 1048576)
+            const mebibyteExpression = convertCustomFormatToFormatExpression({
+                type: CustomFormatType.BYTES_IEC,
+                compact: Compact.MEBIBYTES,
+            });
+            expect(mebibyteExpression).toEqual('#,##0.00"MiB"');
+            expect(
+                formatValueWithExpression(mebibyteExpression!, 2097152),
+            ).toEqual('2.00MiB');
+
+            // Test with rounding
+            const roundedExpression = convertCustomFormatToFormatExpression({
+                type: CustomFormatType.BYTES_IEC,
+                compact: Compact.KIBIBYTES,
+                round: 1,
+            });
+            expect(roundedExpression).toEqual('#,##0.0"KiB"');
+            expect(formatValueWithExpression(roundedExpression!, 1536)).toEqual(
+                '1.5KiB',
+            );
+        });
+
+        test('backend scenario: formatOptions converted to format expression', () => {
+            // This simulates the exact scenario from the backend PR
+            // where formatOptions are converted to format expressions
+            const formatOptions = {
+                type: CustomFormatType.BYTES_IEC,
+                compact: Compact.KIBIBYTES,
+            };
+
+            // Backend calls convertCustomFormatToFormatExpression
+            const formatExpression =
+                convertCustomFormatToFormatExpression(formatOptions);
+            expect(formatExpression).toEqual('#,##0.00"KiB"');
+
+            // Mock metric with format expression set by backend
+            const mockMetric = {
+                fieldType: FieldType.METRIC,
+                type: MetricType.NUMBER,
+                name: 'test_metric',
+                label: 'Test Metric',
+                table: 'test_table',
+                tableLabel: 'Test Table',
+                sql: 'test_sql',
+                hidden: false,
+                // Backend sets format expression instead of formatOptions
+                format: formatExpression || undefined,
+            } as const;
+
+            // Frontend uses formatItemValue which should call formatValueWithExpression
+            const result = formatItemValue(mockMetric, 2048);
+            expect(result).toEqual('2.00KiB'); // Should be correctly divided by 1024
+
+            // Test larger values
+            expect(formatItemValue(mockMetric, 1024)).toEqual('1.00KiB');
+            expect(formatItemValue(mockMetric, 3072)).toEqual('3.00KiB');
+        });
+
+        test('formatValueWithExpression ignores the incidental runtime timezone for date expressions (#19759)', () => {
+            const previousTz = process.env.TZ;
+            process.env.TZ = 'America/New_York';
+
+            try {
+                const value = new Date('2024-11-01T00:00:00.000Z');
+
+                // Even when the host runtime is non-UTC, a date expression
+                // with no project timezone should render the raw UTC wall-clock
+                // rather than drifting into the machine-local zone.
+                expect(
+                    formatValueWithExpression('d mmm yyyy hh:mm:ss', value),
+                ).toEqual('1 Nov 2024 00:00:00');
+            } finally {
+                if (previousTz === undefined) {
+                    delete process.env.TZ;
+                } else {
+                    process.env.TZ = previousTz;
+                }
+            }
+        });
+    });
+
+    describe('isMomentInput', () => {
+        test('should return true for moment object', () => {
+            expect(isMomentInput(moment())).toBe(true);
+        });
+
+        test('should return true for dayjs object', () => {
+            expect(isMomentInput(dayjs())).toBe(true);
+        });
+
+        test('should return true for dates', () => {
+            expect(isMomentInput(new Date())).toBe(true);
+        });
+
+        test('should return true for strings', () => {
+            expect(isMomentInput('2021-03-10')).toBe(true);
+        });
+
+        test('should return false for non-dates-strings-moment-dayjs types', () => {
+            expect(isMomentInput(undefined)).toBe(false);
+            expect(isMomentInput(null)).toBe(false);
+        });
+    });
+
+    describe('convertCustomFormatToFormatExpression', () => {
+        test('should convert format object to expression', () => {
+            const customFormats: CustomFormat[] = [
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.JPY, // test JPY because it has no decimal
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.DKK, // test DKK because it has prefix instead of symbol
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    round: 0, // test with no round
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    round: 4, // test with extra round
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    compact: Compact.THOUSANDS, // test with compact
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    separator: NumberSeparator.COMMA_PERIOD, // test with separator
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    separator: NumberSeparator.NO_SEPARATOR_PERIOD, // test with no separator
+                },
+                {
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    // test with multiple options
+                    compact: Compact.THOUSANDS,
+                    round: 3,
+                    separator: NumberSeparator.NO_SEPARATOR_PERIOD,
+                },
+                {
+                    type: CustomFormatType.PERCENT,
+                },
+                {
+                    type: CustomFormatType.PERCENT,
+                    round: 0, // test with no round
+                },
+                {
+                    type: CustomFormatType.PERCENT,
+                    round: 3, // test with round
+                },
+                {
+                    type: CustomFormatType.PERCENT,
+                    separator: NumberSeparator.COMMA_PERIOD, // test with separator
+                },
+                {
+                    type: CustomFormatType.NUMBER,
+                },
+                {
+                    type: CustomFormatType.NUMBER,
+                    round: 0, // test with no round
+                },
+                {
+                    type: CustomFormatType.NUMBER,
+                    round: 3, // test with round
+                },
+                {
+                    type: CustomFormatType.NUMBER,
+                    prefix: 'prefix', // test with prefix
+                },
+                {
+                    type: CustomFormatType.NUMBER,
+                    suffix: 'suffix', // test with suffix
+                },
+                {
+                    type: CustomFormatType.NUMBER,
+                    // test with multiple options
+                    prefix: 'prefix',
+                    compact: Compact.THOUSANDS,
+                    round: 3,
+                    separator: NumberSeparator.NO_SEPARATOR_PERIOD,
+                    suffix: 'suffix',
+                },
+            ];
+            customFormats.forEach((format) => {
+                const value = 12345.1235;
+                const formatExpression =
+                    convertCustomFormatToFormatExpression(format);
+                // Check if the format expression was generated
+                expect(formatExpression).not.toBe(null);
+
+                const formattedValueWithCustomFormat = applyCustomFormat(
+                    value,
+                    format,
+                );
+                const formattedValueWithFormatExpression =
+                    formatValueWithExpression(formatExpression!, value);
+
+                // Check if the formatted value is the same
+                expect(formattedValueWithFormatExpression).toEqual(
+                    formattedValueWithCustomFormat,
+                );
+            });
+        });
+
+        test('should not convert dynamic auto compact to a static format expression', () => {
+            expect(
+                convertCustomFormatToFormatExpression({
+                    type: CustomFormatType.NUMBER,
+                    compact: Compact.AUTO,
+                }),
+            ).toBeNull();
+
+            expect(
+                convertCustomFormatToFormatExpression({
+                    type: CustomFormatType.CURRENCY,
+                    currency: Format.USD,
+                    compact: Compact.AUTO,
+                }),
+            ).toBeNull();
+        });
+    });
+
+    describe('applyDefaultFormatting', () => {
+        it('should handle boolean values', () => {
+            expect(applyDefaultFormat(true)).toBe('true');
+            expect(applyDefaultFormat(false)).toBe('false');
+        });
+        it('should handle falsey values', () => {
+            expect(applyDefaultFormat(undefined)).toBe('-');
+            expect(applyDefaultFormat(null)).toBe('∅');
+            expect(applyDefaultFormat(0)).toBe('0');
+            expect(applyDefaultFormat('')).toBe('');
+        });
+        it('should handle strings', () => {
+            expect(applyDefaultFormat('foo')).toBe('foo');
+        });
+        it('should handle numbers', () => {
+            expect(applyDefaultFormat(1234567)).toBe('1,234,567');
+            expect(applyDefaultFormat(1234)).toBe('1,234');
+            expect(applyDefaultFormat(-1234)).toBe('-1,234');
+        });
+    });
+
+    describe('formatItemValue with parameters', () => {
+        describe('conditional format expressions with ternary operators', () => {
+            it('should format currency based on parameter value - USD', () => {
+                const metricWithConditionalFormat = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${ld.parameters.currency=="USD"?"$":"€"}0,0.00',
+                };
+                const parameters = { currency: 'USD' };
+
+                expect(
+                    formatItemValue(
+                        metricWithConditionalFormat,
+                        1234.56,
+                        false,
+                        parameters,
+                    ),
+                ).toBe('$1,234.56');
+            });
+
+            it('should format currency based on parameter value - EUR', () => {
+                const metricWithConditionalFormat = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${ld.parameters.currency=="USD"?"$":"€"}0,0.00',
+                };
+                const parameters = { currency: 'EUR' };
+
+                expect(
+                    formatItemValue(
+                        metricWithConditionalFormat,
+                        1234.56,
+                        false,
+                        parameters,
+                    ),
+                ).toBe('€1,234.56');
+            });
+
+            it('should handle simple currency parameter substitution', () => {
+                const metricWithSimpleFormat = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${ld.parameters.symbol}0,0.00',
+                };
+
+                expect(
+                    formatItemValue(metricWithSimpleFormat, 1234.56, false, {
+                        symbol: '£',
+                    }),
+                ).toBe('£1,234.56');
+
+                expect(
+                    formatItemValue(metricWithSimpleFormat, 1234.56, false, {
+                        symbol: '¥',
+                    }),
+                ).toBe('¥1,234.56');
+            });
+
+            it('should fall back to default formatting when parameters are not provided', () => {
+                const metricWithConditionalFormat = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${ld.parameters.currency=="USD"?"$":"€"}0,0.00',
+                };
+
+                // Without parameters, should fall back to default number formatting
+                expect(
+                    formatItemValue(
+                        metricWithConditionalFormat,
+                        1234.56,
+                        false,
+                        undefined,
+                    ),
+                ).toBe('1,234.56');
+            });
+
+            it('should handle conditional rounding precision', () => {
+                const metricWithConditionalFormat = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${ld.parameters.precision=="high"?"$":"$"}0,0${ld.parameters.precision=="high"?".00":""}',
+                };
+
+                expect(
+                    formatItemValue(
+                        metricWithConditionalFormat,
+                        1234.567,
+                        false,
+                        { precision: 'high' },
+                    ),
+                ).toBe('$1,234.57');
+
+                expect(
+                    formatItemValue(
+                        metricWithConditionalFormat,
+                        1234.567,
+                        false,
+                        { precision: 'low' },
+                    ),
+                ).toBe('$1,235');
+            });
+
+            it('should work with both ld.parameters and lightdash.parameters prefixes', () => {
+                const metricWithLdPrefix = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${ld.parameters.symbol}0,0.00',
+                };
+
+                const metricWithLightdashPrefix = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${lightdash.parameters.symbol}0,0.00',
+                };
+
+                expect(
+                    formatItemValue(metricWithLdPrefix, 1234.56, false, {
+                        symbol: '$',
+                    }),
+                ).toBe('$1,234.56');
+
+                expect(
+                    formatItemValue(metricWithLightdashPrefix, 1234.56, false, {
+                        symbol: '€',
+                    }),
+                ).toBe('€1,234.56');
+            });
+
+            it('should handle different currency symbols', () => {
+                const metricWithFormat = {
+                    ...metric,
+                    type: MetricType.NUMBER,
+                    format: '${ld.parameters.symbol}0,0.00',
+                };
+
+                expect(
+                    formatItemValue(metricWithFormat, 1000.5, false, {
+                        symbol: '$',
+                    }),
+                ).toBe('$1,000.50');
+
+                expect(
+                    formatItemValue(metricWithFormat, 1000.5, false, {
+                        symbol: '€',
+                    }),
+                ).toBe('€1,000.50');
+
+                expect(
+                    formatItemValue(metricWithFormat, 1000.5, false, {
+                        symbol: '£',
+                    }),
+                ).toBe('£1,000.50');
+            });
+        });
+    });
+
+    describe('timezone-aware formatting', () => {
+        const utcTimestamp = '2020-04-04T02:00:00.000Z';
+
+        describe('formatDate', () => {
+            test('existing behavior unchanged when no timezone', () => {
+                const withTrue = formatDate(utcTimestamp, TimeFrames.DAY, true);
+                const withFalse = formatDate(
+                    utcTimestamp,
+                    TimeFrames.DAY,
+                    false,
+                );
+                const withDefault = formatDate(utcTimestamp, TimeFrames.DAY);
+                expect(withTrue).toBe('2020-04-04');
+                expect(withFalse).toBe(withDefault);
+            });
+
+            test('shifts UTC instant into project TZ for positive offsets (Tokyo)', () => {
+                // Tokyo midnight Jan 14 = UTC Jan 13 15:00
+                const tokyoMidnight = '2024-01-13T15:00:00.000Z';
+                expect(
+                    formatDate(
+                        tokyoMidnight,
+                        TimeFrames.DAY,
+                        false,
+                        'Asia/Tokyo',
+                    ),
+                ).toBe('2024-01-14');
+            });
+
+            test('shifts UTC instant into project TZ for negative offsets (Pago_Pago)', () => {
+                // Pago_Pago midnight Jan 14 = UTC Jan 14 11:00
+                const ppMidnight = '2024-01-14T11:00:00.000Z';
+                expect(
+                    formatDate(
+                        ppMidnight,
+                        TimeFrames.DAY,
+                        false,
+                        'Pacific/Pago_Pago',
+                    ),
+                ).toBe('2024-01-14');
+            });
+
+            test('UTC project TZ is a no-op', () => {
+                const utcMidnight = '2024-01-14T00:00:00.000Z';
+                expect(
+                    formatDate(utcMidnight, TimeFrames.DAY, false, 'UTC'),
+                ).toBe('2024-01-14');
+            });
+
+            test('timezone takes precedence over convertToUTC', () => {
+                expect(
+                    formatDate(
+                        utcTimestamp,
+                        TimeFrames.DAY,
+                        true,
+                        'America/New_York',
+                    ),
+                ).toBe('2020-04-03');
+            });
+
+            test('year boundary falls on different years in Tokyo vs Pago_Pago', () => {
+                // Jan 1 00:00 UTC = Tokyo Jan 1 09:00 (2024), PP Dec 31 13:00 (2023)
+                const yearBoundary = '2024-01-01T00:00:00.000Z';
+                expect(
+                    formatDate(
+                        yearBoundary,
+                        TimeFrames.YEAR,
+                        false,
+                        'Asia/Tokyo',
+                    ),
+                ).toBe('2024');
+                expect(
+                    formatDate(
+                        yearBoundary,
+                        TimeFrames.YEAR,
+                        false,
+                        'Pacific/Pago_Pago',
+                    ),
+                ).toBe('2023');
+            });
+
+            test('month boundary shifts with positive offset (Tokyo)', () => {
+                // Tokyo Feb 1 00:00 = UTC Jan 31 15:00
+                const tokyoMonthBoundary = '2024-01-31T15:00:00.000Z';
+                expect(
+                    formatDate(
+                        tokyoMonthBoundary,
+                        TimeFrames.MONTH,
+                        false,
+                        'Asia/Tokyo',
+                    ),
+                ).toBe('2024-02');
+            });
+
+            test('returns NaT for invalid input', () => {
+                expect(
+                    formatDate(
+                        'not a date',
+                        TimeFrames.DAY,
+                        false,
+                        'Asia/Tokyo',
+                    ),
+                ).toBe('NaT');
+            });
+        });
+
+        describe('formatTimestamp', () => {
+            test('formats timestamp in project timezone', () => {
+                const result = formatTimestamp(
+                    utcTimestamp,
+                    TimeFrames.SECOND,
+                    false,
+                    'America/New_York',
+                );
+                expect(result).toBe('2020-04-03, 22:00:00 (-04:00)');
+            });
+
+            test('formats timestamp with correct offset in MILLISECOND interval', () => {
+                const result = formatTimestamp(
+                    utcTimestamp,
+                    TimeFrames.MILLISECOND,
+                    false,
+                    'America/New_York',
+                );
+                expect(result).toContain('2020-04-03, 22:00:00:000');
+                expect(result).toContain('-04:00');
+            });
+
+            test('existing behavior unchanged when no timezone', () => {
+                const withTrue = formatTimestamp(
+                    utcTimestamp,
+                    TimeFrames.MILLISECOND,
+                    true,
+                );
+                expect(withTrue).toBe('2020-04-04, 02:00:00:000 (+00:00)');
+            });
+        });
+
+        describe('formatItemValue uniform timezone shift', () => {
+            const tsBase = {
+                ...dimension,
+                type: DimensionType.TIMESTAMP,
+            };
+
+            test('truncated HOUR shifts into project TZ (negative offset)', () => {
+                // Pago_Pago 15:00 Jan 14 = UTC Jan 15 02:00
+                const value = new Date('2024-01-15T02:00:00.000Z');
+                expect(
+                    formatItemValue(
+                        { ...tsBase, timeInterval: TimeFrames.HOUR },
+                        value,
+                        false,
+                        undefined,
+                        'Pacific/Pago_Pago',
+                    ),
+                ).toBe('2024-01-14, 15 (-11:00)');
+            });
+
+            test('truncated HOUR shifts into project TZ (positive offset)', () => {
+                // Tokyo 11:00 Jan 15 = UTC Jan 15 02:00
+                const value = new Date('2024-01-15T02:00:00.000Z');
+                expect(
+                    formatItemValue(
+                        { ...tsBase, timeInterval: TimeFrames.HOUR },
+                        value,
+                        false,
+                        undefined,
+                        'Asia/Tokyo',
+                    ),
+                ).toBe('2024-01-15, 11 (+09:00)');
+            });
+
+            test('RAW TIMESTAMP shifts into project TZ', () => {
+                const value = new Date('2024-01-15T02:00:00.000Z');
+                expect(
+                    formatItemValue(
+                        { ...tsBase, timeInterval: TimeFrames.RAW },
+                        value,
+                        false,
+                        undefined,
+                        'Pacific/Pago_Pago',
+                    ),
+                ).toContain('(-11:00)');
+            });
+
+            test('DATE DAY over TIMESTAMP base is a calendar value — renders as-is, no shift (GLITCH-452)', () => {
+                // A day-grain truncation now compiles to a real DATE (the
+                // project-local calendar day), so it renders as-is regardless of
+                // the project timezone — no midnight-instant shift.
+                const value = new Date('2024-01-14T00:00:00.000Z');
+                expect(
+                    formatItemValue(
+                        {
+                            ...dimension,
+                            type: DimensionType.DATE,
+                            timeInterval: TimeFrames.DAY,
+                            timeIntervalBaseDimensionType:
+                                DimensionType.TIMESTAMP,
+                        },
+                        value,
+                        false,
+                        undefined,
+                        'Asia/Tokyo',
+                    ),
+                ).toBe('2024-01-14');
+            });
+
+            test('no timezone is byte-identical to default', () => {
+                const value = new Date('2024-01-15T02:00:00.000Z');
+                const hourItem = {
+                    ...tsBase,
+                    timeInterval: TimeFrames.HOUR,
+                };
+                expect(formatItemValue(hourItem, value)).toBe(
+                    formatItemValue(
+                        hourItem,
+                        value,
+                        undefined,
+                        undefined,
+                        undefined,
+                    ),
+                );
+            });
+        });
+    });
+
+    describe('toIsoWithProjectOffset', () => {
+        const tz = 'Pacific/Pago_Pago'; // UTC-11, no DST
+
+        test('returns undefined when timezone is unset', () => {
+            expect(
+                toIsoWithProjectOffset('2024-01-15T02:00:00.000Z', undefined),
+            ).toBeUndefined();
+        });
+
+        test('returns undefined when timezone is UTC (no-op short-circuit)', () => {
+            expect(
+                toIsoWithProjectOffset('2024-01-15T02:00:00.000Z', 'UTC'),
+            ).toBeUndefined();
+        });
+
+        test('shifts a UTC ISO string into project offset', () => {
+            expect(toIsoWithProjectOffset('2024-01-15T02:00:00.000Z', tz)).toBe(
+                '2024-01-14T15:00:00.000-11:00',
+            );
+        });
+
+        test('always emits millis even when source had none', () => {
+            expect(toIsoWithProjectOffset('2024-01-15T02:00:00Z', tz)).toBe(
+                '2024-01-14T15:00:00.000-11:00',
+            );
+        });
+
+        test('accepts Date input', () => {
+            expect(
+                toIsoWithProjectOffset(
+                    new Date('2024-01-15T02:00:00.000Z'),
+                    tz,
+                ),
+            ).toBe('2024-01-14T15:00:00.000-11:00');
+        });
+
+        test('accepts numeric epoch ms', () => {
+            const epoch = Date.UTC(2024, 0, 15, 2, 0, 0, 0);
+            expect(toIsoWithProjectOffset(epoch, tz)).toBe(
+                '2024-01-14T15:00:00.000-11:00',
+            );
+        });
+
+        test('returns undefined for null/undefined/non-instant inputs', () => {
+            expect(toIsoWithProjectOffset(null, tz)).toBeUndefined();
+            expect(toIsoWithProjectOffset(undefined, tz)).toBeUndefined();
+            expect(toIsoWithProjectOffset({}, tz)).toBeUndefined();
+            expect(toIsoWithProjectOffset(['a'], tz)).toBeUndefined();
+        });
+
+        test('returns undefined for unparseable strings', () => {
+            expect(
+                toIsoWithProjectOffset('not-a-timestamp', tz),
+            ).toBeUndefined();
+        });
+
+        test('honors positive-offset zones (DST-aware via moment-timezone)', () => {
+            // Asia/Karachi is UTC+5 year-round, so 02:00 UTC -> 07:00 +05:00
+            expect(
+                toIsoWithProjectOffset(
+                    '2024-01-15T02:00:00.000Z',
+                    'Asia/Karachi',
+                ),
+            ).toBe('2024-01-15T07:00:00.000+05:00');
+        });
+    });
+
+    describe('formatTemporalCellForSpreadsheet', () => {
+        const tz = 'Pacific/Pago_Pago'; // UTC-11
+        const tsField = {
+            ...dimension,
+            type: DimensionType.TIMESTAMP,
+            name: 'event_timestamp',
+        };
+        const dateBaseTsField = {
+            ...dimension,
+            type: DimensionType.DATE,
+            name: 'event_timestamp_day',
+            timeIntervalBaseDimensionType: DimensionType.TIMESTAMP,
+        };
+        const calendarDateField = {
+            ...dimension,
+            type: DimensionType.DATE,
+            name: 'order_date',
+        };
+
+        test('TIMESTAMP shifts into project tz with millis', () => {
+            expect(
+                formatTemporalCellForSpreadsheet(
+                    tsField,
+                    '2024-01-15T18:00:00.000Z',
+                    tz,
+                ),
+            ).toBe('2024-01-15 07:00:00.000');
+        });
+
+        test('TIMESTAMP without timezone formats wall-clock as-is', () => {
+            expect(
+                formatTemporalCellForSpreadsheet(
+                    tsField,
+                    '2024-01-15T18:00:00.000Z',
+                    undefined,
+                ),
+            ).toBe('2024-01-15 18:00:00.000');
+        });
+
+        test('DATE-base-TS shifts into project tz', () => {
+            expect(
+                formatTemporalCellForSpreadsheet(
+                    dateBaseTsField,
+                    '2024-01-15T11:00:00.000Z',
+                    tz,
+                ),
+            ).toBe('2024-01-15');
+        });
+
+        test('calendar DATE is not shifted even when tz is set', () => {
+            expect(
+                formatTemporalCellForSpreadsheet(
+                    calendarDateField,
+                    '2024-01-15',
+                    tz,
+                ),
+            ).toBe('2024-01-15');
+        });
+
+        test('returns undefined for non-temporal fields', () => {
+            expect(
+                formatTemporalCellForSpreadsheet(dimension, 'foo', tz),
+            ).toBeUndefined();
+            expect(
+                formatTemporalCellForSpreadsheet(metric, 42, tz),
+            ).toBeUndefined();
+        });
+
+        test('returns undefined for null / empty raw values', () => {
+            expect(
+                formatTemporalCellForSpreadsheet(tsField, null, tz),
+            ).toBeUndefined();
+            expect(
+                formatTemporalCellForSpreadsheet(tsField, undefined, tz),
+            ).toBeUndefined();
+            expect(
+                formatTemporalCellForSpreadsheet(tsField, '', tz),
+            ).toBeUndefined();
+        });
+
+        test('accepts Date input', () => {
+            expect(
+                formatTemporalCellForSpreadsheet(
+                    tsField,
+                    new Date('2024-01-15T18:00:00.000Z'),
+                    tz,
+                ),
+            ).toBe('2024-01-15 07:00:00.000');
+        });
+    });
+
+    describe('field-level number separator (PROD-7558)', () => {
+        const big = 1234567.5;
+
+        describe('ECMA-376 format expression respects the separator', () => {
+            const ecma = {
+                ...metric,
+                type: MetricType.NUMBER,
+                format: '#,##0.00',
+            };
+
+            test('no separator is byte-identical to the default (US) output', () => {
+                expect(formatItemValue(ecma, big)).toEqual('1,234,567.50');
+                expect(
+                    formatItemValue(
+                        { ...ecma, separator: NumberSeparator.DEFAULT },
+                        big,
+                    ),
+                ).toEqual('1,234,567.50');
+                expect(
+                    formatItemValue(
+                        { ...ecma, separator: NumberSeparator.COMMA_PERIOD },
+                        big,
+                    ),
+                ).toEqual('1,234,567.50');
+            });
+
+            test('period-comma (European)', () => {
+                expect(
+                    formatItemValue(
+                        { ...ecma, separator: NumberSeparator.PERIOD_COMMA },
+                        big,
+                    ),
+                ).toEqual('1.234.567,50');
+            });
+
+            test('space-period (French-ish)', () => {
+                expect(
+                    formatItemValue(
+                        { ...ecma, separator: NumberSeparator.SPACE_PERIOD },
+                        big,
+                    ),
+                ).toEqual('1 234 567.50');
+            });
+
+            test('no separator', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...ecma,
+                            separator: NumberSeparator.NO_SEPARATOR_PERIOD,
+                        },
+                        big,
+                    ),
+                ).toEqual('1234567.50');
+            });
+
+            test('apostrophe-period (Swiss)', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...ecma,
+                            separator: NumberSeparator.APOSTROPHE_PERIOD,
+                        },
+                        big,
+                    ),
+                ).toEqual("1'234'567.50");
+            });
+
+            test('currency expression localises symbol-prefixed values', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...metric,
+                            type: MetricType.NUMBER,
+                            format: '[$€]#,##0.00',
+                            separator: NumberSeparator.PERIOD_COMMA,
+                        },
+                        big,
+                    ),
+                ).toEqual('€1.234.567,50');
+            });
+
+            test('parameterised format expression localises too', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...metric,
+                            type: MetricType.NUMBER,
+                            format: '${ld.parameters.symbol}0,0.00',
+                            separator: NumberSeparator.PERIOD_COMMA,
+                        },
+                        1234.56,
+                        false,
+                        { symbol: '€' },
+                    ),
+                ).toEqual('€1.234,56');
+            });
+        });
+
+        describe('legacy + structured paths pick up the field separator', () => {
+            test('legacy format enum (the documented workaround)', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...metric,
+                            type: MetricType.NUMBER,
+                            format: Format.EUR,
+                            separator: NumberSeparator.PERIOD_COMMA,
+                        },
+                        12345.1235,
+                    ),
+                ).toEqual('12.345,12 €');
+            });
+
+            test('formatOptions without a separator inherits the field separator', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...metric,
+                            type: MetricType.NUMBER,
+                            formatOptions: {
+                                type: CustomFormatType.NUMBER,
+                                round: 2,
+                            },
+                            separator: NumberSeparator.PERIOD_COMMA,
+                        },
+                        big,
+                    ),
+                ).toEqual('1.234.567,50');
+            });
+
+            test('formatOptions separator wins over the field separator', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...metric,
+                            type: MetricType.NUMBER,
+                            formatOptions: {
+                                type: CustomFormatType.NUMBER,
+                                round: 2,
+                                separator: NumberSeparator.COMMA_PERIOD,
+                            },
+                            separator: NumberSeparator.PERIOD_COMMA,
+                        },
+                        big,
+                    ),
+                ).toEqual('1,234,567.50');
+            });
+
+            test('CUSTOM formatOptions expression respects the field separator', () => {
+                expect(
+                    formatItemValue(
+                        {
+                            ...metric,
+                            type: MetricType.NUMBER,
+                            formatOptions: {
+                                type: CustomFormatType.CUSTOM,
+                                custom: '#,##0.00',
+                            },
+                            separator: NumberSeparator.PERIOD_COMMA,
+                        },
+                        big,
+                    ),
+                ).toEqual('1.234.567,50');
+            });
+        });
+
+        test('AdditionalMetric ECMA expression respects the separator', () => {
+            expect(
+                formatItemValue(
+                    {
+                        ...additionalMetric,
+                        type: MetricType.NUMBER,
+                        format: '#,##0.00',
+                        separator: NumberSeparator.PERIOD_COMMA,
+                    },
+                    big,
+                ),
+            ).toEqual('1.234.567,50');
+        });
+
+        describe('getEffectiveSeparator', () => {
+            test('reads the field-level separator', () => {
+                expect(
+                    getEffectiveSeparator({
+                        ...metric,
+                        separator: NumberSeparator.PERIOD_COMMA,
+                    }),
+                ).toEqual(NumberSeparator.PERIOD_COMMA);
+            });
+
+            test('formatOptions separator takes precedence', () => {
+                expect(
+                    getEffectiveSeparator({
+                        ...metric,
+                        separator: NumberSeparator.PERIOD_COMMA,
+                        formatOptions: {
+                            type: CustomFormatType.NUMBER,
+                            separator: NumberSeparator.SPACE_PERIOD,
+                        },
+                    }),
+                ).toEqual(NumberSeparator.SPACE_PERIOD);
+            });
+
+            test('reads a table calculation format separator', () => {
+                expect(
+                    getEffectiveSeparator({
+                        ...tableCalculation,
+                        format: {
+                            type: CustomFormatType.NUMBER,
+                            separator: NumberSeparator.NO_SEPARATOR_PERIOD,
+                        },
+                    }),
+                ).toEqual(NumberSeparator.NO_SEPARATOR_PERIOD);
+            });
+
+            test('returns undefined when nothing sets one', () => {
+                expect(getEffectiveSeparator(metric)).toBeUndefined();
+                expect(getEffectiveSeparator(undefined)).toBeUndefined();
+            });
+        });
+
+        describe('getFormatExpressionLocale', () => {
+            // Render paths that call formatValueWithExpression directly (e.g.
+            // chart series formatters) rely on this to localise ECMA-376
+            // expressions the same way formatItemValue does.
+            test('derives a numfmt locale from a non-default separator', () => {
+                const locale = getFormatExpressionLocale({
+                    ...metric,
+                    separator: NumberSeparator.PERIOD_COMMA,
+                });
+                expect(locale).toBeDefined();
+                // The derived locale must actually flip the separators on an
+                // ECMA-376 currency expression (the bug was passing undefined,
+                // which silently rendered US separators on charts).
+                expect(
+                    formatValueWithExpression('[$€]#,##0.00', 1234.56, locale),
+                ).toEqual('€1.234,56');
+            });
+
+            test('returns undefined for the default/US separator', () => {
+                expect(
+                    getFormatExpressionLocale({
+                        ...metric,
+                        separator: NumberSeparator.COMMA_PERIOD,
+                    }),
+                ).toBeUndefined();
+                expect(getFormatExpressionLocale(metric)).toBeUndefined();
+                expect(getFormatExpressionLocale(undefined)).toBeUndefined();
+            });
+        });
+    });
+
+    describe('getFieldFormatOverrideProps', () => {
+        const numericDimension: Dimension = {
+            ...dimension,
+            type: DimensionType.NUMBER,
+        };
+
+        test('encodes a non-dynamic override as a format expression, no formatOptions', () => {
+            const props = getFieldFormatOverrideProps({
+                type: CustomFormatType.NUMBER,
+                compact: Compact.THOUSANDS,
+            });
+            expect(props.format).toEqual('#,##0.###,"K"');
+            expect(props.formatOptions).toBeUndefined();
+        });
+
+        test('preserves structured formatOptions for dynamic AUTO compact (no expression form)', () => {
+            const formatOptions: CustomFormat = {
+                type: CustomFormatType.NUMBER,
+                compact: Compact.AUTO,
+            };
+            // AUTO has no ECMA-376 representation, so the expression must be
+            // cleared and the structured options carried through instead.
+            expect(
+                convertCustomFormatToFormatExpression(formatOptions),
+            ).toBeNull();
+            const props = getFieldFormatOverrideProps(formatOptions);
+            expect(props.format).toBeUndefined();
+            expect(props.formatOptions).toEqual(formatOptions);
+        });
+
+        test('preserves structured formatOptions for dynamic AUTO compact on CURRENCY too', () => {
+            const formatOptions: CustomFormat = {
+                type: CustomFormatType.CURRENCY,
+                currency: 'USD',
+                compact: Compact.AUTO,
+            };
+            expect(
+                convertCustomFormatToFormatExpression(formatOptions),
+            ).toBeNull();
+            const props = getFieldFormatOverrideProps(formatOptions);
+            expect(props.format).toBeUndefined();
+            expect(props.formatOptions).toEqual(formatOptions);
+        });
+
+        test('AUTO override on a numeric dimension compacts the value (the reported bug)', () => {
+            const field = {
+                ...numericDimension,
+                ...getFieldFormatOverrideProps({
+                    type: CustomFormatType.NUMBER,
+                    compact: Compact.AUTO,
+                }),
+            };
+            expect(formatItemValue(field, 929_000_000)).toEqual('929M');
+            expect(formatItemValue(field, 1_500)).toEqual('1.5K');
+        });
+
+        test('AUTO override clears a legacy field format expression so it cannot shadow the structured options', () => {
+            // legacy YAML expression that would otherwise win in formatItemValue
+            const fieldWithLegacyFormat = {
+                ...numericDimension,
+                format: '#,##0',
+            };
+            const field = {
+                ...fieldWithLegacyFormat,
+                ...getFieldFormatOverrideProps({
+                    type: CustomFormatType.NUMBER,
+                    compact: Compact.AUTO,
+                }),
+            };
+            // Without clearing the legacy expression this renders '929,000,000'.
+            expect(formatItemValue(field, 929_000_000)).toEqual('929M');
+        });
+    });
+});

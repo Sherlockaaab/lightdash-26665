@@ -1,0 +1,801 @@
+import {
+    type CustomFormatType,
+    type HomepageRecommendedActionKey,
+    type SearchItemType,
+    type TableCalculationType,
+    type TimeFrames,
+    type WarehouseTypes,
+} from '@lightdash/common';
+import type * as rudderSDK from 'rudder-sdk-js';
+import {
+    type CategoryName,
+    type EventName,
+    type PageName,
+    type PageType,
+    type SectionName,
+} from '../../types/Events';
+
+type GenericEvent = {
+    name:
+        | EventName.REVOKE_INVITES_BUTTON_CLICKED
+        | EventName.INVITE_BUTTON_CLICKED
+        | EventName.RUN_QUERY_BUTTON_CLICKED
+        | EventName.UPDATE_DASHBOARD_NAME_CLICKED
+        | EventName.ADD_COLUMN_BUTTON_CLICKED
+        | EventName.CONFIRM_DELETE_TABLE_CALCULATION_BUTTON_CLICKED
+        | EventName.DELETE_TABLE_CALCULATION_BUTTON_CLICKED
+        | EventName.EDIT_TABLE_CALCULATION_BUTTON_CLICKED
+        | EventName.REFRESH_DBT_CONNECTION_BUTTON_CLICKED
+        | EventName.UPDATE_PROJECT_TABLES_CONFIGURATION_BUTTON_CLICKED
+        | EventName.UPDATE_PROJECT_BUTTON_CLICKED
+        | EventName.FORMAT_METRIC_BUTTON_CLICKED
+        | EventName.CREATE_QUICK_TABLE_CALCULATION_BUTTON_CLICKED
+        | EventName.ADD_FILTER_CLICKED
+        | EventName.NOTIFICATIONS_CLICKED
+        | EventName.NOTIFICATIONS_ITEM_CLICKED
+        | EventName.NOTIFICATIONS_READ_MORE_CLICKED
+        | EventName.ADD_CUSTOM_METRIC_CLICKED
+        | EventName.REMOVE_CUSTOM_METRIC_CLICKED
+        | EventName.CUSTOM_AXIS_RANGE_TOGGLE_CLICKED
+        | EventName.CREATE_PROJECT_ACCESS_BUTTON_CLICKED
+        | EventName.CREATE_PROJECT_CLI_BUTTON_CLICKED
+        | EventName.CREATE_PROJECT_MANUALLY_BUTTON_CLICKED
+        | EventName.CREATE_PROJECT_AGENT_BUTTON_CLICKED
+        | EventName.CREATE_PROJECT_WAREHOUSE_BUTTON_CLICKED
+        | EventName.CREATE_PROJECT_CLI_SSO_OPTION_CLICKED
+        | EventName.COPY_CREATE_PROJECT_CODE_BUTTON_CLICKED
+        | EventName.TRY_DEMO_CLICKED
+        | EventName.GO_TO_LINK_CLICKED
+        | EventName.USAGE_ANALYTICS_CLICKED
+        | EventName.VIEW_UNDERLYING_DATA_CLICKED
+        | EventName.DRILL_BY_CLICKED
+        | EventName.SCHEDULER_SEND_NOW_BUTTON
+        | EventName.ADD_CUSTOM_DIMENSION_CLICKED
+        | EventName.DATE_ZOOM_CLICKED
+        | EventName.COMMENTS_CLICKED
+        | EventName.EMBED_DOWNLOAD_CSV_CLICKED
+        | EventName.EMBED_DOWNLOAD_IMAGE_CLICKED
+        | EventName.DOWNLOAD_IMAGE_CLICKED
+        | EventName.NOTIFICATIONS_COMMENTS_ITEM_CLICKED
+        | EventName.DASHBOARD_AUTO_REFRESH_UPDATED
+        | EventName.METRICS_CATALOG_CLICKED
+        | EventName.METRICS_CATALOG_CHART_USAGE_CLICKED
+        | EventName.METRICS_CATALOG_EXPLORE_CLICKED
+        | EventName.METRICS_CATALOG_CHART_USAGE_CHART_CLICKED
+        | EventName.METRICS_CATALOG_CATEGORY_CLICKED
+        | EventName.METRICS_CATALOG_CATEGORY_FILTER_APPLIED
+        | EventName.METRICS_CATALOG_ICON_APPLIED
+        | EventName.METRICS_CATALOG_EXPLORE_COMPARE_LAST_PERIOD
+        | EventName.METRICS_CATALOG_EXPLORE_COMPARE_ANOTHER_METRIC
+        | EventName.METRICS_CATALOG_EXPLORE_DATE_FILTER_APPLIED
+        | EventName.METRICS_CATALOG_EXPLORE_GRANULARITY_APPLIED
+        | EventName.METRICS_CATALOG_EXPLORE_SEGMENT_BY_APPLIED
+        | EventName.METRICS_CATALOG_EXPLORE_TIME_DIMENSION_OVERRIDE_APPLIED
+        | EventName.METRICS_CATALOG_SEARCH_APPLIED
+        | EventName.METRICS_CATALOG_TREES_EDGE_CREATED
+        | EventName.METRICS_CATALOG_TREES_EDGE_REMOVED
+        | EventName.METRICS_CATALOG_TREES_CANVAS_MODE_CLICKED
+        | EventName.BIGQUERY_SSO_SIGNIN_CLICKED
+        | EventName.SNOWFLAKE_CLI_SSO_COMMAND_COPIED
+        | EventName.PLAYGROUND_PROJECT_ENTERED
+        | EventName.AGENT_SETUP_PROMPT_COPIED;
+    properties?: {};
+};
+
+type SetupInviteSentEvent = {
+    name: EventName.SETUP_INVITE_SENT;
+    properties: {
+        organizationId: string;
+    };
+};
+
+type DocumentationClickedEvent = {
+    name: EventName.DOCUMENTATION_BUTTON_CLICKED;
+    properties: {
+        action:
+            | 'invite_user'
+            | 'save_chart'
+            | 'run_query'
+            | 'define_metrics'
+            | 'connect_project'
+            | 'getting_started';
+    };
+};
+
+export type OnboardingStepClickedEvent = {
+    name: EventName.ONBOARDING_STEP_CLICKED;
+    properties: {
+        action:
+            | 'invite_user'
+            | 'save_chart'
+            | 'run_query'
+            | 'define_metrics'
+            | 'connect_project';
+    };
+};
+
+export type LandingRunQueryClickedEvent = {
+    name: EventName.LANDING_RUN_QUERY_CLICKED;
+    properties: {
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+export type HomepageQuickActionClickedEvent = {
+    name: EventName.HOMEPAGE_QUICK_ACTION_CLICKED;
+    properties: {
+        actionType: string;
+    };
+};
+
+export type HomepageRecommendedActionClickedEvent = {
+    name: EventName.HOMEPAGE_RECOMMENDED_ACTION_CLICKED;
+    properties: {
+        actionKey: HomepageRecommendedActionKey;
+        destination: string;
+    };
+};
+
+export type HomepageRecommendedActionSkippedEvent = {
+    name: EventName.HOMEPAGE_RECOMMENDED_ACTION_SKIPPED;
+    properties: {
+        actionKey: HomepageRecommendedActionKey;
+    };
+};
+
+export type SetupStepClickedEvent = {
+    name: EventName.SETUP_STEP_CLICKED;
+    properties: {
+        action: 'create_user' | 'create_project';
+    };
+};
+
+export type SearchResultClickedEvent = {
+    name: EventName.SEARCH_RESULT_CLICKED;
+    properties: {
+        type: SearchItemType;
+        id: string;
+    };
+};
+
+export type GlobalSearchOpenEvent = {
+    name: EventName.GLOBAL_SEARCH_OPEN;
+    properties: {
+        action: 'input_click' | 'hotkeys';
+    };
+};
+
+export type GlobalSearchClosedEvent = {
+    name: EventName.GLOBAL_SEARCH_CLOSED;
+    properties: {
+        action: 'result_click' | 'default';
+    };
+};
+
+export type CrossFilterDashboardAppliedEvent = {
+    name: EventName.CROSS_FILTER_DASHBOARD_APPLIED;
+    properties: {
+        fieldType: string | undefined;
+        dashboardId: string;
+        projectId: string;
+    };
+};
+
+export type ViewUnderlyingDataClickedEvent = {
+    name: EventName.VIEW_UNDERLYING_DATA_CLICKED;
+    properties: {
+        organizationId: string;
+        userId: string;
+        projectId: string;
+    };
+};
+
+export type DrillByClickedEvent = {
+    name: EventName.DRILL_BY_CLICKED;
+    properties: {
+        organizationId: string;
+        userId: string;
+        projectId: string;
+    };
+};
+
+export type DashboardAutoRefreshUpdateEvent = {
+    name: EventName.DASHBOARD_AUTO_REFRESH_UPDATED;
+    properties: {
+        organizationId: string;
+        userId: string;
+        projectId: string;
+        dashboardId: string;
+        frequency: string;
+    };
+};
+
+type MetricsCatalogClickedEvent = {
+    name: EventName.METRICS_CATALOG_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type MetricsCatalogChartUsageClickedEvent = {
+    name: EventName.METRICS_CATALOG_CHART_USAGE_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        chartCount: number;
+        tableName: string;
+    };
+};
+
+type MetricsCatalogExploreClickedEvent = {
+    name: EventName.METRICS_CATALOG_EXPLORE_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        tableName: string;
+    };
+};
+
+type MetricsCatalogChartUsageChartClickedEvent = {
+    name: EventName.METRICS_CATALOG_CHART_USAGE_CHART_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        tableName: string;
+        chartId: string;
+    };
+};
+
+type MetricsCatalogCategoryClickedEvent = {
+    name: EventName.METRICS_CATALOG_CATEGORY_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        tagName: string;
+        isNewTag: boolean;
+    };
+};
+
+type MetricsCatalogCategoryFilterAppliedEvent = {
+    name: EventName.METRICS_CATALOG_CATEGORY_FILTER_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type MetricsCatalogIconAppliedEvent = {
+    name: EventName.METRICS_CATALOG_ICON_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type MetricsCatalogExploreCompareLastPeriodEvent = {
+    name: EventName.METRICS_CATALOG_EXPLORE_COMPARE_LAST_PERIOD;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        tableName: string;
+    };
+};
+
+type MetricsCatalogExploreCompareAnotherMetricEvent = {
+    name: EventName.METRICS_CATALOG_EXPLORE_COMPARE_ANOTHER_METRIC;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        tableName: string;
+        compareMetricName: string;
+        compareTableName: string;
+    };
+};
+
+type MetricsCatalogExploreDateFilterAppliedEvent = {
+    name: EventName.METRICS_CATALOG_EXPLORE_DATE_FILTER_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type MetricsCatalogExploreGranularityAppliedEvent = {
+    name: EventName.METRICS_CATALOG_EXPLORE_GRANULARITY_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        tableName: string;
+        granularity: TimeFrames;
+    };
+};
+
+type MetricsCatalogExploreSegmentByAppliedEvent = {
+    name: EventName.METRICS_CATALOG_EXPLORE_SEGMENT_BY_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        tableName: string;
+        segmentDimension: string;
+    };
+};
+
+type MetricsCatalogExploreTimeDimensionOverrideAppliedEvent = {
+    name: EventName.METRICS_CATALOG_EXPLORE_TIME_DIMENSION_OVERRIDE_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        metricName: string;
+        tableName: string;
+    };
+};
+
+type MetricsCatalogSearchAppliedEvent = {
+    name: EventName.METRICS_CATALOG_SEARCH_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type MetricsCatalogTreesEdgeCreatedEvent = {
+    name: EventName.METRICS_CATALOG_TREES_EDGE_CREATED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type MetricsCatalogTreesEdgeRemovedEvent = {
+    name: EventName.METRICS_CATALOG_TREES_EDGE_REMOVED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type MetricsCatalogTreesCanvasModeClickedEvent = {
+    name: EventName.METRICS_CATALOG_TREES_CANVAS_MODE_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type WriteBackEvent = {
+    name:
+        | EventName.WRITE_BACK_FROM_CUSTOM_METRIC_HEADER_CLICKED
+        | EventName.WRITE_BACK_FROM_CUSTOM_METRIC_CLICKED
+        | EventName.WRITE_BACK_FROM_CUSTOM_DIMENSION_HEADER_CLICKED
+        | EventName.WRITE_BACK_FROM_CUSTOM_DIMENSION_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        customMetricsCount?: number;
+        customDimensionsCount?: number;
+    };
+};
+
+type CustomMetricReplacementEvent = {
+    name: EventName.CUSTOM_FIELDS_REPLACEMENT_APPLIED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        chartId?: string;
+        customMetricIds: string[];
+    };
+};
+
+type DashboardChartLoadedEvent = {
+    name: EventName.DASHBOARD_CHART_LOADED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        dashboardId: string;
+        chartId: string;
+        queryId: string;
+        warehouseExecutionTimeMs: number | undefined;
+        totalTimeMs: number | undefined;
+        totalResults: number;
+        loadedRows: number;
+        // cacheMetadata: CacheMetadata;
+    };
+};
+
+type SpaceBreadcrumbClickedEvent = {
+    name: EventName.SPACE_BREADCRUMB_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+    };
+};
+
+type AiAgentChartHowItsCalculatedClickedEvent = {
+    name: EventName.AI_AGENT_CHART_HOW_ITS_CALCULATED_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        aiAgentId: string;
+        threadId: string;
+        messageId: string;
+        chartType: string;
+    };
+};
+
+type AiAgentChartCreatedEvent = {
+    name: EventName.AI_AGENT_CHART_CREATED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        aiAgentId: string;
+        threadId: string;
+        messageId: string;
+        tableName: string;
+    };
+};
+
+type AiAgentChartExploredEvent = {
+    name: EventName.AI_AGENT_CHART_EXPLORED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        aiAgentId: string;
+        threadId: string;
+        messageId: string;
+        tableName: string;
+    };
+};
+
+export type AiAgentAskClickedSource =
+    | 'dashboard_header'
+    | 'dashboard_chart_tile'
+    | 'saved_chart_header'
+    | 'resource_action_menu';
+
+type AiAgentAskClickedEvent = {
+    name: EventName.AI_AGENT_ASK_CLICKED;
+    properties: {
+        userId: string | undefined;
+        organizationId: string | undefined;
+        projectId: string | undefined;
+        clickedFrom: AiAgentAskClickedSource;
+    };
+};
+
+type AiAgentChatMinimizedEvent = {
+    name: EventName.AI_AGENT_CHAT_MINIMIZED;
+    properties: {
+        userId: string | undefined;
+        organizationId: string | undefined;
+        projectId: string;
+        agentUuid: string;
+        threadUuid: string | undefined;
+    };
+};
+
+type AiAgentSuggestionImpressionEvent = {
+    name: EventName.AI_AGENT_SUGGESTION_IMPRESSION;
+    properties: {
+        projectId: string;
+        agentId: string;
+        chipCount: number;
+        placement: 'agent_chat' | 'homepage_hero';
+    };
+};
+
+type AiAgentSuggestionClickEvent = {
+    name: EventName.AI_AGENT_SUGGESTION_CLICK;
+    properties: {
+        organizationId: string;
+        projectId: string;
+        agentId: string;
+        threadId?: string;
+        afterMessageId?: string;
+        chipLabel: string;
+        chipKind: 'prompt' | 'navigate';
+        chipTool?: string;
+        chipIndex: number;
+        mode: 'empty-state' | 'post-response';
+        placement: 'agent_chat' | 'homepage_hero';
+    };
+};
+
+type ThemeToggledEvent = {
+    name: EventName.THEME_TOGGLED;
+    properties: {
+        to: string;
+        organizationId: string;
+        projectId: string;
+        userId: string;
+    };
+};
+
+export type TableCalculationSaveMode = 'sql' | 'template' | 'formula';
+
+type TableCalculationSaveEvent = {
+    name:
+        | EventName.CREATE_TABLE_CALCULATION_BUTTON_CLICKED
+        | EventName.UPDATE_TABLE_CALCULATION_BUTTON_CLICKED;
+    properties: {
+        mode: TableCalculationSaveMode;
+        generatedByAi: boolean;
+        resultType: TableCalculationType;
+        formatType: CustomFormatType;
+    };
+};
+
+type FormulaTableCalculationAiGenerateClickedEvent = {
+    name: EventName.FORMULA_TABLE_CALCULATION_AI_GENERATE_CLICKED;
+    properties: {
+        userId: string;
+        organizationId: string;
+        projectId: string;
+        isEdit: boolean;
+    };
+};
+
+type DashboardUiVersionToggledEvent = {
+    name: EventName.DASHBOARD_UI_VERSION_TOGGLED;
+    properties: {
+        to: string;
+        organizationId: string | undefined;
+        projectId: string | undefined;
+        userId: string | undefined;
+    };
+};
+
+type DashboardFilterLockToggledEvent = {
+    name: EventName.DASHBOARD_FILTER_LOCK_TOGGLED;
+    properties: {
+        action: 'lock' | 'unlock';
+        dashboardUuid: string | undefined;
+        tabUuid: string | undefined;
+        fieldId: string;
+        tableName: string;
+    };
+};
+
+type DashboardFilterRequirementsSavedEvent = {
+    name: EventName.DASHBOARD_FILTER_REQUIREMENTS_SAVED;
+    properties: {
+        dashboardUuid: string | undefined;
+        ruleCount: number;
+        memberCount: number;
+        hasNote: boolean;
+    };
+};
+
+type CreateProjectButtonClickedEvent = {
+    name: EventName.CREATE_PROJECT_BUTTON_CLICKED;
+    properties: {
+        warehouse: WarehouseTypes;
+        authenticationType?: string;
+        warehouseOnly?: boolean;
+    };
+};
+
+type CreateProjectFailedEvent = {
+    name: EventName.CREATE_PROJECT_FAILED;
+    properties: {
+        warehouse: WarehouseTypes;
+        errorType: string;
+        warehouseOnly?: boolean;
+    };
+};
+
+type SignupFormSubmittedEvent = {
+    name: EventName.SIGNUP_FORM_SUBMITTED;
+    properties: {
+        variant: 'email_only' | 'password';
+    };
+};
+
+type OtpResendClickedEvent = {
+    name: EventName.OTP_RESEND_CLICKED;
+    properties: {
+        purpose: 'signup_verification' | 'login';
+    };
+};
+
+type LoginFlowMethodSelectedEvent = {
+    name: EventName.LOGIN_FLOW_METHOD_SELECTED;
+    properties: {
+        method: 'password' | 'email_otp' | 'sso_redirect';
+    };
+};
+
+type OrganizationSetupStepCompletedEvent = {
+    name: EventName.ORGANIZATION_SETUP_STEP_COMPLETED;
+    properties: {
+        step: 'workspace' | 'about_you';
+    };
+};
+
+type OrganizationBrandDetectedEvent = {
+    name: EventName.ORGANIZATION_BRAND_DETECTED;
+    properties: {
+        found: boolean;
+        autoApplied: boolean;
+    };
+};
+
+type OnboardingWarehouseSelectedEvent = {
+    name: EventName.ONBOARDING_WAREHOUSE_SELECTED;
+    properties: {
+        warehouse: string;
+        tier: 'popular' | 'all' | 'other';
+    };
+};
+
+type BigquerySsoSigninCompletedEvent = {
+    name: EventName.BIGQUERY_SSO_SIGNIN_COMPLETED;
+    properties: {
+        success: boolean;
+    };
+};
+
+type OnboardingProjectReadyStartExploringClickedEvent = {
+    name: EventName.ONBOARDING_PROJECT_READY_START_EXPLORING_CLICKED;
+    properties: {
+        projectId: string;
+    };
+};
+
+type HomepageAskSubmittedEvent = {
+    name: EventName.HOMEPAGE_ASK_SUBMITTED;
+    properties: {
+        mode: string;
+        hasProject: boolean;
+    };
+};
+
+type HomepageRecommendedActionImpressionEvent = {
+    name: EventName.HOMEPAGE_RECOMMENDED_ACTION_IMPRESSION;
+    properties: {
+        actionKey: HomepageRecommendedActionKey;
+        position: number;
+        trigger: 'initial' | 'auto_rotate' | 'manual';
+    };
+};
+
+type HomepageRecommendedActionRestoredEvent = {
+    name: EventName.HOMEPAGE_RECOMMENDED_ACTION_RESTORED;
+    properties: {
+        actionKey: HomepageRecommendedActionKey;
+    };
+};
+
+type CreateProjectColumnsDefinedButtonClickedEvent = {
+    name: EventName.CREATE_PROJECT_COLUMNS_DEFINED_BUTTON_CLICKED;
+    properties: {
+        warehouse: WarehouseTypes;
+    };
+};
+
+export type EventData =
+    | GenericEvent
+    | SetupInviteSentEvent
+    | CreateProjectButtonClickedEvent
+    | CreateProjectFailedEvent
+    | SignupFormSubmittedEvent
+    | OtpResendClickedEvent
+    | LoginFlowMethodSelectedEvent
+    | OrganizationSetupStepCompletedEvent
+    | OrganizationBrandDetectedEvent
+    | OnboardingWarehouseSelectedEvent
+    | BigquerySsoSigninCompletedEvent
+    | OnboardingProjectReadyStartExploringClickedEvent
+    | HomepageAskSubmittedEvent
+    | HomepageRecommendedActionImpressionEvent
+    | HomepageRecommendedActionRestoredEvent
+    | CreateProjectColumnsDefinedButtonClickedEvent
+    | HomepageQuickActionClickedEvent
+    | HomepageRecommendedActionClickedEvent
+    | HomepageRecommendedActionSkippedEvent
+    | SetupStepClickedEvent
+    | DocumentationClickedEvent
+    | SearchResultClickedEvent
+    | GlobalSearchOpenEvent
+    | GlobalSearchClosedEvent
+    | OnboardingStepClickedEvent
+    | CrossFilterDashboardAppliedEvent
+    | DashboardFilterRequirementsSavedEvent
+    | ViewUnderlyingDataClickedEvent
+    | DrillByClickedEvent
+    | DashboardAutoRefreshUpdateEvent
+    | MetricsCatalogClickedEvent
+    | MetricsCatalogChartUsageClickedEvent
+    | MetricsCatalogExploreClickedEvent
+    | MetricsCatalogChartUsageChartClickedEvent
+    | MetricsCatalogCategoryClickedEvent
+    | MetricsCatalogCategoryFilterAppliedEvent
+    | MetricsCatalogIconAppliedEvent
+    | MetricsCatalogExploreCompareLastPeriodEvent
+    | MetricsCatalogExploreCompareAnotherMetricEvent
+    | MetricsCatalogExploreDateFilterAppliedEvent
+    | MetricsCatalogExploreGranularityAppliedEvent
+    | MetricsCatalogExploreSegmentByAppliedEvent
+    | MetricsCatalogExploreTimeDimensionOverrideAppliedEvent
+    | MetricsCatalogSearchAppliedEvent
+    | LandingRunQueryClickedEvent
+    | MetricsCatalogTreesEdgeCreatedEvent
+    | MetricsCatalogTreesEdgeRemovedEvent
+    | MetricsCatalogTreesCanvasModeClickedEvent
+    | WriteBackEvent
+    | DashboardChartLoadedEvent
+    | CustomMetricReplacementEvent
+    | SpaceBreadcrumbClickedEvent
+    | AiAgentChartHowItsCalculatedClickedEvent
+    | AiAgentChartCreatedEvent
+    | AiAgentChartExploredEvent
+    | AiAgentAskClickedEvent
+    | AiAgentChatMinimizedEvent
+    | AiAgentSuggestionImpressionEvent
+    | AiAgentSuggestionClickEvent
+    | ThemeToggledEvent
+    | DashboardUiVersionToggledEvent
+    | TableCalculationSaveEvent
+    | FormulaTableCalculationAiGenerateClickedEvent
+    | DashboardFilterLockToggledEvent;
+
+export type IdentifyData = {
+    id: string;
+    traits?: Record<string, any>;
+};
+
+export interface PageData {
+    name: PageName;
+    category?: CategoryName;
+    type?: PageType;
+}
+
+export interface SectionData {
+    name: SectionName;
+}
+
+export interface TrackingData {
+    rudder?: typeof rudderSDK;
+    page?: PageData;
+    section?: SectionData;
+}
+
+export interface TrackingActions {
+    track: (event: EventData) => void;
+    page: (event: PageData) => void;
+    identify: (event: IdentifyData) => void;
+}
+
+export type TrackingContextType = { data: TrackingData } & TrackingActions;

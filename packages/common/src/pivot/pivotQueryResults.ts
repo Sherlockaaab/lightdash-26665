@@ -1,0 +1,1729 @@
+import last from 'lodash/last';
+import { LightdashParameters } from '../compiler/parameters';
+import type { ReadyQueryResultsPage } from '../index';
+import { UnexpectedIndexError } from '../types/errors';
+import {
+    DimensionType,
+    FieldType,
+    isField,
+    type ItemsMap,
+} from '../types/field';
+import { type ParametersValuesMap } from '../types/parameters';
+import {
+    type PivotColumn,
+    type PivotConfig,
+    type PivotData,
+    type PivotRowTotalsByIndex,
+    type TotalField,
+} from '../types/pivot';
+import { type ResultRow, type ResultValue } from '../types/results';
+import { TimeFrames } from '../types/timeFrames';
+import { getArrayValue } from '../utils/accessors';
+import { getPivotRowContextKey } from '../utils/conditionalFormatting';
+import {
+    formatItemValue,
+    formatTemporalCellForSpreadsheet,
+    shouldShiftItemTimezone,
+    toIsoWithProjectOffset,
+} from '../utils/formatting';
+import { type PivotValuesColumn } from '../visualizations/types';
+
+type FieldFunction = (fieldId: string) => ItemsMap[string] | undefined;
+
+type FieldLabelFunction = (fieldId: string) => string | undefined;
+
+// ISO 8601 datetime with an explicit timezone (e.g. 2026-01-01T00:00:00Z).
+const ISO_DATETIME_RE =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/;
+
+// Canonicalize a raw index value to a stable string. Date columns serialize
+// differently between the pivot query (`...00Z`) and the flat totals query
+// (`...00.000Z`), so any ISO datetime is normalized to its ISO instant; other
+// values pass through as a plain string.
+export const normalizePivotMatchRaw = (raw: unknown): string | null => {
+    if (raw === null || raw === undefined) return null;
+    const str = String(raw);
+    if (ISO_DATETIME_RE.test(str)) {
+        const parsed = new Date(str);
+        if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+    }
+    return str;
+};
+
+// Stable, order-independent key for matching a pivot row to its warehouse row
+// total. Both the worker (reading source pivot rows) and the frontend hook
+// (reading the flat totals query rows) must build the key from the same set of
+// index dimension fieldIds, so we sort by fieldId and normalize the raw value.
+export const buildPivotRowTotalKey = (
+    indexEntries: Array<[fieldId: string, raw: unknown]>,
+): string =>
+    JSON.stringify(
+        [...indexEntries]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([fieldId, raw]) => [fieldId, normalizePivotMatchRaw(raw)]),
+    );
+
+// Coerce a warehouse cell's raw value to a finite number, or null. Numeric
+// strings are accepted (some warehouses return decimals as strings); null,
+// undefined, empty and non-numeric values are rejected.
+const toFiniteNumber = (raw: unknown): number | null => {
+    if (raw === null || raw === undefined || raw === '') return null;
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? numeric : null;
+};
+
+/**
+ * Flatten the single wide totals row from a `calculate-total`
+ * (`kind: 'columnTotal'`) response into the `warehouseColumnTotals` map keyed by
+ * pivot SQL column name. Non-numeric cells are dropped — the lookup only uses
+ * numbers. Shared by the frontend hook and the backend export path so both
+ * produce identical column totals.
+ */
+export const buildWarehouseColumnTotals = (
+    rows: ResultRow[],
+): Record<string, number> => {
+    const firstRow = rows[0];
+    if (!firstRow) return {};
+    const totals: Record<string, number> = {};
+    for (const [key, cell] of Object.entries(firstRow)) {
+        const numeric = toFiniteNumber(cell?.value?.raw);
+        if (numeric !== null) {
+            totals[key] = numeric;
+        }
+    }
+    return totals;
+};
+
+/**
+ * Build the `warehouseRowTotals` map from a `calculate-total`
+ * (`kind: 'rowTotal'`) response — one flat row per index-value combination, each
+ * keyed by its index-dimension values (`buildPivotRowTotalKey`) → metric fieldId
+ * → numeric total. `indexFieldIds` must match the index dims the pivot worker
+ * uses so the keys align. Shared by the frontend hook and the backend export
+ * path.
+ */
+export const buildWarehouseRowTotals = (
+    rows: ResultRow[],
+    indexFieldIds: string[],
+): PivotRowTotalsByIndex => {
+    const indexFieldIdSet = new Set(indexFieldIds);
+    const map: PivotRowTotalsByIndex = {};
+    for (const row of rows) {
+        const key = buildPivotRowTotalKey(
+            indexFieldIds.map((fieldId) => [fieldId, row[fieldId]?.value?.raw]),
+        );
+        const metricTotals: Record<string, number> = {};
+        for (const [fieldId, cell] of Object.entries(row)) {
+            if (!indexFieldIdSet.has(fieldId)) {
+                const numeric = toFiniteNumber(cell?.value?.raw);
+                if (numeric !== null) {
+                    metricTotals[fieldId] = numeric;
+                }
+            }
+        }
+        map[key] = metricTotals;
+    }
+    return map;
+};
+
+// Backend `.formatted` strings don't resolve ${ld.parameters.*} placeholders
+// (parameters live on the client). For flat tables, useColumns re-formats per
+// cell. The pivot path stores backend values verbatim, so we do the same
+// per-cell overlay here whenever the field's format references parameters.
+const reformatCellWithParameters = (
+    value: ResultValue | null | undefined,
+    item: ItemsMap[string] | undefined,
+    parameters: ParametersValuesMap | undefined,
+): ResultValue | null | undefined => {
+    if (!value || !item || !parameters) return value;
+    if (!('format' in item) || typeof item.format !== 'string') return value;
+    if (
+        !item.format.includes(`\${${LightdashParameters.PREFIX_SHORT}`) &&
+        !item.format.includes(`\${${LightdashParameters.PREFIX}`)
+    ) {
+        return value;
+    }
+    return {
+        raw: value.raw,
+        formatted: formatItemValue(item, value.raw, false, parameters),
+    };
+};
+
+const create2DArray = <T>(
+    rows: number,
+    columns: number,
+    value: T | null = null,
+): (T | null)[][] =>
+    Array.from({ length: rows }, () =>
+        Array.from({ length: columns }, () => value),
+    );
+
+/**
+ * Rebuilds `data.retrofitData.{allCombinedData,pivotColumnInfo}` from
+ * indexValues + dataValues + rowTotals so the TanStack table renderer has
+ * a flat row shape per output row.
+ *
+ * INVARIANT: `allCombinedData.length === indexValues.length`. The
+ * `convertSqlPivotedRowsToPivotData` caller emits `rows.length` output rows
+ * in the standard pivot path, or `rows.length * baseMetricsArray.length`
+ * when `metricsAsRows: true` (each input row fans out to one output row per
+ * metric). A separate post-processing step in that caller attaches
+ * passthrough dimension values onto each output row positionally, dividing
+ * the output index by the fanout factor to land back on the originating
+ * input row. If this function ever starts coalescing/dropping rows, the
+ * positional merge will silently associate passthrough values with the
+ * wrong rows. The caller has a dev-mode warn that catches this during testing.
+ */
+const combinedRetrofit = (
+    data: PivotData,
+    getField: FieldFunction,
+    getFieldLabel: FieldLabelFunction,
+    parameters?: ParametersValuesMap,
+) => {
+    const indexValues = data.indexValues.length ? data.indexValues : [[]];
+    const baseIdInfo = last(data.headerValues);
+    if (data.headerValues[0] === undefined) {
+        throw new UnexpectedIndexError(
+            'combinedRetrofit: Cannot get header values',
+        );
+    }
+    const uniqueIdsForDataValueColumns: string[] = Array(
+        getArrayValue(data.headerValues, 0).length,
+    );
+
+    data.headerValues.forEach((headerRow) => {
+        headerRow.forEach((headerColValue, colIndex) => {
+            uniqueIdsForDataValueColumns[colIndex] = `${
+                (uniqueIdsForDataValueColumns[colIndex] ?? '') +
+                headerColValue.fieldId
+            }__`;
+        });
+    });
+
+    // Row totals are warehouse-computed (see `convertSqlPivotedRowsToPivotData`),
+    // so they are correct for every metric type — no `isSummable` gate. A null
+    // total means no warehouse value was available for that cell; render blank.
+    const getMetricAsRowTotalValueFromAxis = (
+        total: unknown,
+        rowIndex: number,
+    ): ResultValue | null => {
+        const value = last(data.indexValues[rowIndex]);
+        if (!value || !value.fieldId) throw new Error('Invalid pivot data');
+        if (total === null || total === undefined) return null;
+
+        const item = getField(value.fieldId);
+        const formattedValue = formatItemValue(item, total, false, parameters);
+
+        return {
+            raw: total,
+            formatted: formattedValue,
+        };
+    };
+
+    const getRowTotalValueFromAxis = (
+        field: TotalField | undefined,
+        total: unknown,
+    ): ResultValue | null => {
+        if (!field || !field.fieldId) throw new Error('Invalid pivot data');
+        if (total === null || total === undefined) return null;
+        const item = getField(field.fieldId);
+
+        const formattedValue = formatItemValue(item, total, false, parameters);
+
+        return {
+            raw: total,
+            formatted: formattedValue,
+        };
+    };
+
+    let pivotColumnInfo = [] as PivotColumn[];
+    const allCombinedData = indexValues.map((row, rowIndex) => {
+        const newRow = row.map((cell, colIndex) => {
+            if (cell.type === 'label') {
+                const cellValue = getFieldLabel(cell.fieldId);
+                return {
+                    ...cell,
+                    fieldId: `label-${colIndex}`,
+                    value: {
+                        raw: cellValue,
+                        formatted: cellValue,
+                    },
+                    columnType: 'label',
+                };
+            }
+            return {
+                ...cell,
+                columnType: 'indexValue',
+            };
+        });
+
+        const remappedDataValues = getArrayValue(data.dataValues, rowIndex).map(
+            (dataValue, colIndex) => {
+                const baseIdInfoForCol = baseIdInfo
+                    ? baseIdInfo[colIndex]
+                    : undefined;
+                const baseId = baseIdInfoForCol?.fieldId;
+                const id =
+                    getArrayValue(uniqueIdsForDataValueColumns, colIndex) +
+                    colIndex;
+                return {
+                    baseId,
+                    fieldId: id,
+                    value: dataValue || {},
+                };
+            },
+        );
+
+        const remappedRowTotals = data.rowTotals?.[rowIndex]?.map(
+            (total, colIndex) => {
+                const baseId = `row-total-${colIndex}`;
+                const id = baseId;
+                const underlyingData = last(data.rowTotalFields)?.[colIndex];
+
+                const value = data.pivotConfig.metricsAsRows
+                    ? getMetricAsRowTotalValueFromAxis(total, rowIndex)
+                    : getRowTotalValueFromAxis(underlyingData, total);
+                const underlyingId = data.pivotConfig.metricsAsRows
+                    ? undefined
+                    : underlyingData?.fieldId;
+                return {
+                    baseId,
+                    fieldId: id,
+                    underlyingId,
+                    value,
+                    columnType: 'rowTotal',
+                };
+            },
+        );
+
+        const entireRow = [
+            ...newRow,
+            ...remappedDataValues,
+            ...(remappedRowTotals || []),
+        ];
+
+        if (rowIndex === 0) {
+            pivotColumnInfo = entireRow.map((cell) => ({
+                fieldId: cell.fieldId,
+                baseId: 'baseId' in cell ? cell.baseId : undefined,
+                underlyingId:
+                    'underlyingId' in cell ? cell.underlyingId : undefined,
+                columnType: 'columnType' in cell ? cell.columnType : undefined,
+            }));
+        }
+
+        const altRow: ResultRow = {};
+        entireRow.forEach((cell) => {
+            const val = cell.value;
+            if (val && 'formatted' in val && val.formatted !== undefined) {
+                altRow[cell.fieldId] = {
+                    value: {
+                        raw: val.raw,
+                        formatted: val.formatted,
+                    },
+                };
+            }
+        });
+
+        return altRow;
+    });
+    // eslint-disable-next-line no-param-reassign
+    data.retrofitData = { allCombinedData, pivotColumnInfo };
+    return data;
+};
+
+const getHeaderValueTypes = ({
+    metricsAsRows,
+    pivotDimensionNames,
+}: {
+    metricsAsRows: boolean;
+    pivotDimensionNames: string[];
+}): PivotData['headerValueTypes'] => {
+    const headerDimensionValueTypes = pivotDimensionNames.map<{
+        type: FieldType.DIMENSION;
+        fieldId: string;
+    }>((fieldId) => ({
+        type: FieldType.DIMENSION,
+        fieldId,
+    }));
+    const headerMetricValueTypes: { type: FieldType.METRIC }[] = metricsAsRows
+        ? []
+        : [{ type: FieldType.METRIC }];
+    return [...headerDimensionValueTypes, ...headerMetricValueTypes];
+};
+
+const getColumnTotals = ({
+    baseMetricFieldIds,
+    uniqueColumns,
+    filteredValuesColumns,
+    totalColumns,
+    dataColumns,
+    hasIndex,
+    pivotConfig,
+    indexValues,
+    warehouseColumnTotals,
+}: {
+    baseMetricFieldIds: string[];
+    uniqueColumns: PivotValuesColumn[];
+    filteredValuesColumns: PivotValuesColumn[];
+    totalColumns: number;
+    dataColumns: number;
+    hasIndex: boolean;
+    indexValues: PivotData['indexValues'];
+    pivotConfig: Pick<PivotConfig, 'metricsAsRows' | 'columnTotals'>;
+    warehouseColumnTotals: Record<string, number> | undefined;
+}) => {
+    let columnTotalFields: PivotData['columnTotalFields'];
+    let columnTotals: PivotData['columnTotals'];
+    const N_DATA_COLUMNS = dataColumns;
+
+    // Column totals are exclusively warehouse-computed (like row totals): each
+    // data column's total is looked up by its pivot SQL column name. Returns
+    // null when no warehouse value is available (still loading, errored, or the
+    // source query can't be totalled) — there is no client-side fallback.
+    const lookupTotal = (
+        pivotColumnName: string | undefined,
+    ): number | null => {
+        if (!warehouseColumnTotals || !pivotColumnName) return null;
+        const value = warehouseColumnTotals[pivotColumnName];
+        return typeof value === 'number' ? value : null;
+    };
+
+    if (pivotConfig.columnTotals && hasIndex) {
+        if (pivotConfig.metricsAsRows) {
+            // One footer row per visible metric; each column is a unique pivot
+            // combination. Match the metric + pivot values back to its source
+            // value column to read the warehouse total by pivot column name.
+            const N_TOTAL_ROWS = baseMetricFieldIds.length;
+            const N_TOTAL_COLS = totalColumns;
+            columnTotalFields = create2DArray(N_TOTAL_ROWS, N_TOTAL_COLS);
+            columnTotals = create2DArray(N_TOTAL_ROWS, N_DATA_COLUMNS);
+
+            baseMetricFieldIds.forEach((fieldId, metricIndex) => {
+                columnTotalFields![metricIndex][N_TOTAL_COLS - 1] = {
+                    fieldId,
+                };
+            });
+
+            columnTotals = columnTotals.map((row, metricRowIndex) =>
+                row.map((_, dataColIndex) => {
+                    const metric = baseMetricFieldIds[metricRowIndex];
+                    const uniqueCol = uniqueColumns[dataColIndex];
+                    const matchingColumn = filteredValuesColumns.find(
+                        (col) =>
+                            col.referenceField === metric &&
+                            col.pivotValues.every((pv) =>
+                                uniqueCol.pivotValues.some(
+                                    (upv) =>
+                                        upv.referenceField ===
+                                            pv.referenceField &&
+                                        upv.value === pv.value,
+                                ),
+                            ),
+                    );
+                    return lookupTotal(matchingColumn?.pivotColumnName);
+                }),
+            );
+        } else {
+            const N_TOTAL_COLS = indexValues[0].length;
+            const N_TOTAL_ROWS = 1;
+
+            columnTotalFields = create2DArray(N_TOTAL_ROWS, N_TOTAL_COLS);
+            columnTotals = create2DArray(N_TOTAL_ROWS, N_DATA_COLUMNS);
+
+            // set the last index cell as the "Total"
+            columnTotalFields[N_TOTAL_ROWS - 1][N_TOTAL_COLS - 1] = {
+                fieldId: undefined,
+            };
+
+            // Data columns map 1:1 to the value columns in this layout.
+            columnTotals = columnTotals.map((row) =>
+                row.map((_col, colIndex) =>
+                    lookupTotal(uniqueColumns[colIndex]?.pivotColumnName),
+                ),
+            );
+        }
+    }
+    return { columnTotalFields, columnTotals };
+};
+
+const getTitleFields = ({
+    hasHeader,
+    hasIndex,
+    headerValueTypes,
+    indexValueTypes,
+}: {
+    hasHeader: boolean;
+    hasIndex: boolean;
+    headerValueTypes: PivotData['headerValueTypes'];
+    indexValueTypes: PivotData['indexValueTypes'];
+}): PivotData['titleFields'] => {
+    const titleFields: PivotData['titleFields'] = create2DArray(
+        hasHeader ? headerValueTypes.length : 1,
+        hasIndex ? indexValueTypes.length : 1,
+    );
+    headerValueTypes.forEach((headerValueType, headerIndex) => {
+        if (headerValueType.type === FieldType.DIMENSION) {
+            titleFields[headerIndex][
+                hasIndex ? indexValueTypes.length - 1 : 0
+            ] = {
+                fieldId: headerValueType.fieldId,
+                direction: 'header',
+            };
+        }
+    });
+    indexValueTypes.forEach((indexValueType, indexIndex) => {
+        if (indexValueType.fieldId) {
+            titleFields[hasHeader ? headerValueTypes.length - 1 : 0][
+                indexIndex
+            ] = {
+                fieldId: indexValueType.fieldId,
+                direction: 'index',
+            };
+        }
+    });
+    return titleFields;
+};
+
+/**
+ * Converts SQL-pivoted results to PivotData format
+ * This handles results that are already pivoted at the SQL level (e.g., payments_total_revenue_any_bank_transfer)
+ * and transforms them into the same PivotData structure consumed by the pivot table.
+ */
+export const convertSqlPivotedRowsToPivotData = ({
+    rows,
+    pivotDetails,
+    pivotConfig,
+    getField,
+    getFieldLabel,
+    groupedSubtotals,
+    groupedRowSubtotals,
+    warehouseRowTotals,
+    warehouseColumnTotals,
+    warehouseGrandTotals,
+    columnLimit,
+    parameters,
+}: {
+    rows: ResultRow[];
+    pivotDetails: NonNullable<ReadyQueryResultsPage['pivotDetails']>;
+    pivotConfig: Pick<
+        PivotConfig,
+        | 'rowTotals'
+        | 'columnTotals'
+        | 'metricsAsRows'
+        | 'hiddenMetricFieldIds'
+        | 'hiddenDimensionFieldIds'
+        | 'visibleMetricFieldIds'
+        | 'columnOrder'
+        | 'rowFieldIds'
+    >; // only use properties that are not part of pivot details metadata
+    getField: FieldFunction;
+    getFieldLabel: FieldLabelFunction;
+    groupedSubtotals: Record<string, Record<string, number>[]> | undefined;
+    groupedRowSubtotals?: PivotData['groupedRowSubtotals'];
+    /**
+     * Warehouse-computed row totals from `calculate-total` (`kind: 'rowTotal'`).
+     * Row totals are exclusively warehouse-computed — there is no client-side
+     * fallback — so cells are blank until this resolves (or stay blank if the
+     * source query can't be totalled). Drives both the metrics-as-columns and
+     * metrics-as-rows layouts.
+     */
+    warehouseRowTotals?: PivotRowTotalsByIndex;
+    /**
+     * Warehouse-computed column totals from `calculate-total`
+     * (`kind: 'columnTotal'`), keyed by pivot SQL column name. Column totals
+     * are exclusively warehouse-computed — there is no client-side fallback —
+     * so cells are blank until this resolves (or stay blank if the source
+     * query can't be totalled). Drives both layouts.
+     */
+    warehouseColumnTotals?: Record<string, number>;
+    /**
+     * Warehouse-computed grand totals from `calculate-total`
+     * (`kind: 'grandTotal'`), keyed by metric field id. These are only used
+     * when both total axes are enabled.
+     */
+    warehouseGrandTotals?: Record<string, number>;
+    columnLimit?: number;
+    parameters?: ParametersValuesMap;
+}): PivotData => {
+    if (rows.length === 0) {
+        throw new Error('Cannot convert SQL pivoted results with no rows');
+    }
+
+    const hiddenMetricFieldIds = pivotConfig.hiddenMetricFieldIds || [];
+    const hiddenDimensionFieldIds = pivotConfig.hiddenDimensionFieldIds || [];
+    const { visibleMetricFieldIds } = pivotConfig;
+    const columnOrder = pivotConfig.columnOrder || [];
+
+    const isMetricVisibleInPivot = (fieldId: string): boolean => {
+        if (visibleMetricFieldIds) {
+            return visibleMetricFieldIds.includes(fieldId);
+        }
+        return !hiddenMetricFieldIds.includes(fieldId);
+    };
+
+    const isDimVisibleInPivot = (fieldId: string): boolean =>
+        !hiddenDimensionFieldIds.includes(fieldId);
+
+    // Extract information from pivot details metadata. Row-index dims that the
+    // user has hidden are dropped from the rendered index column list — the
+    // underlying SQL row grouping is unchanged, so data rows still align with
+    // the visible index values; we just don't render the hidden column.
+    let indexColumns: string[];
+    if (pivotDetails.indexColumn) {
+        if (Array.isArray(pivotDetails.indexColumn)) {
+            indexColumns = pivotDetails.indexColumn
+                .map((col) => col.reference)
+                .filter(isDimVisibleInPivot)
+                .sort(
+                    (a, b) => columnOrder.indexOf(a) - columnOrder.indexOf(b),
+                );
+        } else {
+            indexColumns = isDimVisibleInPivot(
+                pivotDetails.indexColumn.reference,
+            )
+                ? [pivotDetails.indexColumn.reference]
+                : [];
+        }
+    } else {
+        indexColumns = [];
+    }
+
+    // Full index references (including hidden index dims). The warehouse row
+    // total query groups by ALL index dims, and the source pivot rows are
+    // grouped the same way (hiding only affects rendering), so the lookup key
+    // must use every index dim — not just the visible `indexColumns`.
+    let allIndexColumnRefs: string[] = [];
+    if (pivotDetails.indexColumn) {
+        allIndexColumnRefs = Array.isArray(pivotDetails.indexColumn)
+            ? pivotDetails.indexColumn.map((col) => col.reference)
+            : [pivotDetails.indexColumn.reference];
+    }
+
+    // Filter value columns: visibleMetricFieldIds (allowlist) takes precedence
+    // over hiddenMetricFieldIds (blocklist). Cartesian charts use the allowlist
+    // to exclude sort-only metrics injected for pivot sorting (PROD-6906).
+    let visibleValuesColumns = pivotDetails.valuesColumns.filter(
+        ({ referenceField }) => isMetricVisibleInPivot(referenceField),
+    );
+
+    // Apply column limit: keep only the first N unique pivot column groups
+    if (columnLimit !== undefined && columnLimit > 0) {
+        const seenGroups = new Set<string>();
+        visibleValuesColumns = visibleValuesColumns.filter((col) => {
+            const groupKey = col.pivotValues
+                .map(
+                    ({ referenceField, value }) => `${referenceField}:${value}`,
+                )
+                .join('|');
+            if (!seenGroups.has(groupKey)) {
+                if (seenGroups.size >= columnLimit) return false;
+                seenGroups.add(groupKey);
+            }
+            return true;
+        });
+    }
+
+    const visibleValueFieldIds = new Set(
+        visibleValuesColumns.map(({ referenceField }) => referenceField),
+    );
+    const rowValueFieldIds = (pivotConfig.rowFieldIds ?? []).filter((fieldId) =>
+        visibleValueFieldIds.has(fieldId),
+    );
+    const rowValueFieldIdSet = new Set(rowValueFieldIds);
+    const firstPivotColumnByMetricFieldId = new Map<
+        string,
+        (typeof visibleValuesColumns)[number]
+    >();
+    // A row value renders the first rendered pivot column's value, so pick per
+    // metric from the same (columnIndex, columnOrder) render order the header
+    // and data columns use below, rather than trusting the input array order.
+    [...visibleValuesColumns]
+        .sort(
+            (a, b) =>
+                Number(a.columnIndex) - Number(b.columnIndex) ||
+                columnOrder.indexOf(a.referenceField) -
+                    columnOrder.indexOf(b.referenceField),
+        )
+        .forEach((column) => {
+            if (!firstPivotColumnByMetricFieldId.has(column.referenceField)) {
+                firstPivotColumnByMetricFieldId.set(
+                    column.referenceField,
+                    column,
+                );
+            }
+        });
+    const filteredValuesColumns = visibleValuesColumns.filter(
+        ({ referenceField }) => !rowValueFieldIdSet.has(referenceField),
+    );
+
+    // Get unique base metrics from valuesColumns, preserving order
+    const baseMetricsArray = filteredValuesColumns
+        .map((col) => col.referenceField)
+        .filter((field, index, self) => self.indexOf(field) === index)
+        .sort((a, b) => columnOrder.indexOf(a) - columnOrder.indexOf(b));
+    const effectiveMetricsAsRows =
+        pivotConfig.metricsAsRows && baseMetricsArray.length > 0;
+
+    const configuredRowFieldIds = pivotConfig.rowFieldIds;
+    const rowFieldIds = configuredRowFieldIds
+        ? [
+              ...configuredRowFieldIds.filter(
+                  (fieldId) =>
+                      indexColumns.includes(fieldId) ||
+                      rowValueFieldIdSet.has(fieldId),
+              ),
+              ...indexColumns.filter(
+                  (fieldId) => !configuredRowFieldIds.includes(fieldId),
+              ),
+          ]
+        : indexColumns;
+
+    // pivotDetails.groupByColumns comes from PivotConfiguration.groupByColumns,
+    // which only contains VISIBLE pivot-column dims. Hidden pivot-column dims
+    // that drive sort order (sortOnlyDimensions in PivotConfiguration) are
+    // deliberately excluded from groupByColumns before this point, so they
+    // never appear as column header rows here. No extra filtering needed.
+    const headerValueTypes =
+        filteredValuesColumns.length > 0
+            ? getHeaderValueTypes({
+                  metricsAsRows: effectiveMetricsAsRows,
+                  pivotDimensionNames: (pivotDetails.groupByColumns ?? []).map(
+                      ({ reference }) => reference,
+                  ),
+              })
+            : [];
+
+    const rowFieldValueTypes: PivotData['indexValueTypes'] = rowFieldIds.map(
+        (fieldId) =>
+            rowValueFieldIdSet.has(fieldId)
+                ? { type: FieldType.METRIC as const, fieldId }
+                : { type: FieldType.DIMENSION as const, fieldId },
+    );
+    const indexValueTypes: PivotData['indexValueTypes'] = effectiveMetricsAsRows
+        ? [...rowFieldValueTypes, { type: FieldType.METRIC as const }]
+        : rowFieldValueTypes;
+
+    // Build header values (pivot dimension values)
+    const headerValues: PivotData['headerValues'] = [];
+    pivotDetails.groupByColumns?.forEach(({ reference }, index) => {
+        headerValues.push([]);
+        let columns = filteredValuesColumns;
+        if (effectiveMetricsAsRows) {
+            // For metrics as rows, we only need unique combinations of pivot values, excluding per metric duplicates
+            columns = Array.from(
+                new Map(
+                    columns.map((col) => [
+                        col.pivotValues
+                            .map(
+                                ({ referenceField, value }) =>
+                                    `${referenceField}:${value}`,
+                            )
+                            .join('|'),
+                        col,
+                    ]),
+                ).values(),
+            );
+        }
+        columns.forEach(({ pivotValues, pivotColumnName }) => {
+            const pivotValue = pivotValues.find(
+                ({ referenceField }) => referenceField === reference,
+            );
+            if (pivotValue) {
+                const field = getField(pivotValue.referenceField);
+                const formattedValue =
+                    pivotValue.formatted ||
+                    (field
+                        ? formatItemValue(
+                              field,
+                              pivotValue.value,
+                              true,
+                              parameters,
+                          )
+                        : String(pivotValue.value));
+                const allColumnsWithSamePivotValues = columns.filter(
+                    (matchingColumn) => {
+                        const referencesToMatch = (
+                            pivotDetails.groupByColumns || []
+                        )
+                            .map((groupByColumn) => groupByColumn.reference)
+                            .slice(0, index + 1);
+                        // Match all pivot values
+                        return referencesToMatch.every((referenceToMatch) => {
+                            const pivotValueA = pivotValues.find(
+                                ({ referenceField: referenceField3 }) =>
+                                    referenceField3 === referenceToMatch,
+                            );
+                            const pivotValueB = matchingColumn.pivotValues.find(
+                                ({ referenceField: referenceField3 }) =>
+                                    referenceField3 === referenceToMatch,
+                            );
+                            return pivotValueA?.value === pivotValueB?.value;
+                        });
+                    },
+                );
+                const isFirstInGroup =
+                    allColumnsWithSamePivotValues[0].pivotColumnName ===
+                    pivotColumnName;
+                headerValues[index].push({
+                    type: 'value' as const,
+                    fieldId: reference,
+                    value: {
+                        raw: pivotValue.value,
+                        formatted: formattedValue,
+                    },
+                    colSpan: isFirstInGroup
+                        ? allColumnsWithSamePivotValues.length
+                        : 0,
+                });
+            }
+        });
+    });
+
+    // Add metric labels for columns if not metrics as rows
+    if (!effectiveMetricsAsRows && baseMetricsArray.length > 0) {
+        headerValues.push(
+            filteredValuesColumns
+                .sort((a, b) => {
+                    const columnIndexSort =
+                        Number(a.columnIndex) - Number(b.columnIndex);
+                    const columnOrderSort =
+                        columnOrder.indexOf(a.referenceField) -
+                        columnOrder.indexOf(b.referenceField);
+
+                    return columnIndexSort || columnOrderSort;
+                })
+                .map(({ referenceField }) => ({
+                    type: 'label' as const,
+                    fieldId: referenceField,
+                })),
+        );
+    }
+
+    const filteredHeaderValues = headerValues.filter((row) => row.length > 0);
+    const renderedHeaderValues =
+        filteredHeaderValues.length > 0 ? filteredHeaderValues : [[]];
+
+    // Build index values (row identifiers)
+    let indexValues: PivotData['indexValues'];
+
+    const getRowFieldValue = (row: ResultRow, fieldId: string): ResultValue => {
+        if (!rowValueFieldIdSet.has(fieldId)) {
+            return row[fieldId].value;
+        }
+
+        const firstPivotColumn = firstPivotColumnByMetricFieldId.get(fieldId);
+        const value = firstPivotColumn
+            ? row[firstPivotColumn.pivotColumnName]?.value
+            : undefined;
+        const reformatted = reformatCellWithParameters(
+            value,
+            getField(fieldId),
+            parameters,
+        );
+        return (
+            reformatted ?? {
+                raw: null,
+                formatted: formatItemValue(
+                    getField(fieldId),
+                    null,
+                    false,
+                    parameters,
+                ),
+            }
+        );
+    };
+    const getRowFieldValues = (row: ResultRow) =>
+        rowFieldIds.map((fieldId) => ({
+            type: 'value' as const,
+            fieldId,
+            value: getRowFieldValue(row, fieldId),
+            colSpan: 1,
+        }));
+
+    if (effectiveMetricsAsRows) {
+        indexValues = rows.reduce<PivotData['indexValues']>((acc, row) => {
+            // multiply rows per metric
+            baseMetricsArray.forEach((metric) => {
+                acc.push([
+                    ...getRowFieldValues(row),
+                    {
+                        type: 'label' as const,
+                        fieldId: metric,
+                    },
+                ]);
+            });
+            return acc;
+        }, []);
+    } else {
+        indexValues = rows.map(getRowFieldValues);
+    }
+
+    // Build data values (the actual pivot data)
+    let dataValues: PivotData['dataValues'];
+
+    // Get unique columns
+    const uniqueColumns = effectiveMetricsAsRows
+        ? Array.from(
+              new Map(
+                  filteredValuesColumns.map((col) => [
+                      col.pivotValues
+                          .map(
+                              ({ referenceField, value }) =>
+                                  `${referenceField}:${value}`,
+                          )
+                          .join('|'),
+                      col,
+                  ]),
+              ).values(),
+          )
+        : filteredValuesColumns;
+
+    if (effectiveMetricsAsRows) {
+        // multiply rows per metric
+        dataValues = rows.reduce<PivotData['dataValues']>((acc, row) => {
+            baseMetricsArray.forEach((metric) => {
+                // Build row data for this metric using unique columns
+                // For each unique column combination, find the corresponding value for this metric
+                const rowData = uniqueColumns.map((uniqueCol) => {
+                    // Find the actual column in sortedValuesColumns that matches this unique combination and metric
+                    const matchingColumn = filteredValuesColumns.find(
+                        (col) =>
+                            col.referenceField === metric &&
+                            col.pivotValues.every((pv) =>
+                                uniqueCol.pivotValues.some(
+                                    (upv) =>
+                                        upv.referenceField ===
+                                            pv.referenceField &&
+                                        upv.value === pv.value,
+                                ),
+                            ),
+                    );
+
+                    return matchingColumn && row[matchingColumn.pivotColumnName]
+                        ? (reformatCellWithParameters(
+                              row[matchingColumn.pivotColumnName].value,
+                              getField(metric),
+                              parameters,
+                          ) ?? null)
+                        : null;
+                });
+
+                acc.push(rowData);
+            });
+            return acc;
+        }, []);
+    } else {
+        dataValues = rows.map((row) =>
+            filteredValuesColumns.map((valueCol) =>
+                row[valueCol.pivotColumnName]
+                    ? (reformatCellWithParameters(
+                          row[valueCol.pivotColumnName].value,
+                          getField(valueCol.referenceField),
+                          parameters,
+                      ) ?? null)
+                    : null,
+            ),
+        );
+    }
+
+    const fullPivotConfig: PivotConfig = {
+        pivotDimensions:
+            pivotDetails.groupByColumns?.map((col) => col.reference) || [],
+        metricsAsRows: effectiveMetricsAsRows,
+        ...(pivotConfig.rowFieldIds && {
+            rowFieldIds: pivotConfig.rowFieldIds,
+        }),
+        columnOrder: pivotConfig.columnOrder,
+        hiddenMetricFieldIds: pivotConfig.hiddenMetricFieldIds || [],
+        ...(pivotConfig.visibleMetricFieldIds && {
+            visibleMetricFieldIds: pivotConfig.visibleMetricFieldIds,
+        }),
+        columnTotals: pivotConfig.columnTotals,
+        rowTotals: pivotConfig.rowTotals,
+    };
+
+    // Compute row totals if requested
+    let rowTotalFields: PivotData['rowTotalFields'];
+    let rowTotals: PivotData['rowTotals'];
+    const hasHeader = headerValueTypes.length > 0;
+    const hasIndex = indexValueTypes.length > 0;
+    const N_DATA_ROWS = hasIndex ? dataValues.length : 1;
+    const N_DATA_COLUMNS = uniqueColumns.length;
+
+    if (fullPivotConfig.rowTotals && hasHeader) {
+        // Row totals are exclusively warehouse-computed: look up the value for a
+        // (source row, metric) pair in `warehouseRowTotals`, keyed by the row's
+        // index-dim values. Returns null when no warehouse value is available
+        // (e.g. still loading, errored, or the source query can't be totalled)
+        // — there is no client-side fallback, so the cell renders blank.
+        const warehouseRowTotalValue = (
+            sourceRowIndex: number,
+            metricFieldId: string | undefined,
+        ): number | null => {
+            if (!warehouseRowTotals || !metricFieldId) return null;
+            const warehouseRow =
+                warehouseRowTotals[
+                    buildPivotRowTotalKey(
+                        allIndexColumnRefs.map((ref) => [
+                            ref,
+                            rows[sourceRowIndex]?.[ref]?.value?.raw,
+                        ]),
+                    )
+                ];
+            if (!warehouseRow) return null;
+            // The totals query column carries the metric aggregation suffix
+            // (`<metric>_any` for Lightdash metrics, matching PivotQueryBuilder
+            // naming); fall back to the bare id.
+            const value =
+                warehouseRow[`${metricFieldId}_any`] ??
+                warehouseRow[metricFieldId];
+            return typeof value === 'number' ? value : null;
+        };
+
+        if (fullPivotConfig.metricsAsRows) {
+            const N_TOTAL_COLS = 1;
+            const N_TOTAL_ROWS = headerValues.length;
+            const N_METRICS = baseMetricsArray.length;
+
+            rowTotalFields = create2DArray(N_TOTAL_ROWS, N_TOTAL_COLS);
+            rowTotals = create2DArray(N_DATA_ROWS, N_TOTAL_COLS);
+
+            // set the last header cell as the "Total"
+            rowTotalFields[N_TOTAL_ROWS - 1][N_TOTAL_COLS - 1] = {
+                fieldId: undefined,
+            };
+
+            // Output rows fan out one per metric per source row (see indexValues
+            // construction), so row `i` is source `floor(i / N)` × metric `i % N`.
+            rowTotals = rowTotals.map((row, rowIndex) =>
+                row.map(() => {
+                    if (N_METRICS === 0) return null;
+                    const sourceRowIndex = Math.floor(rowIndex / N_METRICS);
+                    const metricFieldId =
+                        baseMetricsArray[rowIndex % N_METRICS];
+                    return warehouseRowTotalValue(
+                        sourceRowIndex,
+                        metricFieldId,
+                    );
+                }),
+            );
+        } else {
+            // One total column per visible base metric.
+            const N_TOTAL_COLS = baseMetricsArray.length;
+            const N_TOTAL_ROWS = headerValues.length;
+
+            rowTotalFields = create2DArray(N_TOTAL_ROWS, N_TOTAL_COLS);
+            rowTotals = create2DArray(rows.length, N_TOTAL_COLS);
+
+            baseMetricsArray.forEach((fieldId, metricIndex) => {
+                rowTotalFields![N_TOTAL_ROWS - 1][metricIndex] = {
+                    fieldId,
+                };
+            });
+
+            rowTotals = rowTotals.map((row, rowIndex) =>
+                row.map((_, totalColIndex) =>
+                    warehouseRowTotalValue(
+                        rowIndex,
+                        rowTotalFields![N_TOTAL_ROWS - 1][totalColIndex]
+                            ?.fieldId,
+                    ),
+                ),
+            );
+        }
+    }
+
+    const { columnTotalFields, columnTotals } = getColumnTotals({
+        baseMetricFieldIds: baseMetricsArray,
+        uniqueColumns,
+        filteredValuesColumns,
+        totalColumns: indexValueTypes.length,
+        dataColumns: N_DATA_COLUMNS,
+        pivotConfig: fullPivotConfig,
+        indexValues,
+        hasIndex,
+        warehouseColumnTotals,
+    });
+
+    const grandTotals =
+        fullPivotConfig.rowTotals &&
+        fullPivotConfig.columnTotals &&
+        warehouseGrandTotals
+            ? baseMetricsArray.map((fieldId) => {
+                  const value =
+                      warehouseGrandTotals[`${fieldId}_any`] ??
+                      warehouseGrandTotals[fieldId];
+                  return typeof value === 'number' ? value : null;
+              })
+            : undefined;
+
+    // Passthrough dims — hidden non-sort pivot dims whose raw values are
+    // carried on each row so cross-field richText / image templates can
+    // resolve `row.<table>.<field>.raw` even though the dim has no rendered
+    // column. Backend AsyncQueryService writes these values onto each row
+    // under the field's natural reference.
+    //
+    // Two sources:
+    //   1. `pivotDetails.passthroughDimensions` — set by the backend when the
+    //      query was built with the field already in `passthroughDimensions`.
+    //   2. `hiddenDimensionFieldIds` ∩ row keys — handles the "user just hid
+    //      a previously-visible dim and the cached results haven't refetched
+    //      yet" case: the row data still carries the value from when the dim
+    //      was visible, so we can opt it into passthrough on the fly. This
+    //      makes the image stay rendered immediately on hide without
+    //      requiring a re-run of the query.
+    //
+    // Note: we don't add them to allCombinedData / pivotColumnInfo here —
+    // combinedRetrofit (below) rebuilds both, so additions here would be
+    // discarded. The merge happens post-combinedRetrofit.
+    const declaredPassthroughs = pivotDetails.passthroughDimensions ?? [];
+    const declaredPassthroughRefs = new Set(
+        declaredPassthroughs.map((d) => d.reference),
+    );
+    const groupByRefs = new Set(
+        (pivotDetails.groupByColumns ?? []).map((c) => c.reference),
+    );
+    // Use the RAW `pivotDetails.indexColumn` (pre-filter), not the local
+    // `indexColumns` array which already has hidden refs removed via
+    // `isDimVisibleInPivot`. We're trying to detect "this field is
+    // structurally an indexColumn in the cached pivot shape", and the
+    // filtered list would always say "not present" for hidden fields.
+    const indexColumnRefs = new Set<string>();
+    if (pivotDetails.indexColumn) {
+        if (Array.isArray(pivotDetails.indexColumn)) {
+            for (const col of pivotDetails.indexColumn) {
+                indexColumnRefs.add(col.reference);
+            }
+        } else {
+            indexColumnRefs.add(pivotDetails.indexColumn.reference);
+        }
+    }
+    const firstRow = rows[0];
+    const inferredPassthroughs: typeof declaredPassthroughs = firstRow
+        ? hiddenDimensionFieldIds
+              .filter(
+                  (fieldId) =>
+                      !declaredPassthroughRefs.has(fieldId) &&
+                      !groupByRefs.has(fieldId) &&
+                      !indexColumnRefs.has(fieldId) &&
+                      firstRow[fieldId] !== undefined,
+              )
+              .map((fieldId) => ({ reference: fieldId }))
+        : [];
+    const passthroughDimensions = [
+        ...declaredPassthroughs,
+        ...inferredPassthroughs,
+    ];
+
+    // Build retrofit data for backwards compatibility
+    const allCombinedData = rows
+        .map((row) => {
+            const combinedRow: ResultRow = {};
+
+            // Add index columns
+            rowFieldIds.forEach((fieldId) => {
+                combinedRow[fieldId] = {
+                    value: getRowFieldValue(row, fieldId),
+                };
+            });
+
+            if (effectiveMetricsAsRows) {
+                // Add metric label with correct index (after all row fields)
+                const labelIndex = rowFieldIds.length;
+                const metricLabel =
+                    getFieldLabel(baseMetricsArray[0]) || baseMetricsArray[0];
+                combinedRow[`label-${labelIndex}`] = {
+                    value: {
+                        raw: metricLabel,
+                        formatted: metricLabel,
+                    },
+                };
+            }
+
+            // Add data columns with generated field IDs using metadata
+            filteredValuesColumns.forEach((valueCol, colIndex) => {
+                const pivotDimensions = (pivotDetails.groupByColumns || []).map(
+                    (col) => col.reference,
+                );
+                const fieldId = effectiveMetricsAsRows
+                    ? `${pivotDimensions.join('__')}__${colIndex}`
+                    : `${pivotDimensions.join('__')}__${
+                          valueCol.referenceField
+                      }__${colIndex}`;
+
+                if (row[valueCol.pivotColumnName]) {
+                    const cell = row[valueCol.pivotColumnName];
+                    const reformatted = reformatCellWithParameters(
+                        cell.value,
+                        getField(valueCol.referenceField),
+                        parameters,
+                    );
+                    // Helper short-circuits to the input value reference when
+                    // no reformat is needed — fall back to `cell` in that case
+                    // so we don't allocate a fresh wrapper per non-parameterised
+                    // cell.
+                    combinedRow[fieldId] =
+                        reformatted && reformatted !== cell.value
+                            ? { value: reformatted }
+                            : cell;
+                }
+            });
+
+            return combinedRow;
+        })
+        .map((combinedRow, rowIndex) => {
+            // Add row totals if enabled
+            if (fullPivotConfig.rowTotals && rowTotals) {
+                const rowTotalValue = rowTotals[rowIndex]?.[0];
+                if (rowTotalValue !== undefined) {
+                    const field = getField(baseMetricsArray[0]);
+                    const formattedValue = field
+                        ? formatItemValue(
+                              field,
+                              rowTotalValue,
+                              false,
+                              parameters,
+                          )
+                        : String(rowTotalValue);
+
+                    return {
+                        ...combinedRow,
+                        'row-total-0': {
+                            value: {
+                                raw: rowTotalValue,
+                                formatted: formattedValue,
+                            },
+                        },
+                    };
+                }
+            }
+            return combinedRow;
+        });
+
+    const pivotColumnInfo: PivotColumn[] = [
+        ...rowFieldIds.map((fieldId) => ({
+            fieldId,
+            baseId: undefined,
+            underlyingId: undefined,
+            columnType: 'indexValue' as const,
+        })),
+        ...(effectiveMetricsAsRows
+            ? [
+                  {
+                      fieldId: `label-${rowFieldIds.length}`,
+                      baseId: undefined,
+                      underlyingId: undefined,
+                      columnType: 'label' as const,
+                  },
+              ]
+            : []),
+        ...filteredValuesColumns.map((valueCol, colIndex) => {
+            const pivotDimensions = (pivotDetails.groupByColumns || []).map(
+                (col) => col.reference,
+            );
+            const fieldId = effectiveMetricsAsRows
+                ? `${pivotDimensions.join('__')}__${colIndex}`
+                : `${pivotDimensions.join('__')}__${
+                      valueCol.referenceField
+                  }__${colIndex}`;
+
+            return {
+                fieldId,
+                baseId: effectiveMetricsAsRows
+                    ? pivotDimensions[0]
+                    : valueCol.referenceField,
+                underlyingId: undefined,
+                columnType: undefined,
+            };
+        }),
+        ...(fullPivotConfig.rowTotals
+            ? [
+                  {
+                      fieldId: 'row-total-0',
+                      baseId: 'row-total-0',
+                      underlyingId: undefined,
+                      columnType: 'rowTotal' as const,
+                  },
+              ]
+            : []),
+    ];
+
+    const titleFields = getTitleFields({
+        hasIndex,
+        hasHeader,
+        headerValueTypes,
+        indexValueTypes,
+    });
+
+    const pivotData: PivotData = {
+        titleFields,
+        headerValueTypes,
+        headerValues: renderedHeaderValues,
+        indexValueTypes,
+        indexValues,
+        dataColumnCount: N_DATA_COLUMNS,
+        dataValues,
+        rowTotalFields,
+        columnTotalFields,
+        rowTotals,
+        columnTotals,
+        ...(grandTotals ? { grandTotals } : {}),
+        cellsCount: effectiveMetricsAsRows
+            ? rowFieldIds.length +
+              1 + // label column
+              uniqueColumns.length +
+              (rowTotals ? rowTotals[0].length : 0)
+            : rowFieldIds.length +
+              uniqueColumns.length +
+              (rowTotals ? rowTotals[0].length : 0),
+        rowsCount: effectiveMetricsAsRows
+            ? rows.length * baseMetricsArray.length
+            : rows.length,
+        pivotConfig: fullPivotConfig,
+        retrofitData: {
+            allCombinedData,
+            pivotColumnInfo,
+        },
+        groupedSubtotals,
+        ...(groupedRowSubtotals ? { groupedRowSubtotals } : {}),
+    };
+
+    const retrofitted = combinedRetrofit(
+        pivotData,
+        getField,
+        getFieldLabel,
+        parameters,
+    );
+
+    // combinedRetrofit rebuilds retrofitData.{allCombinedData,pivotColumnInfo}
+    // from indexValues + dataValues + rowTotals, so any passthrough additions
+    // we made earlier are gone. Re-attach them here:
+    //   - Append passthrough entries to pivotColumnInfo so PivotTable
+    //     registers a TanStack column (hidden via columnVisibility).
+    //   - Merge passthrough values from the corresponding input row onto
+    //     each output row (1-to-1 by index — convertSqlPivotedRowsToPivotData
+    //     emits one output row per input row).
+    //
+    // INVARIANT: combinedRetrofit.retrofitData.allCombinedData.length must
+    // equal rows.length — the positional merge below depends on this. If
+    // anyone adds row coalescing inside combinedRetrofit (or upstream changes
+    // how SQL-pivoted rows fan out), passthrough values would silently shift
+    // to the wrong row. The dev-mode warn below catches that during testing
+    // without crashing prod for users.
+    if (passthroughDimensions.length > 0) {
+        // In metricsAsRows mode, combinedRetrofit fans each input row out to
+        // baseMetricsArray.length output rows (one per metric). The positional
+        // merge below must divide the output index by that factor to land back
+        // on the originating input row — otherwise each metric row reads the
+        // passthrough value from a *different* input row, surfacing as
+        // mismatched images / cross-field template values for repeated row
+        // dims (PROD-7873 follow-up to PR #23452).
+        const inputRowsPerOutputRow = effectiveMetricsAsRows
+            ? baseMetricsArray.length
+            : 1;
+        const expectedOutputLength = rows.length * inputRowsPerOutputRow;
+        if (
+            process.env.NODE_ENV !== 'production' &&
+            retrofitted.retrofitData.allCombinedData.length !==
+                expectedOutputLength
+        ) {
+            // eslint-disable-next-line no-console
+            console.warn(
+                `[pivot] passthrough positional merge invariant violated: ` +
+                    `allCombinedData.length=${retrofitted.retrofitData.allCombinedData.length} ` +
+                    `!= rows.length*metricsFanout=${expectedOutputLength} ` +
+                    `(rows.length=${rows.length}, fanout=${inputRowsPerOutputRow}). ` +
+                    `Passthrough values may be attached to the wrong rows. ` +
+                    `Investigate combinedRetrofit for row coalescing.`,
+            );
+        }
+        retrofitted.retrofitData.pivotColumnInfo = [
+            ...retrofitted.retrofitData.pivotColumnInfo,
+            ...passthroughDimensions.map((dim) => ({
+                fieldId: dim.reference,
+                baseId: dim.reference,
+                underlyingId: undefined,
+                columnType: 'passthrough' as const,
+            })),
+        ];
+        retrofitted.retrofitData.allCombinedData =
+            retrofitted.retrofitData.allCombinedData.map(
+                (combinedRow, rowIndex) => {
+                    const inputRow =
+                        rows[Math.floor(rowIndex / inputRowsPerOutputRow)];
+                    if (!inputRow) return combinedRow;
+                    const enriched: ResultRow = { ...combinedRow };
+                    for (const dim of passthroughDimensions) {
+                        const value = inputRow[dim.reference];
+                        if (value !== undefined) {
+                            enriched[dim.reference] = value;
+                        }
+                    }
+                    return enriched;
+                },
+            );
+    }
+
+    // Hidden-metric side-channel for conditional formatting (PROD-2372).
+    // Hidden metrics are dropped from `filteredValuesColumns`, so their pivoted
+    // values never reach `dataValues` and a CF rule that references a hidden
+    // metric renders nothing. Stash each hidden metric's pivoted cell value,
+    // keyed by the same displayed-dimension context the renderer rebuilds
+    // (visible index dims + visible header/pivot dims) via the shared
+    // `getPivotRowContextKey` helper, so producer and consumer keys cannot drift.
+    const hiddenValuesColumns = pivotDetails.valuesColumns.filter(
+        ({ referenceField }) => !isMetricVisibleInPivot(referenceField),
+    );
+    if (hiddenValuesColumns.length > 0) {
+        const visiblePivotDimRefs = new Set(
+            (pivotDetails.groupByColumns ?? []).map((c) => c.reference),
+        );
+        const hiddenContextValues: Record<
+            string,
+            Record<string, ResultValue>
+        > = {};
+        rows.forEach((row) => {
+            hiddenValuesColumns.forEach((col) => {
+                const cell = row[col.pivotColumnName];
+                if (!cell?.value) return;
+                const dimValues: Record<string, unknown> = {};
+                // Visible index (row) dims — match the renderer, which keys on
+                // displayed index dims only (hidden index dims are excluded).
+                indexColumns.forEach((ref) => {
+                    dimValues[ref] = row[ref]?.value?.raw;
+                });
+                // Visible header (pivot) dims for this column group. Hidden
+                // sort-only pivot dims never appear in `groupByColumns`, so they
+                // are excluded here too — keeping the key aligned with the
+                // renderer's `headerInfo`.
+                col.pivotValues.forEach((pv) => {
+                    if (visiblePivotDimRefs.has(pv.referenceField)) {
+                        dimValues[pv.referenceField] = pv.value;
+                    }
+                });
+                const key = getPivotRowContextKey(dimValues);
+                const perField = hiddenContextValues[key] ?? {};
+                perField[col.referenceField] = cell.value;
+                hiddenContextValues[key] = perField;
+            });
+        });
+        if (Object.keys(hiddenContextValues).length > 0) {
+            retrofitted.hiddenContextValues = hiddenContextValues;
+        }
+    }
+
+    // Row-index dims hidden via hiddenDimensionFieldIds are dropped from the
+    // rendered `indexValues`, but interactive drill-down ("View underlying
+    // data" / "Drill into") needs their per-row values to scope correctly
+    // (PROD-7841). `allIndexColumnRefs` includes hidden dims; `indexColumns`
+    // is visible-only, so the difference is the hidden set. Stash them in a
+    // parallel array aligned by row index with `indexValues`.
+    const hiddenIndexColumns = allIndexColumnRefs.filter(
+        (ref) => !indexColumns.includes(ref),
+    );
+    if (hiddenIndexColumns.length > 0) {
+        const buildHiddenCells = (row: (typeof rows)[number]) =>
+            hiddenIndexColumns.map((col) => ({
+                type: 'value' as const,
+                fieldId: col,
+                value: row[col].value,
+                colSpan: 1,
+            }));
+        retrofitted.hiddenIndexValues = pivotConfig.metricsAsRows
+            ? rows.reduce<PivotData['indexValues']>((acc, row) => {
+                  // mirror the per-metric row multiplication of `indexValues`
+                  baseMetricsArray.forEach(() => {
+                      acc.push(buildHiddenCells(row));
+                  });
+                  return acc;
+              }, [])
+            : rows.map((row) => buildHiddenCells(row));
+    }
+
+    return retrofitted;
+};
+
+export type PivotResultsDataCell = {
+    raw: unknown;
+    formatted: string;
+    fieldId: string;
+};
+
+export type PivotResultsData = {
+    headers: string[][];
+    dataRows: Array<Array<PivotResultsDataCell>>;
+    fieldIds: string[];
+    hasIndex: boolean;
+};
+
+const NATIVE_DATE_TIME_FRAMES = new Set<TimeFrames>([
+    TimeFrames.YEAR,
+    TimeFrames.MONTH,
+    TimeFrames.DAY,
+    TimeFrames.HOUR,
+    TimeFrames.MINUTE,
+    TimeFrames.SECOND,
+    TimeFrames.MILLISECOND,
+    TimeFrames.RAW,
+]);
+
+export function timeIntervalToExcelNumFmt(
+    timeInterval: TimeFrames | undefined,
+    dimensionType: DimensionType,
+): string | null {
+    if (timeInterval && !NATIVE_DATE_TIME_FRAMES.has(timeInterval)) {
+        return null;
+    }
+
+    switch (timeInterval) {
+        case TimeFrames.YEAR:
+            return 'yyyy';
+        case TimeFrames.MONTH:
+            return 'yyyy-mm';
+        case TimeFrames.DAY:
+            return 'yyyy-mm-dd';
+        case TimeFrames.HOUR:
+            return 'yyyy-mm-dd hh:00';
+        case TimeFrames.MINUTE:
+            return 'yyyy-mm-dd hh:mm';
+        case TimeFrames.SECOND:
+            return 'yyyy-mm-dd hh:mm:ss';
+        case TimeFrames.MILLISECOND:
+            return 'yyyy-mm-dd hh:mm:ss.000';
+        case TimeFrames.RAW:
+        case undefined:
+            return dimensionType === DimensionType.TIMESTAMP
+                ? 'yyyy-mm-dd hh:mm:ss'
+                : 'yyyy-mm-dd';
+        default:
+            return null;
+    }
+}
+
+type PivotResultsParams = {
+    pivotConfig: PivotConfig;
+    pivotDetails: NonNullable<ReadyQueryResultsPage['pivotDetails']>;
+    rows: ResultRow[];
+    itemMap: ItemsMap;
+    customLabels: Record<string, string> | undefined;
+    onlyRaw: boolean;
+    undefinedCharacter?: string;
+    // When set + onlyRaw + the cell's field is TIMESTAMP, the emitted value
+    // is the warehouse instant shifted into the project tz with an explicit
+    // offset suffix. No-op for other modes / fields.
+    timezone?: string;
+    // When true, shiftable temporal cells (header + body, both modes) emit
+    // the wall-clock format spreadsheet apps auto-detect as a date.
+    formatTemporalsForSpreadsheet?: boolean;
+    // Warehouse-computed totals (from `calculate-total`). Without them the
+    // pivot worker leaves total cells blank — there is no client-side fallback.
+    warehouseRowTotals?: PivotRowTotalsByIndex;
+    warehouseColumnTotals?: Record<string, number>;
+    warehouseGrandTotals?: Record<string, number>;
+};
+
+export const pivotResultsAsData = ({
+    pivotConfig,
+    rows,
+    itemMap,
+    customLabels,
+    onlyRaw,
+    undefinedCharacter = '',
+    pivotDetails,
+    timezone,
+    formatTemporalsForSpreadsheet = false,
+    warehouseRowTotals,
+    warehouseColumnTotals,
+    warehouseGrandTotals,
+}: PivotResultsParams): PivotResultsData => {
+    const getFieldLabel = (fieldId: string) => {
+        const customLabel = customLabels?.[fieldId];
+        if (customLabel !== undefined) return customLabel;
+        const field = itemMap[fieldId];
+        return (field && isField(field) && field?.label) || fieldId;
+    };
+    const pivotedResults = convertSqlPivotedRowsToPivotData({
+        getField: (fieldId: string) => itemMap && itemMap[fieldId],
+        getFieldLabel,
+        rows,
+        pivotDetails,
+        pivotConfig,
+        groupedSubtotals: undefined,
+        warehouseRowTotals,
+        warehouseColumnTotals,
+        warehouseGrandTotals,
+    });
+
+    const formatField = onlyRaw ? 'raw' : 'formatted';
+    const pickValue = (
+        cellValue: ResultValue | undefined,
+        fieldId: string,
+    ): string => {
+        const item = itemMap[fieldId];
+        if (formatTemporalsForSpreadsheet) {
+            const spreadsheetTemporal = formatTemporalCellForSpreadsheet(
+                item,
+                cellValue?.raw,
+                timezone,
+            );
+            if (spreadsheetTemporal !== undefined) return spreadsheetTemporal;
+        }
+        const base = (cellValue?.[formatField] as string) ?? '';
+        if (!onlyRaw || !timezone) return base;
+        if (!shouldShiftItemTimezone(item)) return base;
+        const shifted = toIsoWithProjectOffset(cellValue?.raw, timezone);
+        return shifted ?? base;
+    };
+    const headers = pivotedResults.headerValues.reduce<string[][]>(
+        (acc, row, i) => {
+            const values = row.map((header) =>
+                'value' in header
+                    ? pickValue(header.value, header.fieldId)
+                    : getFieldLabel(header.fieldId),
+            );
+            const fields = pivotedResults.titleFields[i];
+            const fieldLabels = fields.map((field) =>
+                field ? getFieldLabel(field.fieldId) : undefinedCharacter,
+            );
+
+            const rowTotalLabels =
+                pivotedResults.rowTotalFields?.[i]?.map((totalField) =>
+                    totalField?.fieldId
+                        ? `Total ${getFieldLabel(totalField.fieldId)}`
+                        : 'Total',
+                ) || [];
+
+            acc[i] = [...fieldLabels, ...values, ...rowTotalLabels];
+            return acc;
+        },
+        [[]],
+    );
+
+    // Passthrough columns are registered in pivotColumnInfo so the pivot
+    // table can render cross-field richText / image templates that read
+    // `row.<table>.<field>.raw`. They must NOT appear in CSV / XLSX
+    // exports — the user explicitly hid the column from the visualization,
+    // and the "hide" semantic includes exports. Filtered here so every
+    // downstream consumer of pivotResultsAsData (CSV, XLSX, etc.) inherits
+    // the exclusion.
+    const fieldIds = Object.values(pivotedResults.retrofitData.pivotColumnInfo)
+        .filter((field) => field.columnType !== 'passthrough')
+        .map((field) => field.fieldId);
+
+    const hasIndex = pivotedResults.indexValues.length > 0;
+    const dataRows = pivotedResults.retrofitData.allCombinedData.map((row) => {
+        const noIndexPrefix: PivotResultsDataCell[] = hasIndex
+            ? []
+            : [{ raw: '', formatted: '', fieldId: '' }];
+        const cells: PivotResultsDataCell[] = fieldIds.map((fieldId) => ({
+            raw: row[fieldId]?.value?.raw ?? '',
+            formatted:
+                pickValue(row[fieldId]?.value, fieldId) || undefinedCharacter,
+            fieldId,
+        }));
+        return [...noIndexPrefix, ...cells];
+    });
+
+    // Column totals render as footer row(s) below the data — mirroring the
+    // pivot table UI. Each row is [index labels, per-column totals, blank row
+    // total cells], matching the header/data column order. Only present when
+    // column totals are enabled (and therefore the table has an index).
+    const columnTotalRows: PivotResultsDataCell[][] = (
+        pivotedResults.columnTotals ?? []
+    ).map((totalRow, totalRowIndex) => {
+        const totalFieldsRow =
+            pivotedResults.columnTotalFields?.[totalRowIndex] ?? [];
+        const lastTotalField = last(totalFieldsRow);
+        const lastHeaderRow = last(pivotedResults.headerValues) ?? [];
+
+        const labelCells: PivotResultsDataCell[] = totalFieldsRow.map(
+            (totalField) => {
+                const label = totalField
+                    ? `Total${
+                          totalField.fieldId
+                              ? ` ${getFieldLabel(totalField.fieldId)}`
+                              : ''
+                      }`
+                    : '';
+                return { raw: label, formatted: label, fieldId: '' };
+            },
+        );
+
+        const dataCells: PivotResultsDataCell[] = totalRow.map(
+            (total, colIndex) => {
+                if (total === null || total === undefined) {
+                    return {
+                        raw: '',
+                        formatted: undefinedCharacter,
+                        fieldId: '',
+                    };
+                }
+                // The total's metric is the per-row metric (metricsAsRows) or
+                // the data column's metric (metricsAsColumns).
+                const headerCell = lastHeaderRow[colIndex];
+                let fieldId: string | undefined;
+                if (pivotConfig.metricsAsRows) {
+                    fieldId = lastTotalField?.fieldId;
+                } else if (headerCell && 'fieldId' in headerCell) {
+                    fieldId = headerCell.fieldId;
+                }
+                const field = fieldId ? itemMap[fieldId] : undefined;
+                const formatted = onlyRaw
+                    ? String(total)
+                    : formatItemValue(field, total, false);
+                return { raw: total, formatted, fieldId: fieldId ?? '' };
+            },
+        );
+
+        const totalFields = last(pivotedResults.rowTotalFields) ?? [];
+        const rowTotalCells: PivotResultsDataCell[] =
+            pivotConfig.rowTotals && pivotedResults.rowTotalFields?.[0]
+                ? pivotedResults.rowTotalFields[0].map((_, totalColIndex) => {
+                      const grandTotalIndex = pivotConfig.metricsAsRows
+                          ? totalRowIndex
+                          : totalColIndex;
+                      const grandTotal =
+                          pivotedResults.grandTotals?.[grandTotalIndex];
+                      const fieldId = pivotConfig.metricsAsRows
+                          ? lastTotalField?.fieldId
+                          : totalFields[totalColIndex]?.fieldId;
+                      if (
+                          grandTotal === null ||
+                          grandTotal === undefined ||
+                          !fieldId
+                      ) {
+                          return { raw: '', formatted: '', fieldId: '' };
+                      }
+                      const field = itemMap[fieldId];
+                      const formatted = onlyRaw
+                          ? String(grandTotal)
+                          : formatItemValue(field, grandTotal, false);
+                      return {
+                          raw: grandTotal,
+                          formatted,
+                          fieldId,
+                      };
+                  })
+                : [];
+
+        return [...labelCells, ...dataCells, ...rowTotalCells];
+    });
+
+    return {
+        headers,
+        dataRows: [...dataRows, ...columnTotalRows],
+        fieldIds,
+        hasIndex,
+    };
+};
+
+export const pivotResultsAsCsv = (params: PivotResultsParams) => {
+    const data = pivotResultsAsData(params);
+
+    const pivotedRows: string[][] = data.dataRows.map((row) =>
+        row.map((cell) => cell.formatted),
+    );
+
+    return [...data.headers, ...pivotedRows];
+};

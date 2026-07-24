@@ -1,0 +1,80 @@
+import { Anchor, Box, Group, Text, Tooltip } from '@mantine-8/core';
+import { type FC } from 'react';
+import { PillTagsInput } from '../../../../components/common/TagsInput/PillTagsInput';
+import { TagPill } from '../../../../components/common/TagsInput/TagPill';
+import MsTeamsSvg from '../../../../svgs/msteams.svg?react';
+import classes from './SchedulerWebhookPill.module.css';
+
+type MicrosoftTeamsDestinationProps = {
+    onChange: (val: string[]) => void;
+    msTeamTargets: string[];
+    /** Omit the leading icon when the parent renders its own destination label */
+    hideIcon?: boolean;
+};
+
+const renderWebhookPill = ({
+    value,
+    onRemove,
+}: {
+    value: string;
+    onRemove: () => void;
+}) => (
+    <Tooltip label={value} withinPortal multiline w="500px">
+        <TagPill
+            label={value}
+            onRemove={onRemove}
+            className={classes.webhookPill}
+        />
+    </Tooltip>
+);
+
+const validateMsTeamsWebhook = (webhook: string): boolean => {
+    if (webhook.length === 0) return false;
+    if (!webhook.startsWith('https://')) return false;
+    if (/\s/.test(webhook)) return false;
+
+    return true;
+};
+
+export const SchedulerFormMicrosoftTeamsInput: FC<
+    MicrosoftTeamsDestinationProps
+> = ({ onChange, msTeamTargets, hideIcon }) => {
+    return (
+        <Group wrap="nowrap" mb={hideIcon ? 0 : 'sm'} align="flex-start">
+            {!hideIcon && (
+                <Box pt="xxs">
+                    <MsTeamsSvg
+                        style={{
+                            margin: '5px 2px',
+                            width: '20px',
+                            height: '20px',
+                        }}
+                    />
+                </Box>
+            )}
+            <Box w="100%">
+                <PillTagsInput
+                    radius="md"
+                    clearable
+                    placeholder="Enter Microsoft Teams Workflow or webhook URLs"
+                    value={msTeamTargets}
+                    allowDuplicates={false}
+                    splitChars={[',', ' ']}
+                    validate={validateMsTeamsWebhook}
+                    onChange={onChange}
+                    renderPill={renderWebhookPill}
+                />
+                <Text size="xs" c="dimmed" mt={4}>
+                    <Anchor
+                        size="xs"
+                        href="https://support.microsoft.com/en-us/office/create-incoming-webhooks-with-workflows-for-microsoft-teams-8ae491c7-0394-4861-ba59-055e33f75498"
+                        target="_blank"
+                    >
+                        Create a Workflow
+                    </Anchor>{' '}
+                    in Microsoft Teams to get a URL.
+                </Text>
+            </Box>
+        </Group>
+    );
+};

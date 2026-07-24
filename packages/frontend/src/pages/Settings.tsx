@@ -1,0 +1,934 @@
+import { subject } from '@casl/ability';
+import { ProjectType } from '@lightdash/common';
+import {
+    Anchor,
+    ActionIcon,
+    Box,
+    Group,
+    ScrollArea,
+    Stack,
+    Text,
+    Title,
+    Tooltip,
+} from '@mantine-8/core';
+import { useDebouncedValue, useLocalStorage } from '@mantine-8/hooks';
+import {
+    IconLayoutSidebarLeftCollapse,
+    IconLayoutSidebarLeftExpand,
+} from '@tabler/icons-react';
+import { useMemo, useState, type FC } from 'react';
+import {
+    matchPath,
+    Navigate,
+    useLocation,
+    useParams,
+    useRoutes,
+    type RouteObject,
+} from 'react-router';
+import ErrorState from '../components/common/ErrorState';
+import MantineIcon from '../components/common/MantineIcon';
+import Page from '../components/common/Page/Page';
+import PageBreadcrumbs from '../components/common/PageBreadcrumbs';
+import { SettingsGridCard } from '../components/common/Settings/SettingsCard';
+import { SettingsPage } from '../components/common/Settings/SettingsPage';
+import PageSpinner from '../components/PageSpinner';
+import ProjectSettings from '../components/Settings/ProjectSettings';
+import SettingsNavigation from '../components/Settings/SettingsNavigation';
+import SettingsSearchInput from '../components/Settings/SettingsSearchInput';
+import AccessTokensPanel from '../components/UserSettings/AccessTokensPanel';
+import AllowedDomainsPanel from '../components/UserSettings/AllowedDomainsPanel';
+import AppearanceSettingsPanel from '../components/UserSettings/AppearanceSettingsPanel';
+import DefaultProjectPanel from '../components/UserSettings/DefaultProjectPanel';
+import { DeleteOrganizationPanel } from '../components/UserSettings/DeleteOrganizationPanel';
+import EmailWhitelabelPanel from '../components/UserSettings/EmailWhitelabel/EmailWhitelabelPanel';
+import ExportingPanel from '../components/UserSettings/ExportingPanel';
+import GithubSettingsPanel from '../components/UserSettings/GithubSettingsPanel';
+import GithubUserSettingsPanel from '../components/UserSettings/GithubUserSettingsPanel';
+import GitlabSettingsPanel from '../components/UserSettings/GitlabSettingsPanel';
+import ImpersonationPanel from '../components/UserSettings/ImpersonationPanel';
+import { LeaveOrganizationPanel } from '../components/UserSettings/LeaveOrganizationPanel';
+import LimitsPanel from '../components/UserSettings/LimitsPanel';
+import MyAppsPanel from '../components/UserSettings/MyAppsPanel';
+import { MyWarehouseConnectionsPanel } from '../components/UserSettings/MyWarehouseConnectionsPanel';
+import OAuthClientsPanel from '../components/UserSettings/OAuthClientsPanel';
+import OrganizationPanel from '../components/UserSettings/OrganizationPanel';
+import AccountLinkingPanel from '../components/UserSettings/OrganizationSso/AccountLinkingPanel';
+import AzureAdSsoPanel from '../components/UserSettings/OrganizationSso/AzureAdSsoPanel';
+import GenericOidcSsoPanel from '../components/UserSettings/OrganizationSso/GenericOidcSsoPanel';
+import GoogleSsoPanel from '../components/UserSettings/OrganizationSso/GoogleSsoPanel';
+import OktaSsoPanel from '../components/UserSettings/OrganizationSso/OktaSsoPanel';
+import OneLoginSsoPanel from '../components/UserSettings/OrganizationSso/OneLoginSsoPanel';
+import { OrganizationWarehouseCredentialsPanel } from '../components/UserSettings/OrganizationWarehouseCredentialsPanel';
+import PasswordPanel from '../components/UserSettings/PasswordPanel';
+import ProfilePanel from '../components/UserSettings/ProfilePanel';
+import ProjectManagementPanel from '../components/UserSettings/ProjectManagementPanel';
+import UserScheduledDeliveriesPanel from '../components/UserSettings/ScheduledDeliveriesPanel';
+import SlackSettingsPanel from '../components/UserSettings/SlackSettingsPanel';
+import SocialLoginsPanel from '../components/UserSettings/SocialLoginsPanel';
+import SupportImpersonationPanel from '../components/UserSettings/SupportImpersonationPanel';
+import UserAttributesPanel from '../components/UserSettings/UserAttributesPanel';
+import UsersAndGroupsPanel from '../components/UserSettings/UsersAndGroupsPanel';
+import VerifiedDomainsPanel from '../components/UserSettings/VerifiedDomains/VerifiedDomainsPanel';
+import { ReviewRemediationWorkspace } from '../ee/features/aiCopilot/components/Admin/ReviewRemediationWorkspace';
+import { AiAgentsSettingsPage } from '../ee/features/aiCopilot/components/Admin/settings/AiAgentsSettingsPage';
+import { AiGeneralSettingsPage } from '../ee/features/aiCopilot/components/Admin/settings/AiGeneralSettingsPage';
+import { AiReviewsSettingsPage } from '../ee/features/aiCopilot/components/Admin/settings/AiReviewsSettingsPage';
+import { AiSettingsProviders } from '../ee/features/aiCopilot/components/Admin/settings/AiSettingsProviders';
+import { AiThreadsSettingsPage } from '../ee/features/aiCopilot/components/Admin/settings/AiThreadsSettingsPage';
+import { McpActivitySettingsPage } from '../ee/features/aiCopilot/components/Admin/settings/McpActivitySettingsPage';
+import ScimAccessTokensPanel from '../ee/features/scim/components/ScimAccessTokensPanel';
+import { ServiceAccountsPage } from '../ee/features/serviceAccounts';
+import { CustomRoleCreate } from '../ee/pages/customRoles/CustomRoleCreate';
+import { CustomRoleDuplicate } from '../ee/pages/customRoles/CustomRoleDuplicate';
+import { CustomRoleEdit } from '../ee/pages/customRoles/CustomRoleEdit';
+import { CustomRoles } from '../ee/pages/customRoles/CustomRoles';
+import DesignListPage from '../features/organizationDesigns/components/DesignListPage';
+import { filterSettingsNavigation } from '../hooks/settings/filterSettingsNavigation';
+import { useSettingsContext } from '../hooks/settings/useSettingsContext';
+import { useSettingsNavigation } from '../hooks/settings/useSettingsNavigation';
+import { TrackPage } from '../providers/Tracking/TrackingProvider';
+import { PageName } from '../types/Events';
+import classes from './Settings.module.css';
+
+const SETTINGS_SIDEBAR_COLLAPSED_STORAGE_KEY = 'settings:sidebar-collapsed';
+
+const AiReviewsToIssuesRedirect = ({
+    itemRoute = false,
+}: {
+    itemRoute?: boolean;
+}) => {
+    const { fingerprint } = useParams<{ fingerprint: string }>();
+    const location = useLocation();
+
+    const pathname =
+        itemRoute && fingerprint
+            ? `/generalSettings/ai/issues/${encodeURIComponent(fingerprint)}`
+            : '/generalSettings/ai/issues';
+
+    return (
+        <Navigate
+            to={`${pathname}${location.search}${location.hash}`}
+            replace
+        />
+    );
+};
+
+const Settings: FC = () => {
+    const context = useSettingsContext();
+    const sections = useSettingsNavigation(context);
+
+    const [isSidebarCollapsed, setIsSidebarCollapsed] =
+        useLocalStorage<boolean>({
+            key: SETTINGS_SIDEBAR_COLLAPSED_STORAGE_KEY,
+            defaultValue: false,
+            getInitialValueInEffect: false,
+        });
+    const [search, setSearch] = useState('');
+    const [debouncedSearch] = useDebouncedValue(search, 200);
+
+    const filteredSections = useMemo(
+        () => filterSettingsNavigation(sections, debouncedSearch),
+        [sections, debouncedSearch],
+    );
+
+    const location = useLocation();
+    // Reset the search on navigation so each visit starts unfiltered; done
+    // during render rather than an effect, which would lag the route change.
+    const [prevPathname, setPrevPathname] = useState(location.pathname);
+    if (prevPathname !== location.pathname) {
+        setPrevPathname(location.pathname);
+        setSearch('');
+    }
+
+    const {
+        user,
+        health,
+        organization,
+        project,
+        isScimTokenManagementEnabled,
+        dataAppsFlag,
+        isAiCopilotEnabledOrTrial,
+        shouldShowAiAgentReviews,
+        canManageOrgAiAgent,
+        hasAnyAiAgentAccess,
+        isAiOrganizationSettingsLoading,
+        showImpersonationPanel,
+        isLeaveOrganizationEnabled,
+        isCustomRolesEnabled,
+        isProLimitsEnabled,
+        isSsoOrganizationSettingsEnabled,
+        isEmailWhitelabelEnabled,
+        isServiceAccountsEnabled,
+        allowPasswordAuthentication,
+        hasSocialLogin,
+        isHealthLoading,
+        healthError,
+        isUserLoading,
+        userError,
+        isOrganizationLoading,
+        organizationError,
+        isActiveProjectUuidLoading,
+        isProjectLoading,
+        projectError,
+    } = context;
+
+    const routes = useMemo<RouteObject[]>(() => {
+        const allowedRoutes: RouteObject[] = [
+            {
+                path: '/appearance',
+                element: <AppearanceSettingsPanel />,
+            },
+            {
+                path: '/profile',
+                element: (
+                    <SettingsPage
+                        title="Profile"
+                        description="Manage your personal details and account preferences."
+                    >
+                        <SettingsGridCard>
+                            <Title order={5}>Profile details</Title>
+                            <ProfilePanel />
+                        </SettingsGridCard>
+                        {health?.hasGithub && <GithubUserSettingsPanel />}
+                        {isLeaveOrganizationEnabled && (
+                            <SettingsGridCard>
+                                <Box>
+                                    <Title order={5}>Danger zone</Title>
+                                    <Text c="ldGray.6" fz="xs">
+                                        Leave the organization to remove
+                                        yourself from it (you cannot leave if
+                                        you are the only admin). This action is
+                                        not reversible.
+                                    </Text>
+                                </Box>
+                                <LeaveOrganizationPanel />
+                            </SettingsGridCard>
+                        )}
+                    </SettingsPage>
+                ),
+            },
+            {
+                path: '*',
+                element: <Navigate to="/generalSettings/profile" />,
+            },
+        ];
+
+        if (allowPasswordAuthentication) {
+            allowedRoutes.push({
+                path: '/password',
+                element: (
+                    <SettingsPage
+                        title="Password"
+                        description="Update your password and manage the ways you sign in."
+                    >
+                        <SettingsGridCard>
+                            <Title order={5}>Change password</Title>
+                            <PasswordPanel />
+                        </SettingsGridCard>
+
+                        {hasSocialLogin && (
+                            <SettingsGridCard>
+                                <Title order={5}>Social logins</Title>
+                                <SocialLoginsPanel />
+                            </SettingsGridCard>
+                        )}
+                    </SettingsPage>
+                ),
+            });
+        }
+        allowedRoutes.push({
+            path: '/myWarehouseConnections',
+            element: (
+                <Stack gap="xl">
+                    <MyWarehouseConnectionsPanel />
+                </Stack>
+            ),
+        });
+        if (user?.ability.can('create', 'ScheduledDeliveries')) {
+            // A user might not be able to create scheduled permissions on the org level but on a specific project
+            // level. The check here makes sure that the user has the ability to create a scheduled delivery at least somewhere.
+            // Since the service returns specifically the user's scheduled deliveries, this is completely intended behavior.
+            allowedRoutes.push({
+                path: '/userScheduledDeliveries',
+                element: <UserScheduledDeliveriesPanel />,
+            });
+        }
+        if (dataAppsFlag?.enabled && user?.ability.can('create', 'DataApp')) {
+            allowedRoutes.push({
+                path: '/myApps',
+                element: (
+                    <MyAppsPanel
+                        key={String(project?.type === ProjectType.PREVIEW)}
+                        includePreviewAppsByDefault={
+                            project?.type === ProjectType.PREVIEW
+                        }
+                    />
+                ),
+            });
+        }
+        if (user?.ability.can('manage', 'PersonalAccessToken')) {
+            allowedRoutes.push({
+                path: '/organization',
+                element: (
+                    <SettingsPage
+                        title="General"
+                        description="Manage organization-wide defaults, access, and account controls."
+                    >
+                        <SettingsGridCard>
+                            <Title order={5}>Organization details</Title>
+                            <OrganizationPanel />
+                        </SettingsGridCard>
+
+                        <SettingsGridCard>
+                            <div>
+                                <Title order={5}>Allowed email domains</Title>
+                                <Text c="ldGray.6" fz="xs">
+                                    Anyone with email addresses at these domains
+                                    can automatically join the organization.
+                                </Text>
+                            </div>
+                            <AllowedDomainsPanel />
+                        </SettingsGridCard>
+
+                        <SettingsGridCard>
+                            <div>
+                                <Title order={5}>Default project</Title>
+                                <Text c="ldGray.6" fz="xs">
+                                    This is the project users will see when they
+                                    log in for the first time or from a new
+                                    device. If a user does not have access, they
+                                    will see their next accessible project.
+                                </Text>
+                            </div>
+                            <DefaultProjectPanel />
+                        </SettingsGridCard>
+
+                        {showImpersonationPanel && (
+                            <SettingsGridCard>
+                                <Title order={5}>User impersonation</Title>
+                                <ImpersonationPanel />
+                            </SettingsGridCard>
+                        )}
+
+                        <SettingsGridCard>
+                            <Title order={5}>Lightdash support access</Title>
+                            <SupportImpersonationPanel />
+                        </SettingsGridCard>
+
+                        {(isLeaveOrganizationEnabled ||
+                            user.ability?.can('delete', 'Organization')) && (
+                            <SettingsGridCard>
+                                <div>
+                                    <Title order={5}>Danger zone</Title>
+                                    <Text c="ldGray.6" fz="xs">
+                                        {isLeaveOrganizationEnabled &&
+                                            'Leave the organization to remove yourself from it (you cannot leave if you are the only admin). '}
+                                        {user.ability?.can(
+                                            'delete',
+                                            'Organization',
+                                        ) &&
+                                            'Deleting the organization removes the whole workspace and all its content, including users. '}
+                                        These actions are not reversible.
+                                    </Text>
+                                </div>
+                                <Stack gap="sm" align="flex-end">
+                                    {isLeaveOrganizationEnabled && (
+                                        <LeaveOrganizationPanel />
+                                    )}
+                                    {user.ability?.can(
+                                        'delete',
+                                        'Organization',
+                                    ) && <DeleteOrganizationPanel />}
+                                </Stack>
+                            </SettingsGridCard>
+                        )}
+                    </SettingsPage>
+                ),
+            });
+        }
+        if (user?.ability.can('manage', 'Organization')) {
+            allowedRoutes.push({
+                path: '/exporting',
+                element: (
+                    <SettingsPage
+                        title="Exporting"
+                        description="Control how exported files are shared outside Lightdash."
+                    >
+                        <SettingsGridCard>
+                            <div>
+                                <Title order={5}>Scheduled deliveries</Title>
+                                <Text c="ldGray.6" fz="xs">
+                                    Control how files exported from your
+                                    organization — starting with scheduled
+                                    deliveries — are shared.{' '}
+                                    <Anchor
+                                        inherit
+                                        href="https://docs.lightdash.com/guides/how-to-create-scheduled-deliveries"
+                                        target="_blank"
+                                        rel="noreferrer"
+                                    >
+                                        Learn more about scheduled deliveries
+                                    </Anchor>
+                                    .
+                                </Text>
+                            </div>
+                            <ExportingPanel />
+                        </SettingsGridCard>
+                    </SettingsPage>
+                ),
+            });
+        }
+        if (isProLimitsEnabled && user?.ability.can('manage', 'Organization')) {
+            allowedRoutes.push({
+                path: '/limits',
+                element: (
+                    <SettingsPage
+                        title="Limits"
+                        description="Set organization-wide query and export limits."
+                    >
+                        <SettingsGridCard>
+                            <div>
+                                <Title order={5}>Query and export limits</Title>
+                                <Text c="ldGray.6" fz="xs">
+                                    Limit how many rows a query can return and
+                                    how many cells a CSV or Excel export can
+                                    contain for your organization.
+                                </Text>
+                            </div>
+                            <LimitsPanel />
+                        </SettingsGridCard>
+                    </SettingsPage>
+                ),
+            });
+        }
+        if (
+            user?.ability.can(
+                'manage',
+                subject('OrganizationMemberProfile', {
+                    organizationUuid: organization?.organizationUuid,
+                }),
+            )
+        ) {
+            allowedRoutes.push({
+                path: '/userManagement',
+                element: <UsersAndGroupsPanel />,
+            });
+        }
+
+        if (
+            user?.ability.can(
+                'manage',
+                subject('Organization', {
+                    organizationUuid: organization?.organizationUuid,
+                }),
+            )
+        ) {
+            allowedRoutes.push({
+                path: '/userAttributes',
+                element: <UserAttributesPanel />,
+            });
+        }
+        if (
+            user?.ability.can(
+                'manage',
+                subject('OrganizationWarehouseCredentials', {
+                    organizationUuid: organization?.organizationUuid,
+                }),
+            )
+        ) {
+            allowedRoutes.push({
+                path: '/warehouseCredentials',
+                element: <OrganizationWarehouseCredentialsPanel />,
+            });
+        }
+        if (
+            organization &&
+            !organization.needsProject &&
+            user?.ability.can('view', 'Project')
+        ) {
+            allowedRoutes.push({
+                path: '/projectManagement',
+                element: <ProjectManagementPanel />,
+            });
+        }
+
+        if (
+            project &&
+            organization &&
+            !organization.needsProject &&
+            user?.ability.can(
+                'update',
+                subject('Project', {
+                    organizationUuid: organization.organizationUuid,
+                    projectUuid: project.projectUuid,
+                }),
+            )
+        ) {
+            allowedRoutes.push({
+                path: '/projectManagement/:projectUuid/*',
+                element: (
+                    <TrackPage name={PageName.PROJECT_SETTINGS}>
+                        <ProjectSettings />
+                    </TrackPage>
+                ),
+            });
+        }
+        if (user?.ability.can('manage', 'PersonalAccessToken')) {
+            allowedRoutes.push({
+                path: '/personalAccessTokens',
+                element: <AccessTokensPanel />,
+            });
+        }
+
+        if (
+            dataAppsFlag?.enabled &&
+            user?.ability.can('view', 'OrganizationDesign')
+        ) {
+            allowedRoutes.push({
+                path: '/themes',
+                element: <DesignListPage />,
+            });
+        }
+
+        if (user?.ability.can('manage', 'Organization')) {
+            allowedRoutes.push({
+                path: '/integrations',
+                element: (
+                    <SettingsPage
+                        title="Integrations"
+                        description="Connect Lightdash to the tools your organization uses."
+                    >
+                        {!health?.hasSlack &&
+                            !health?.hasGithub &&
+                            !health?.hasGitlab &&
+                            'No integrations available'}
+                        {health?.hasSlack && <SlackSettingsPanel />}
+                        {health?.hasGithub && <GithubSettingsPanel />}
+                        {health?.hasGitlab && <GitlabSettingsPanel />}
+                    </SettingsPage>
+                ),
+            });
+        }
+
+        if (user?.ability.can('manage', 'Organization')) {
+            allowedRoutes.push({
+                path: '/oauthClients',
+                element: <OAuthClientsPanel />,
+            });
+        }
+
+        if (
+            user?.ability.can('manage', 'Organization') &&
+            isSsoOrganizationSettingsEnabled
+        ) {
+            allowedRoutes.push({
+                path: '/verifiedDomains',
+                element: <VerifiedDomainsPanel />,
+            });
+        }
+
+        if (
+            user?.ability.can('manage', 'Organization') &&
+            isEmailWhitelabelEnabled
+        ) {
+            allowedRoutes.push({
+                path: '/emailWhitelabel',
+                element: <EmailWhitelabelPanel />,
+            });
+        }
+
+        if (
+            user?.ability.can('manage', 'Organization') &&
+            isSsoOrganizationSettingsEnabled
+        ) {
+            allowedRoutes.push({
+                path: '/sso',
+                element: (
+                    <SettingsPage
+                        title="Single Sign-On"
+                        description="Configure SSO providers and account linking. Users are routed to the matching provider based on their email domain."
+                    >
+                        <AzureAdSsoPanel />
+                        <OktaSsoPanel />
+                        <GenericOidcSsoPanel />
+                        <OneLoginSsoPanel />
+                        {/* Google has no per-org credentials; only show the
+                            toggle when Google is enabled instance-wide. */}
+                        {health?.auth.google.enabled && <GoogleSsoPanel />}
+                        <AccountLinkingPanel />
+                    </SettingsPage>
+                ),
+            });
+        }
+
+        // Commercial route
+        if (
+            user?.ability.can('manage', 'Organization') &&
+            isScimTokenManagementEnabled?.enabled
+        ) {
+            allowedRoutes.push({
+                path: '/scimAccessTokens',
+                element: <ScimAccessTokensPanel />,
+            });
+        }
+
+        if (
+            user?.ability.can('manage', 'Organization') &&
+            isServiceAccountsEnabled
+        ) {
+            allowedRoutes.push({
+                path: '/serviceAccounts',
+                element: <ServiceAccountsPage />,
+            });
+        }
+
+        if (isAiCopilotEnabledOrTrial && hasAnyAiAgentAccess) {
+            allowedRoutes.push({
+                path: '/ai',
+                element: (
+                    <Navigate
+                        to={
+                            canManageOrgAiAgent
+                                ? '/generalSettings/ai/general'
+                                : '/generalSettings/ai/threads'
+                        }
+                        replace
+                    />
+                ),
+            });
+            // General is org-wide config (router, org settings) — org admins only.
+            if (canManageOrgAiAgent) {
+                allowedRoutes.push({
+                    path: '/ai/general',
+                    element: <AiGeneralSettingsPage />,
+                });
+            }
+            allowedRoutes.push({
+                path: '/ai/threads',
+                element: (
+                    <AiSettingsProviders>
+                        <AiThreadsSettingsPage />
+                    </AiSettingsProviders>
+                ),
+            });
+            allowedRoutes.push({
+                path: '/ai/agents',
+                element: (
+                    <AiSettingsProviders>
+                        <AiAgentsSettingsPage />
+                    </AiSettingsProviders>
+                ),
+            });
+            allowedRoutes.push({
+                path: '/ai/mcp',
+                element: (
+                    <AiSettingsProviders>
+                        <McpActivitySettingsPage />
+                    </AiSettingsProviders>
+                ),
+            });
+            if (shouldShowAiAgentReviews) {
+                allowedRoutes.push({
+                    path: '/ai/issues',
+                    element: (
+                        <AiSettingsProviders>
+                            <AiReviewsSettingsPage />
+                        </AiSettingsProviders>
+                    ),
+                });
+                allowedRoutes.push({
+                    path: '/ai/issues/:fingerprint',
+                    element: (
+                        <AiSettingsProviders>
+                            <ReviewRemediationWorkspace />
+                        </AiSettingsProviders>
+                    ),
+                });
+                allowedRoutes.push({
+                    path: '/ai/reviews',
+                    element: <AiReviewsToIssuesRedirect />,
+                });
+                allowedRoutes.push({
+                    path: '/ai/reviews/:fingerprint',
+                    element: <AiReviewsToIssuesRedirect itemRoute />,
+                });
+            }
+        }
+
+        if (
+            user?.ability.can('manage', 'Organization') &&
+            isCustomRolesEnabled
+        ) {
+            allowedRoutes.push({
+                path: '/customRoles',
+                element: <CustomRoles />,
+            });
+            allowedRoutes.push({
+                path: '/customRoles/create',
+                element: <CustomRoleCreate />,
+            });
+            allowedRoutes.push({
+                path: '/customRoles/duplicate',
+                element: <CustomRoleDuplicate />,
+            });
+            allowedRoutes.push({
+                path: '/customRoles/:roleId',
+                element: <CustomRoleEdit />,
+            });
+        }
+
+        return allowedRoutes;
+    }, [
+        allowPasswordAuthentication,
+        user?.ability,
+        organization,
+        project,
+        isScimTokenManagementEnabled?.enabled,
+        isServiceAccountsEnabled,
+        isCustomRolesEnabled,
+        hasSocialLogin,
+        showImpersonationPanel,
+        health?.hasSlack,
+        health?.hasGithub,
+        health?.hasGitlab,
+        health?.auth.google.enabled,
+        dataAppsFlag?.enabled,
+        isProLimitsEnabled,
+        isSsoOrganizationSettingsEnabled,
+        isEmailWhitelabelEnabled,
+        isLeaveOrganizationEnabled,
+        isAiCopilotEnabledOrTrial,
+        shouldShowAiAgentReviews,
+        canManageOrgAiAgent,
+        hasAnyAiAgentAccess,
+    ]);
+    const routeElements = useRoutes(routes);
+
+    const isFixedContent = useMemo(() => {
+        return (
+            !matchPath(
+                {
+                    path: '/generalSettings/projectManagement',
+                    end: true,
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/projectManagement/:projectUuid/scheduledDeliveries',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/projectManagement/:projectUuid/compilationHistory',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/projectManagement/:projectUuid/recentlyDeleted',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/customRoles',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/customRoles/:roleId',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/serviceAccounts',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/projectManagement/:projectUuid/preAggregates/*',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/projectManagement/:projectUuid/validator',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                {
+                    path: '/generalSettings/projectManagement/:projectUuid/pullRequests',
+                },
+                location.pathname,
+            ) &&
+            !matchPath(
+                { path: '/generalSettings/ai/threads' },
+                location.pathname,
+            ) &&
+            !matchPath(
+                { path: '/generalSettings/ai/agents' },
+                location.pathname,
+            ) &&
+            !matchPath(
+                { path: '/generalSettings/ai/mcp' },
+                location.pathname,
+            ) &&
+            !matchPath(
+                { path: '/generalSettings/ai/reviews' },
+                location.pathname,
+            ) &&
+            !matchPath(
+                { path: '/generalSettings/ai/reviews/:fingerprint' },
+                location.pathname,
+            ) &&
+            !matchPath(
+                { path: '/generalSettings/ai/issues' },
+                location.pathname,
+            ) &&
+            !matchPath(
+                { path: '/generalSettings/ai/issues/:fingerprint' },
+                location.pathname,
+            )
+        );
+    }, [location.pathname]);
+
+    // Only block on AI org settings while actually navigating to an AI route, so
+    // its dynamic routes (e.g. /ai/reviews) register before the catch-all redirect
+    // fires on a hard refresh. Scoping it here means a failure of that query no
+    // longer blanks the entire Settings surface — every non-AI route still renders.
+    const isAwaitingAiSettingsRoute =
+        isAiOrganizationSettingsLoading &&
+        Boolean(matchPath('/generalSettings/ai/*', location.pathname));
+
+    if (
+        isHealthLoading ||
+        isUserLoading ||
+        isOrganizationLoading ||
+        isActiveProjectUuidLoading ||
+        isProjectLoading ||
+        isAwaitingAiSettingsRoute
+    ) {
+        return <PageSpinner />;
+    }
+
+    if (userError || healthError || organizationError || projectError) {
+        return (
+            <ErrorState
+                error={
+                    userError?.error ||
+                    healthError?.error ||
+                    organizationError?.error ||
+                    projectError?.error
+                }
+            />
+        );
+    }
+
+    if (!health || !user || !organization) return null;
+
+    return (
+        <Page
+            withFullHeight
+            withSidebarFooter
+            withFixedContent={isFixedContent}
+            withPaddedContent
+            title="Settings"
+            sidebarWidthProps={{ defaultWidth: 300, minWidth: 260 }}
+            isSidebarCollapsed={isSidebarCollapsed}
+            isSidebarCollapsible
+            collapsedSidebarContent={
+                <Tooltip label="Pin sidebar" position="right">
+                    <ActionIcon
+                        variant="subtle"
+                        color="gray"
+                        size="lg"
+                        onClick={() => setIsSidebarCollapsed(false)}
+                        aria-label="Pin sidebar"
+                    >
+                        <MantineIcon icon={IconLayoutSidebarLeftExpand} />
+                    </ActionIcon>
+                </Tooltip>
+            }
+            sidebar={
+                <Stack className={classes.sidebarStack}>
+                    <Group
+                        justify="space-between"
+                        align="center"
+                        className={classes.sidebarHeader}
+                    >
+                        <PageBreadcrumbs
+                            items={[{ title: 'Settings', active: true }]}
+                        />
+                        <Tooltip
+                            label={
+                                isSidebarCollapsed
+                                    ? 'Pin sidebar'
+                                    : 'Unpin sidebar'
+                            }
+                        >
+                            <ActionIcon
+                                variant="subtle"
+                                color="gray"
+                                size="lg"
+                                onClick={() =>
+                                    setIsSidebarCollapsed(!isSidebarCollapsed)
+                                }
+                                aria-label={
+                                    isSidebarCollapsed
+                                        ? 'Pin sidebar'
+                                        : 'Unpin sidebar'
+                                }
+                            >
+                                <MantineIcon
+                                    icon={
+                                        isSidebarCollapsed
+                                            ? IconLayoutSidebarLeftExpand
+                                            : IconLayoutSidebarLeftCollapse
+                                    }
+                                />
+                            </ActionIcon>
+                        </Tooltip>
+                    </Group>
+                    <SettingsSearchInput value={search} onChange={setSearch} />
+                    <ScrollArea
+                        type="scroll"
+                        scrollbarSize={8}
+                        scrollHideDelay={800}
+                        className={classes.sidebarScroll}
+                    >
+                        {filteredSections.length > 0 ? (
+                            <SettingsNavigation
+                                sections={filteredSections}
+                                searchQuery={debouncedSearch}
+                            />
+                        ) : (
+                            <Stack gap="xs" align="center" py="xl" px="md">
+                                <Text fz="sm" c="ldGray.6" ta="center">
+                                    No settings match “{debouncedSearch.trim()}”
+                                </Text>
+                                <Anchor
+                                    component="button"
+                                    type="button"
+                                    fz="xs"
+                                    onClick={() => setSearch('')}
+                                >
+                                    Clear search
+                                </Anchor>
+                            </Stack>
+                        )}
+                    </ScrollArea>
+                </Stack>
+            }
+        >
+            {routeElements}
+        </Page>
+    );
+};
+
+export default Settings;

@@ -1,0 +1,99 @@
+{
+  description = "Nix flake for Lightdash development environment";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  };
+
+  outputs =
+    { self, nixpkgs }:
+    let
+      supportedSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+
+      forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems (system: f system);
+    in
+    {
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            config = {
+              allowUnfreePredicate = pkg: builtins.elem (nixpkgs.lib.getName pkg) [
+                "graphite-cli"
+              ];
+            };
+          };
+
+          # Socket Firewall Free — blocks malicious npm packages before they hit
+          # disk. Not in nixpkgs, so wrap `npx -y sfw` and expose it on PATH.
+          sfw = pkgs.writeShellScriptBin "sfw" ''
+            exec ${pkgs.nodejs}/bin/npx -y sfw "$@"
+          '';
+        in
+        {
+          default = pkgs.mkShell {
+            name = "lightdash-dev-shell";
+
+            nativeBuildInputs = with pkgs; [
+              gcc
+              gnumake
+              pkg-config
+              libpq
+              libpq.pg_config
+              openssl
+
+              # for @databricks/sql
+              lz4
+            ];
+
+            buildInputs = (with pkgs; [
+              nodejs
+              pnpm
+
+              # for dbt
+              python312
+              postgresql
+
+              jq
+              cloudflared
+
+              git-secrets
+
+              google-cloud-sdk
+              kubectl
+              okteto
+
+              natscli
+
+              graphite-cli
+
+              # for canvas native module
+              expat
+              zlib
+              util-linux # libuuid
+              xz # liblzma
+            ]) ++ [ sfw ];
+
+            env.LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.expat
+              pkgs.zlib
+              pkgs.util-linux
+              pkgs.xz
+            ];
+
+            shellHook = ''
+              # Add dbt aliases to PATH
+              export PATH="$PWD/.venvs/bin:$PATH"
+              echo "⚡️ Entering Lightdash development shell for ${system}..."
+            '';
+          };
+        }
+      );
+    };
+}

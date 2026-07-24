@@ -1,0 +1,923 @@
+import { DepGraph } from 'dependency-graph';
+import {
+    getCategoriesFromResource,
+    getSpotlightConfigurationForResource,
+} from '../compiler/lightdashProjectConfig';
+import assertUnreachable from '../utils/assertUnreachable';
+import { getItemId } from '../utils/item';
+import { type AnyType } from './any';
+import { type ColumnInfo, type CompiledModelNode } from './dbtFromSchema';
+import {
+    type DbtSemanticMetric,
+    type DbtSemanticModel,
+} from './dbtSemanticLayer';
+import { ParseError } from './errors';
+import { type JoinRelationship } from './explore';
+import {
+    FieldType,
+    friendlyName,
+    getMinMaxBaseDimensionMetadata,
+    type CompactOrAlias,
+    type Dimension,
+    type DimensionType,
+    type FieldUrl,
+    type FilterAutocompleteValue,
+    type Format,
+    type Metric,
+    type MetricType,
+    type NumberSeparator,
+    type Source,
+    type TimestampDomain,
+} from './field';
+import { parseFilters, type RequiredFilter } from './filterGrammar';
+import { type LightdashProjectConfig } from './lightdashProjectConfig';
+import { type OrderFieldsByStrategy, type TableBase } from './table';
+import { type DefaultTimeDimension, type TimeFrames } from './timeFrames';
+
+export enum SupportedDbtAdapter {
+    BIGQUERY = 'bigquery',
+    DATABRICKS = 'databricks',
+    SNOWFLAKE = 'snowflake',
+    REDSHIFT = 'redshift',
+    POSTGRES = 'postgres',
+    DUCKDB = 'duckdb',
+    TRINO = 'trino',
+    CLICKHOUSE = 'clickhouse',
+    ATHENA = 'athena',
+    SPARK = 'spark',
+}
+
+export type DbtNodeConfig = {
+    materialized: string;
+    snowflake_warehouse: string;
+};
+export type DbtNode = {
+    unique_id: string;
+    resource_type: string;
+    config?: DbtNodeConfig;
+};
+export type DbtRawModelNode = Omit<
+    CompiledModelNode,
+    'resource_type' | 'compiled' | 'language'
+> & {
+    resource_type: 'model' | 'seed';
+    compiled?: boolean;
+    language?: string;
+    columns: { [name: string]: DbtModelColumn };
+    config?: CompiledModelNode['config'] & { meta?: DbtModelMetadata };
+    meta: DbtModelMetadata;
+};
+export type DbtModelNode = DbtRawModelNode & {
+    database: string;
+    unrendered_config?: {
+        meta?: {
+            joins?: Array<{ join: string }>;
+        };
+    };
+};
+export type DbtModelColumn = ColumnInfo & {
+    meta?: DbtColumnMetadata;
+    data_type?: DimensionType;
+    /** Catalog-derived timestamp domain; sibling of data_type because
+     *  attachTypesToModels overwrites data_type wholesale. */
+    timestamp_domain?: TimestampDomain;
+    config?: {
+        meta?: DbtColumnMetadata;
+    };
+};
+
+type DbtLightdashFieldTags = {
+    tags?: string | string[];
+};
+
+export type DbtModelMetadata = DbtModelLightdashConfig & {};
+
+/**
+ * Additional dimension definition for explore-scoped dimensions.
+ * These dimensions are only available within a specific explore.
+ * They can reference fields from joined tables using ${table.field} syntax.
+ *
+ * Unlike column-level additional dimensions, explore-scoped dimensions
+ * require `type` and `sql` since there's no underlying column to infer from.
+ */
+export type DbtExploreLightdashAdditionalDimension =
+    DbtColumnLightdashAdditionalDimension & {
+        type: DimensionType; // Required for explore-scoped dimensions
+        sql: string; // Required for explore-scoped dimensions
+    };
+
+type ExploreConfig = {
+    label?: string;
+    description?: string;
+    /** @deprecated Use groups instead */
+    group_label?: string;
+    /**
+     * Nested groups for tables in the sidebar (max 5 levels). Group keys
+     * resolve to labels via `table_groups` in lightdash.config.yml; missing
+     * keys fall back to using the key as the label.
+     */
+    groups?: string[];
+    joins?: DbtModelJoin[];
+    case_sensitive?: boolean; // When false, all string filters in this explore will be case insensitive. Default is true
+    sql_filter?: string;
+    sql_where?: string; // alias for sql_filter
+    /**
+     * Explore-scoped custom dimensions.
+     * These dimensions are only available within this specific explore
+     * and can reference fields from any joined table.
+     */
+    additional_dimensions?: Record<
+        string,
+        DbtExploreLightdashAdditionalDimension
+    >;
+};
+
+export type DbtPreAggregateDef = {
+    name: string;
+    dimensions: string[];
+    metrics: string[];
+    filters?: Record<string, AnyType>[];
+    time_dimension?: string;
+    granularity?: string;
+    max_rows?: number;
+    refresh?: {
+        cron?: string;
+    };
+    materialization_role?: {
+        email?: string;
+        attributes?: Record<string, string | string[]>;
+        [key: string]: unknown;
+    };
+};
+
+export type SharedDbtModelLightdashConfig = {
+    default_filters?: RequiredFilter[];
+    /**
+     * @deprecated use default_filters instead
+     */
+    required_filters?: RequiredFilter[]; // Alias for default_filters, for backwards compatibility
+};
+
+export type FieldSetDefinition = {
+    fields: string[];
+};
+
+export type DbtModelLightdashConfig = ExploreConfig &
+    SharedDbtModelLightdashConfig & {
+        metrics?: Record<string, DbtModelLightdashMetric>;
+        sets?: Record<string, FieldSetDefinition>;
+        order_fields_by?: OrderFieldsByStrategy;
+        sql_filter?: string;
+        sql_where?: string; // alias for sql_filter
+        sql_from?: string; // overrides dbt model relation_name
+        required_attributes?: Record<string, string | string[]>;
+        any_attributes?: Record<string, string | string[]>;
+        group_details?: Record<string, DbtModelGroup>;
+        default_time_dimension?: {
+            field: string;
+            interval: TimeFrames;
+        };
+        default_show_underlying_values?: string[];
+        spotlight?: {
+            visibility?: NonNullable<
+                LightdashProjectConfig['spotlight']
+            >['default_visibility'];
+            categories?: string[]; // yaml_reference
+            owner?: string; // model owner email (inherited by metrics)
+        };
+        explores?: Record<
+            string,
+            ExploreConfig & SharedDbtModelLightdashConfig
+        >;
+        ai_hint?: string | string[];
+        parameters?: LightdashProjectConfig['parameters'];
+        primary_key?: string | string[];
+        owner?: string; // model owner email
+        pre_aggregates?: DbtPreAggregateDef[];
+    };
+
+export type DbtModelGroup = {
+    label: string;
+    description?: string;
+    ai_hint?: string | string[];
+};
+
+export type DbtModelJoinType = 'inner' | 'full' | 'left' | 'right';
+
+export type DbtModelJoin = {
+    join: string;
+    sql_on: string;
+    alias?: string;
+    label?: string;
+    type?: DbtModelJoinType;
+    hidden?: boolean;
+    fields?: string[];
+    always?: boolean;
+    relationship?: JoinRelationship;
+    description?: string;
+};
+export type DbtColumnMetadata = DbtColumnLightdashConfig & {};
+type DbtColumnLightdashConfig = {
+    dimension?: DbtColumnLightdashDimension;
+    additional_dimensions?: {
+        [subDimensionName: string]: DbtColumnLightdashAdditionalDimension;
+    };
+    metrics?: { [metricName: string]: DbtColumnLightdashMetric };
+};
+
+export type DbtFilterAutocompleteConfig = {
+    values?: FilterAutocompleteValue[];
+    fetch_from_warehouse?: boolean;
+    label_dimension?: string;
+};
+
+export type DbtColumnLightdashDimension = {
+    name?: string;
+    label?: string;
+    type?: DimensionType;
+    description?: string;
+    sql?: string;
+    time_intervals?: boolean | 'default' | 'OFF' | (TimeFrames | string)[];
+    /** Set to false to opt this dim out of display-tz conversion. Defaults to true. */
+    convert_timezone?: boolean;
+    /** Declares whether the column stores an instant ('aware') or a bare wall
+     *  clock ('naive'); overrides the warehouse catalog. */
+    timestamp_domain?: TimestampDomain;
+    hidden?: boolean;
+    // @deprecated Use format expression instead
+    round?: number;
+    // @deprecated Use format expression instead
+    compact?: CompactOrAlias;
+    format?: Format | string; // Format type is deprecated, use format expression(string) instead
+    /** Number separator style for grouping/decimal characters */
+    separator?: NumberSeparator;
+    /** @deprecated Use groups instead */
+    group_label?: string;
+    groups?: string[] | string;
+    colors?: Record<string, string>;
+    urls?: FieldUrl[];
+    required_attributes?: Record<string, string | string[]>;
+    any_attributes?: Record<string, string | string[]>;
+    ai_hint?: string | string[];
+    case_sensitive?: boolean; // When false, string filters on this dimension will be case insensitive. Default is true
+    filter_autocomplete?: DbtFilterAutocompleteConfig;
+    image?: {
+        url: string;
+        width?: number;
+        height?: number;
+        fit?: string;
+    };
+    richText?: string;
+    spotlight?: {
+        filter_by?: boolean;
+        segment_by?: boolean;
+    };
+} & DbtLightdashFieldTags;
+
+export type DbtColumnLightdashAdditionalDimension = Omit<
+    DbtColumnLightdashDimension,
+    'name'
+>;
+
+export type DbtColumnLightdashMetric = {
+    label?: string;
+    type: MetricType;
+    description?: string;
+    sql?: string;
+    hidden?: boolean;
+    // @deprecated Use format expression instead
+    compact?: CompactOrAlias;
+    // @deprecated Use format expression instead
+    round?: number;
+    format?: Format | string; // Format type is deprecated, use format expression(string) instead
+    /** Number separator style for grouping/decimal characters */
+    separator?: NumberSeparator;
+    /** @deprecated Use groups instead */
+    group_label?: string;
+    groups?: string[];
+    urls?: FieldUrl[];
+    show_underlying_values?: string[];
+    filters?: { [key: string]: AnyType }[];
+    percentile?: number;
+    distinct_keys?: string | string[]; // dimension references for sum_distinct deduplication key
+    default_time_dimension?: DefaultTimeDimension;
+    spotlight?: {
+        visibility?: NonNullable<
+            LightdashProjectConfig['spotlight']
+        >['default_visibility'];
+        categories?: string[]; // yaml_reference
+        filter_by?: string[]; // dimension IDs allowlist
+        segment_by?: string[]; // dimension IDs allowlist
+        default_segment?: string; // dimension name pre-selected in Segment by
+        default_filter?: Record<string, AnyType>; // { dimension: value | value[] }, metric filter DSL
+        owner?: string; // metric owner email
+    };
+    drivers?: string[]; // metrics that drive this metric (same-table: 'name', cross-table: 'table.name')
+    ai_hint?: string | string[];
+    richText?: string;
+} & DbtLightdashFieldTags;
+
+export type DbtModelLightdashMetric = DbtColumnLightdashMetric &
+    Required<Pick<DbtColumnLightdashMetric, 'sql'>>;
+
+export const normaliseModelDatabase = (
+    model: DbtRawModelNode,
+    targetWarehouse: SupportedDbtAdapter,
+): DbtModelNode => {
+    switch (targetWarehouse) {
+        case SupportedDbtAdapter.POSTGRES:
+        case SupportedDbtAdapter.BIGQUERY:
+        case SupportedDbtAdapter.SNOWFLAKE:
+        case SupportedDbtAdapter.TRINO:
+        case SupportedDbtAdapter.ATHENA:
+        case SupportedDbtAdapter.REDSHIFT:
+        case SupportedDbtAdapter.DUCKDB:
+            if (model.database === null) {
+                throw new ParseError(
+                    `Cannot parse dbt model '${model.unique_id}' because the database field has null value.`,
+                    {},
+                );
+            }
+            return { ...model, database: model.database as string };
+        case SupportedDbtAdapter.CLICKHOUSE:
+            return { ...model, database: '' }; // Clickhouse doesn't have a database field
+        case SupportedDbtAdapter.DATABRICKS:
+        case SupportedDbtAdapter.SPARK:
+            return { ...model, database: model.database || 'DEFAULT' };
+        default:
+            return assertUnreachable(
+                targetWarehouse,
+                `Cannot recognise warehouse ${targetWarehouse}`,
+            );
+    }
+};
+export const patchPathParts = (
+    patchPath: string,
+): { project: string | null; path: string } => {
+    // dbt-core format: `project://path/to/file.yml`
+    // dbt-fusion format: raw path with no project prefix, may contain Windows backslashes
+    const normalized = patchPath.replace(/\\/g, '/');
+    const separatorIndex = normalized.indexOf('://');
+    if (separatorIndex === -1) {
+        return {
+            project: null,
+            path: normalized,
+        };
+    }
+    return {
+        project: normalized.slice(0, separatorIndex),
+        path: normalized.slice(separatorIndex + '://'.length),
+    };
+};
+
+export type LineageGraph = Record<string, LineageNodeDependency[]>;
+export type LineageNodeDependency = {
+    type: 'model' | 'seed' | 'source';
+    name: string;
+};
+export const buildModelGraph = (
+    allModels: Pick<DbtModelNode, 'unique_id' | 'name' | 'depends_on'>[],
+): DepGraph<LineageNodeDependency> => {
+    const depGraph = new DepGraph<LineageNodeDependency>();
+    const lookup = Object.fromEntries(
+        allModels.map((model) => [model.unique_id, model]),
+    );
+    allModels.forEach((model) => {
+        depGraph.addNode(model.unique_id, { type: 'model', name: model.name });
+        // Only use models for graph.
+        model.depends_on?.nodes?.forEach((nodeId) => {
+            const node = lookup[nodeId];
+            if (node) {
+                depGraph.addNode(node.unique_id, {
+                    type: 'model',
+                    name: node.name,
+                });
+                depGraph.addDependency(model.unique_id, node.unique_id);
+            }
+        });
+    });
+    return depGraph;
+};
+
+export interface DbtCatalogNode {
+    metadata: DbtCatalogNodeMetadata;
+    columns: {
+        [k: string]: DbtCatalogNodeColumn;
+    };
+}
+
+export interface DbtCatalogNodeMetadata {
+    type: string;
+    database: string | null;
+    schema: string;
+    name: string;
+    comment?: string;
+    owner?: string;
+}
+
+export interface DbtCatalogNodeColumn {
+    type: string;
+    comment?: string;
+    index: number;
+    name: string;
+}
+
+export interface DbtRpcDocsGenerateResults {
+    nodes: {
+        [k: string]: DbtCatalogNode;
+    };
+}
+
+export const isDbtRpcDocsGenerateResults = (
+    results: Record<string, AnyType>,
+): results is DbtRpcDocsGenerateResults =>
+    'nodes' in results &&
+    typeof results.nodes === 'object' &&
+    results.nodes !== null &&
+    Object.values(results.nodes).every(
+        (node) =>
+            typeof node === 'object' &&
+            node !== null &&
+            'metadata' in node &&
+            'columns' in node,
+    );
+
+export interface DbtPackage {
+    package: string;
+    version: string;
+}
+
+export interface DbtPackages {
+    packages: DbtPackage[];
+}
+
+export const isDbtPackages = (
+    results: Record<string, AnyType>,
+): results is DbtPackages => 'packages' in results;
+
+export type DbtDoc = {
+    unique_id: string;
+    name: string;
+    block_contents: string;
+};
+
+export interface DbtManifest {
+    nodes: Record<string, DbtNode>;
+    metadata: DbtRawManifestMetadata;
+    /**
+     * dbt MetricFlow metrics (dbt >= 1.6). Translated into Lightdash metrics
+     * during CLI compile — see `translateMetricFlowMetrics`.
+     */
+    metrics: Record<string, DbtSemanticMetric>;
+    docs: Record<string, DbtDoc>;
+    /**
+     * Opaque manifest sections that Lightdash carries through the multi-source
+     * merge (`combineManifestSources`) but does not interpret during compile —
+     * the already-compiled `nodes` carry resolved relation_names, so these are
+     * not read today. Kept for faithful merging and future write-back source
+     * attribution. Optional: not every manifest (or test fixture) includes them.
+     */
+    sources?: Record<string, AnyType>;
+    macros?: Record<string, AnyType>;
+    semantic_models?: Record<string, DbtSemanticModel>;
+}
+
+export interface DbtRawManifestMetadata {
+    dbt_schema_version: string;
+    generated_at: string;
+    adapter_type: string;
+}
+
+export interface DbtManifestMetadata extends DbtRawManifestMetadata {
+    adapter_type: SupportedDbtAdapter;
+}
+
+const isDbtRawManifestMetadata = (x: AnyType): x is DbtRawManifestMetadata =>
+    typeof x === 'object' &&
+    x !== null &&
+    'dbt_schema_version' in x &&
+    'generated_at' in x &&
+    'adapter_type' in x;
+export const isSupportedDbtAdapter = (
+    x: DbtRawManifestMetadata,
+): x is DbtManifestMetadata =>
+    isDbtRawManifestMetadata(x) &&
+    Object.values<string>(SupportedDbtAdapter).includes(x.adapter_type);
+
+export const isSupportedDbtAdapterType = (
+    x: string,
+): x is SupportedDbtAdapter =>
+    Object.values<string>(SupportedDbtAdapter).includes(x);
+
+export interface DbtRpcGetManifestResults {
+    manifest: DbtManifest;
+    selectedModelIds?: string[];
+}
+
+export const isDbtRpcManifestResults = (
+    results: Record<string, AnyType>,
+): results is DbtRpcGetManifestResults =>
+    'manifest' in results &&
+    typeof results.manifest === 'object' &&
+    results.manifest !== null &&
+    'nodes' in results.manifest &&
+    'metadata' in results.manifest &&
+    'metrics' in results.manifest &&
+    isDbtRawManifestMetadata(results.manifest.metadata);
+
+export interface DbtRpcCompileResults {
+    results: { node: DbtNode }[];
+}
+
+export const isDbtRpcCompileResults = (
+    results: Record<string, AnyType>,
+): results is DbtRpcCompileResults =>
+    'results' in results &&
+    Array.isArray(results.results) &&
+    results.results.every(
+        (result) =>
+            typeof result === 'object' &&
+            result !== null &&
+            'node' in result &&
+            typeof result.node === 'object' &&
+            result.node !== null &&
+            'unique_id' in result.node &&
+            'resource_type' in result.node,
+    );
+
+export interface DbtRpcRunSqlResults {
+    results: {
+        table: { column_names: string[]; rows: AnyType[][] };
+    }[];
+}
+
+export const convertToGroups = (
+    dbtGroups: string | string[] | undefined,
+    dbtGroupLabel: string | undefined,
+): string[] => {
+    let groups: string[] = [];
+    if (dbtGroups) {
+        if (typeof dbtGroups === 'string') {
+            groups = [dbtGroups];
+        } else {
+            groups = [...dbtGroups];
+        }
+    } else if (dbtGroupLabel) {
+        groups = [dbtGroupLabel];
+    }
+    return groups;
+};
+
+export const convertToAiHints = (aiHint: unknown): string[] | undefined => {
+    if (typeof aiHint === 'string') {
+        return aiHint ? [aiHint] : undefined;
+    }
+    if (!Array.isArray(aiHint)) {
+        return undefined;
+    }
+
+    const hints = aiHint.filter(
+        (hint): hint is string => typeof hint === 'string',
+    );
+    return hints.length > 0 ? hints : undefined;
+};
+
+export const flattenAiHints = (aiHint: unknown): string =>
+    convertToAiHints(aiHint)?.join(' ') ?? '';
+
+export const getEffectiveFieldAiHints = (
+    field: Pick<Dimension | Metric, 'aiHint' | 'groups'>,
+    table: Pick<TableBase, 'groupDetails'> | undefined,
+): string[] | undefined => {
+    const hints = [
+        ...(convertToAiHints(field.aiHint) ?? []),
+        ...(field.groups ?? []).flatMap(
+            (group) =>
+                convertToAiHints(table?.groupDetails?.[group]?.aiHint) ?? [],
+        ),
+    ];
+
+    return hints.length > 0 ? [...new Set(hints)] : undefined;
+};
+
+export const isDbtRpcRunSqlResults = (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    results: Record<string, any>,
+): results is DbtRpcRunSqlResults =>
+    'results' in results &&
+    Array.isArray(results.results) &&
+    results.results.every(
+        (result) =>
+            typeof result === 'object' &&
+            result !== null &&
+            'table' in result &&
+            typeof result.table === 'object' &&
+            result.table !== null &&
+            'column_names' in result.table &&
+            Array.isArray(result.table.column_names) &&
+            'rows' in result.table &&
+            Array.isArray(result.table.rows),
+    );
+
+type ConvertModelMetricArgs = {
+    modelName: string;
+    name: string;
+    metric: DbtModelLightdashMetric;
+    source?: Source;
+    tableLabel: string;
+    dimensionReference?: string;
+    requiredAttributes?: Record<string, string | string[]>;
+    anyAttributes?: Record<string, string | string[]>;
+    spotlightConfig?: LightdashProjectConfig['spotlight'];
+    modelCategories?: string[];
+    modelOwner?: string;
+    defaultShowUnderlyingValues?: string[];
+    baseDimensionType?: DimensionType;
+    baseDimensionTimeInterval?: TimeFrames;
+};
+export const convertModelMetric = ({
+    modelName,
+    name,
+    metric,
+    source,
+    tableLabel,
+    dimensionReference,
+    requiredAttributes,
+    anyAttributes,
+    spotlightConfig,
+    modelCategories = [],
+    modelOwner,
+    defaultShowUnderlyingValues,
+    baseDimensionType,
+    baseDimensionTimeInterval,
+}: ConvertModelMetricArgs): Metric => {
+    const groups = convertToGroups(metric.groups, metric.group_label);
+    const spotlightVisibility =
+        metric.spotlight?.visibility ?? spotlightConfig?.default_visibility;
+    const metricCategories = Array.from(
+        new Set([...modelCategories, ...(metric.spotlight?.categories || [])]),
+    );
+
+    const spotlightCategories = getCategoriesFromResource(
+        'metric',
+        name,
+        spotlightConfig,
+        metricCategories,
+    );
+
+    // Metric owner takes precedence over model owner
+    const owner = metric.spotlight?.owner ?? modelOwner;
+    const [parsedDefaultFilter] = parseFilters(
+        metric.spotlight?.default_filter
+            ? [metric.spotlight.default_filter]
+            : undefined,
+    );
+    // A spotlight default filter is pre-applied but removable, i.e. non-required.
+    const defaultFilter = parsedDefaultFilter
+        ? { ...parsedDefaultFilter, required: false }
+        : undefined;
+
+    return {
+        fieldType: FieldType.METRIC,
+        name,
+        label: metric.label || friendlyName(name),
+        sql: metric.sql,
+        table: modelName,
+        tableLabel,
+        type: metric.type,
+        description: metric.description,
+        source,
+        hidden: !!metric.hidden,
+        round: metric.round,
+        compact: metric.compact,
+        format: metric.format,
+        separator: metric.separator,
+        groups,
+        showUnderlyingValues:
+            metric.show_underlying_values ?? defaultShowUnderlyingValues,
+        filters: parseFilters(metric.filters),
+        percentile: metric.percentile,
+        ...(metric.distinct_keys
+            ? {
+                  distinctKeys: Array.isArray(metric.distinct_keys)
+                      ? metric.distinct_keys
+                      : [metric.distinct_keys],
+              }
+            : {}),
+        dimensionReference,
+        ...getMinMaxBaseDimensionMetadata(
+            metric.type,
+            baseDimensionType
+                ? {
+                      type: baseDimensionType,
+                      timeInterval: baseDimensionTimeInterval,
+                  }
+                : undefined,
+        ),
+        requiredAttributes,
+        anyAttributes,
+        ...(metric.urls ? { urls: metric.urls } : null),
+        ...(metric.tags
+            ? {
+                  tags: Array.isArray(metric.tags)
+                      ? metric.tags
+                      : [metric.tags],
+              }
+            : null),
+        ...(metric.default_time_dimension
+            ? {
+                  defaultTimeDimension: {
+                      field: metric.default_time_dimension.field,
+                      interval: metric.default_time_dimension.interval,
+                  },
+              }
+            : null),
+        ...getSpotlightConfigurationForResource({
+            visibility: spotlightVisibility,
+            categories: spotlightCategories,
+            filterBy: metric.spotlight?.filter_by,
+            segmentBy: metric.spotlight?.segment_by,
+            defaultSegment: metric.spotlight?.default_segment,
+            defaultFilter,
+            owner,
+        }),
+        ...(metric.drivers ? { drivers: metric.drivers } : {}),
+        ...(metric.ai_hint ? { aiHint: convertToAiHints(metric.ai_hint) } : {}),
+        ...(metric.richText ? { richText: metric.richText } : {}),
+    };
+};
+
+type ConvertColumnMetricArgs = Omit<
+    ConvertModelMetricArgs,
+    'metric' | 'baseDimensionType' | 'baseDimensionTimeInterval'
+> & {
+    metric: DbtColumnLightdashMetric;
+    dimensionName?: string;
+    dimensionSql: string;
+    // Type/interval of the column this metric is declared under. Only trusted as
+    // the metric's base when the metric does not override `sql` — see
+    // convertColumnMetric.
+    dimensionType?: DimensionType;
+    dimensionTimeInterval?: TimeFrames;
+    requiredAttributes?: Record<string, string | string[]>;
+    anyAttributes?: Record<string, string | string[]>;
+    modelCategories?: string[];
+};
+
+export const convertColumnMetric = ({
+    modelName,
+    dimensionName,
+    dimensionSql,
+    dimensionType,
+    dimensionTimeInterval,
+    name,
+    metric,
+    source,
+    tableLabel,
+    requiredAttributes,
+    anyAttributes,
+    spotlightConfig,
+    modelCategories = [],
+    modelOwner,
+    defaultShowUnderlyingValues,
+}: ConvertColumnMetricArgs): Metric => {
+    // The column's type is only a reliable base when the metric actually
+    // aggregates it: no `sql`, or a `sql` equal to dimensionSql. A `sql` pointing
+    // elsewhere (e.g. MAX(id) under a DATE column) must not inherit the type.
+    const aggregatesOwnColumn = !metric.sql || metric.sql === dimensionSql;
+    return convertModelMetric({
+        modelName,
+        name,
+        metric: {
+            ...metric,
+            sql: metric.sql || dimensionSql,
+            description:
+                metric.description ||
+                (dimensionName
+                    ? `${friendlyName(metric.type)} of ${friendlyName(
+                          dimensionName,
+                      )}`
+                    : undefined),
+        },
+        source,
+        tableLabel,
+        dimensionReference: dimensionName
+            ? getItemId({ table: modelName, name: dimensionName })
+            : undefined,
+        baseDimensionType: aggregatesOwnColumn ? dimensionType : undefined,
+        baseDimensionTimeInterval: aggregatesOwnColumn
+            ? dimensionTimeInterval
+            : undefined,
+        requiredAttributes,
+        anyAttributes,
+        ...(metric.default_time_dimension
+            ? {
+                  defaultTimeDimension: {
+                      field: metric.default_time_dimension.field,
+                      interval: metric.default_time_dimension.interval,
+                  },
+              }
+            : null),
+        spotlightConfig,
+        modelCategories,
+        modelOwner,
+        defaultShowUnderlyingValues,
+    });
+};
+
+export enum DbtManifestVersion {
+    V7 = 'v7',
+    V8 = 'v8',
+    V9 = 'v9',
+    V10 = 'v10',
+    V11 = 'v11',
+    V12 = 'v12',
+    // dbt fusion
+    V20 = 'v20', // dbt manifest is the same, but lightdashV20.json allows meta as null
+}
+
+export const getDbtManifestVersion = (
+    manifest: DbtManifest,
+): DbtManifestVersion => {
+    const version =
+        manifest.metadata.dbt_schema_version.match(/\/(v\d+).json/)?.[1];
+    if (!version) {
+        throw new Error(
+            `Could not determine dbt manifest version from ${manifest.metadata.dbt_schema_version}`,
+        );
+    }
+    if (
+        Object.values(DbtManifestVersion).includes(
+            version as DbtManifestVersion,
+        )
+    ) {
+        return version as DbtManifestVersion;
+    }
+    throw new Error(`Unsupported dbt manifest version: ${version}`);
+};
+
+export const getLatestSupportedDbtManifestVersion = (): DbtManifestVersion => {
+    const versions = Object.values(DbtManifestVersion);
+    return versions[versions.length - 1];
+};
+
+export enum DbtExposureType {
+    DASHBOARD = 'dashboard',
+    NOTEBOOK = 'notebook',
+    ANALYSIS = 'analysis',
+    ML = 'ml',
+    APPLICATION = 'application',
+}
+
+export type DbtExposure = {
+    name: string; // a unique exposure name written in snake case
+    owner: {
+        name: string;
+        email: string;
+    };
+    type: DbtExposureType;
+    dependsOn: string[]; // list of refs to models. eg: ref('fct_orders')
+    label?: string;
+    description?: string;
+    url?: string;
+    tags?: string[];
+};
+
+export const getModelsFromManifest = (
+    manifest: DbtManifest,
+): DbtModelNode[] => {
+    const models = Object.values(manifest.nodes).filter(
+        (node) =>
+            ['model', 'seed'].includes(node.resource_type) &&
+            node.config?.materialized !== 'ephemeral',
+    ) as DbtRawModelNode[];
+
+    if (!isSupportedDbtAdapter(manifest.metadata)) {
+        throw new ParseError(
+            `dbt adapter not supported. Lightdash does not support adapter ${manifest.metadata.adapter_type}`,
+            {},
+        );
+    }
+    const adapterType = manifest.metadata.adapter_type;
+    return models.map((model) => normaliseModelDatabase(model, adapterType));
+};
+
+export function getCompiledModels(
+    manifestModels: DbtModelNode[],
+    compiledModelIds?: string[],
+) {
+    const isAnyModelCompiled = manifestModels.some((model) => model.compiled);
+
+    return manifestModels.filter((model) => {
+        // Seeds are always included — they don't appear in dbt ls output
+        // and don't have a compiled field.
+        if (model.resource_type === 'seed') return true;
+
+        if (compiledModelIds) {
+            return compiledModelIds.includes(model.unique_id);
+        }
+
+        // In case any model is compiled, we only return the compiled models otherwise we return all models (this maintains backwards compatibility + adds ability to use parse)
+        return isAnyModelCompiled ? model.compiled : true;
+    });
+}

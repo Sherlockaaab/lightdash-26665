@@ -1,0 +1,2035 @@
+import { SupportedDbtAdapter } from '../types/dbt';
+import { CompileError } from '../types/errors';
+import { type Table } from '../types/explore';
+import {
+    DimensionType,
+    FieldType,
+    friendlyName,
+    MetricType,
+} from '../types/field';
+import { FilterOperator, UnitOfTime } from '../types/filter';
+import { TimeFrames } from '../types/timeFrames';
+import {
+    ExploreCompiler,
+    getTableColumnReferences,
+    parseAllReferences,
+    sqlAggregationWrapsReferences,
+    sqlContainsAggregation,
+    type UncompiledExplore,
+} from './exploreCompiler';
+import {
+    compiledExploreWithHiddenJoin,
+    compiledExploreWithJoinWithFieldsAndGroups,
+    compiledExploreWithParameters,
+    compiledJoinedExploreOverridingAliasAndLabel,
+    compiledJoinedExploreOverridingJoinAlias,
+    compiledJoinedExploreOverridingJoinDescription,
+    compiledJoinedExploreOverridingJoinLabel,
+    compiledJoinedExploreWithJoinAliasAndSubsetOfFieldsThatDontIncludeSqlFields,
+    compiledJoinedExploreWithSubsetOfFields,
+    compiledJoinedExploreWithSubsetOfFieldsThatDontIncludeSqlFields,
+    compiledJoinedExploreWithTwoJoinsToTheSameTable,
+    compiledSimpleJoinedExplore,
+    compiledSimpleJoinedExploreWithAlwaysTrue,
+    compiledSimpleJoinedExploreWithBaseTableDescription,
+    createExploreWithRequiredFilters,
+    customSqlDimensionWithNoReferences,
+    customSqlDimensionWithReferences,
+    expectedCompiledCustomSqlDimensionWithNoReferences,
+    expectedCompiledCustomSqlDimensionWithReferences,
+    exploreCircularDimensionReference,
+    exploreCircularDimensionShortReference,
+    exploreCircularMetricReference,
+    exploreCircularMetricShortReference,
+    exploreComplexReference,
+    exploreComplexReferenceCompiled,
+    exploreMissingBaseTable,
+    exploreMissingJoinTable,
+    exploreOneEmptyTable,
+    exploreOneEmptyTableCompiled,
+    exploreReferenceDimension,
+    exploreReferenceDimensionCompiled,
+    exploreReferenceInJoin,
+    exploreReferenceInJoinCompiled,
+    exploreTableSelfReference,
+    exploreTableSelfReferenceCompiled,
+    exploreTableSelfReferenceCompiledSqlWhere,
+    exploreTableSelfReferenceSqlWhere,
+    exploreWithHiddenJoin,
+    exploreWithInvalidParameterReference,
+    exploreWithJoinWithFieldsAndGroups,
+    exploreWithMetricNumber,
+    exploreWithMetricNumberCompiled,
+    exploreWithMixedDimensionAndMetricReferences,
+    exploreWithMixedDimensionAndMetricReferencesCompiled,
+    exploreWithNonAggregateMetricWithAggregationInSql,
+    exploreWithNonAggregateMetricWithAggregationInSqlCompiled,
+    exploreWithParameters,
+    exploreWithRequiredAttributes,
+    exploreWithRequiredAttributesCompiled,
+    joinedExploreOverridingAliasAndLabel,
+    joinedExploreOverridingJoinAlias,
+    joinedExploreOverridingJoinDescription,
+    joinedExploreOverridingJoinLabel,
+    joinedExploreWithJoinAliasAndSubsetOfFieldsThatDontIncludeSqlFields,
+    joinedExploreWithSubsetOfFields,
+    joinedExploreWithSubsetOfFieldsThatDontIncludeSqlFields,
+    joinedExploreWithTwoJoinsToTheSameTable,
+    simpleJoinedExplore,
+    simpleJoinedExploreWithAlwaysTrue,
+    simpleJoinedExploreWithBaseTableDescription,
+    tablesWithMetricsWithFilters,
+    warehouseClientMock,
+} from './exploreCompiler.mock';
+
+const compiler = new ExploreCompiler(warehouseClientMock);
+
+test('Should throw when required/default filters reference a hidden dimension', () => {
+    const exploreWithHiddenRequiredFilter = createExploreWithRequiredFilters([
+        {
+            id: 'hidden-filter',
+            target: { fieldRef: 'credit_card_amount' },
+            operator: FilterOperator.GREATER_THAN_OR_EQUAL,
+            values: [0],
+            required: true,
+        },
+        {
+            id: 'visible-filter',
+            target: { fieldRef: 'has_credit_card_payment' },
+            operator: FilterOperator.EQUALS,
+            values: ['true'],
+            required: true,
+        },
+    ]);
+
+    const compileExplore = () =>
+        compiler.compileExplore(exploreWithHiddenRequiredFilter);
+
+    expect(compileExplore).toThrowError(
+        /Hidden fields can't be used in default_filters or required_filters/,
+    );
+    expect(compileExplore).toThrowError(/credit_card_amount/);
+});
+
+test('Should allow required/default filters on visible additional dimensions', () => {
+    const exploreWithVisibleAdditionalRequiredFilter =
+        createExploreWithRequiredFilters([
+            {
+                id: 'visible-filter',
+                target: { fieldRef: 'has_credit_card_payment' },
+                operator: FilterOperator.EQUALS,
+                values: ['true'],
+                required: true,
+            },
+        ]);
+
+    const compiledExplore = compiler.compileExplore(
+        exploreWithVisibleAdditionalRequiredFilter,
+    );
+
+    expect(compiledExplore.tables.orders.requiredFilters).toEqual(
+        expect.arrayContaining([
+            expect.objectContaining({
+                target: expect.objectContaining({
+                    fieldRef: 'has_credit_card_payment',
+                }),
+            }),
+        ]),
+    );
+});
+
+test('Should compile empty table', () => {
+    expect(compiler.compileExplore(exploreOneEmptyTable)).toStrictEqual(
+        exploreOneEmptyTableCompiled,
+    );
+});
+
+test('Should throw error when missing base table', () => {
+    expect(() => compiler.compileExplore(exploreMissingBaseTable)).toThrowError(
+        CompileError,
+    );
+});
+
+test('Should throw error when missing joined table', () => {
+    expect(() => compiler.compileExplore(exploreMissingJoinTable)).toThrowError(
+        CompileError,
+    );
+});
+
+test('Should throw error when dimension/metric has circular reference', () => {
+    expect(() =>
+        compiler.compileExplore(exploreCircularDimensionReference),
+    ).toThrowError(CompileError);
+    expect(() =>
+        compiler.compileExplore(exploreCircularDimensionShortReference),
+    ).toThrowError(CompileError);
+    expect(() =>
+        compiler.compileExplore(exploreCircularMetricReference),
+    ).toThrowError(CompileError);
+    expect(() =>
+        compiler.compileExplore(exploreCircularMetricShortReference),
+    ).toThrowError(CompileError);
+});
+
+test('Should compile table with TABLE reference', () => {
+    expect(compiler.compileExplore(exploreTableSelfReference)).toStrictEqual(
+        exploreTableSelfReferenceCompiled,
+    );
+});
+
+test('Should compile table with TABLE reference on sql where', () => {
+    expect(
+        compiler.compileExplore(exploreTableSelfReferenceSqlWhere),
+    ).toStrictEqual(exploreTableSelfReferenceCompiledSqlWhere);
+});
+
+test('Should compile table with reference to another dimension', () => {
+    expect(compiler.compileExplore(exploreReferenceDimension)).toStrictEqual(
+        exploreReferenceDimensionCompiled,
+    );
+});
+
+test('Should compile table with nested references in dimensions and metrics', () => {
+    expect(compiler.compileExplore(exploreComplexReference)).toStrictEqual(
+        exploreComplexReferenceCompiled,
+    );
+});
+
+test('Should compile with a reference to a dimension in a joined table', () => {
+    expect(compiler.compileExplore(exploreReferenceInJoin)).toStrictEqual(
+        exploreReferenceInJoinCompiled,
+    );
+});
+
+test('Should compile with a reference to a metric in a non-aggregate metric', () => {
+    expect(compiler.compileExplore(exploreWithMetricNumber)).toStrictEqual(
+        exploreWithMetricNumberCompiled,
+    );
+});
+
+test('Should compile non-aggregate metrics with aggregation in SQL referencing dimensions', () => {
+    // This tests the pattern where type:number metrics have aggregation
+    // functions in their SQL (e.g., "count(distinct ${user_id})").
+    // These should be allowed to reference dimensions.
+    expect(
+        compiler.compileExplore(
+            exploreWithNonAggregateMetricWithAggregationInSql,
+        ),
+    ).toStrictEqual(exploreWithNonAggregateMetricWithAggregationInSqlCompiled);
+});
+
+test('Should compile non-aggregate metrics with aggregation in SQL referencing BOTH dimensions AND metrics', () => {
+    // This tests the pattern where type:number metrics have aggregation
+    // and reference both dimensions and other metrics in the same SQL.
+    // For example: "sum(${amount}) / ${user_count}" where amount is a dimension
+    // and user_count is a metric.
+    expect(
+        compiler.compileExplore(exploreWithMixedDimensionAndMetricReferences),
+    ).toStrictEqual(exploreWithMixedDimensionAndMetricReferencesCompiled);
+});
+
+describe('Explores with a base table and joined table', () => {
+    test('should compile', () => {
+        expect(compiler.compileExplore(simpleJoinedExplore)).toStrictEqual(
+            compiledSimpleJoinedExplore,
+        );
+    });
+    test('should compile explore with join with fields and a time interval dimension with groups', () => {
+        expect(
+            compiler.compileExplore(exploreWithJoinWithFieldsAndGroups),
+        ).toStrictEqual(compiledExploreWithJoinWithFieldsAndGroups);
+    });
+    test('should compile with a reference to a dimension in a joined table', () => {
+        expect(compiler.compileExplore(exploreReferenceInJoin)).toStrictEqual(
+            exploreReferenceInJoinCompiled,
+        );
+    });
+    test('should compile with custom label on join', () => {
+        expect(
+            compiler.compileExplore(joinedExploreOverridingJoinLabel),
+        ).toStrictEqual(compiledJoinedExploreOverridingJoinLabel);
+    });
+    test('should compile with alias on join', () => {
+        expect(
+            compiler.compileExplore(joinedExploreOverridingJoinAlias),
+        ).toStrictEqual(compiledJoinedExploreOverridingJoinAlias);
+    });
+    test('should compile with an alias and custom label on join', () => {
+        expect(
+            compiler.compileExplore(joinedExploreOverridingAliasAndLabel),
+        ).toStrictEqual(compiledJoinedExploreOverridingAliasAndLabel);
+    });
+    test('should compile with a subset of fields selected on join', () => {
+        expect(
+            compiler.compileExplore(joinedExploreWithSubsetOfFields),
+        ).toStrictEqual(compiledJoinedExploreWithSubsetOfFields);
+    });
+    test('should compile with 2 joins to the same table, one without alias and one with alias', () => {
+        expect(
+            compiler.compileExplore(joinedExploreWithTwoJoinsToTheSameTable),
+        ).toStrictEqual(compiledJoinedExploreWithTwoJoinsToTheSameTable);
+    });
+    test('should compile with a subset of fields selected on join what dont include the fields in the join SQL', () => {
+        expect(
+            compiler.compileExplore(
+                joinedExploreWithSubsetOfFieldsThatDontIncludeSqlFields,
+            ),
+        ).toStrictEqual(
+            compiledJoinedExploreWithSubsetOfFieldsThatDontIncludeSqlFields,
+        );
+    });
+    test('should compile joins with a join alias and a subset of fields selected on join which dont include the fields in the join SQL', () => {
+        expect(
+            compiler.compileExplore(
+                joinedExploreWithJoinAliasAndSubsetOfFieldsThatDontIncludeSqlFields,
+            ),
+        ).toStrictEqual(
+            compiledJoinedExploreWithJoinAliasAndSubsetOfFieldsThatDontIncludeSqlFields,
+        );
+    });
+    test('should compile with a hidden join', () => {
+        expect(compiler.compileExplore(exploreWithHiddenJoin)).toStrictEqual(
+            compiledExploreWithHiddenJoin,
+        );
+    });
+    test('should use base table description when join has no description override', () => {
+        expect(
+            compiler.compileExplore(
+                simpleJoinedExploreWithBaseTableDescription,
+            ),
+        ).toStrictEqual(compiledSimpleJoinedExploreWithBaseTableDescription);
+    });
+    test('should override base table description with join description', () => {
+        expect(
+            compiler.compileExplore(joinedExploreOverridingJoinDescription),
+        ).toStrictEqual(compiledJoinedExploreOverridingJoinDescription);
+    });
+});
+describe('Case sensitivity with project defaults', () => {
+    test('should use project defaults when explore caseSensitive is not set', () => {
+        const exploreWithProjectDefaults: UncompiledExplore = {
+            ...exploreOneEmptyTable,
+            projectDefaults: {
+                case_sensitive: false,
+            },
+        };
+        const compiled = compiler.compileExplore(exploreWithProjectDefaults);
+        expect(compiled.caseSensitive).toBe(false);
+    });
+
+    test('should use explore caseSensitive over project defaults', () => {
+        const exploreWithBothSettings: UncompiledExplore = {
+            ...exploreOneEmptyTable,
+            caseSensitive: true, // Explore level setting
+            projectDefaults: {
+                case_sensitive: false, // Project level setting
+            },
+        };
+        const compiled = compiler.compileExplore(exploreWithBothSettings);
+        expect(compiled.caseSensitive).toBe(true);
+    });
+
+    test('should not set caseSensitive when neither explore nor project defaults are set', () => {
+        const exploreWithNoSettings: UncompiledExplore = {
+            ...exploreOneEmptyTable,
+        };
+        const compiled = compiler.compileExplore(exploreWithNoSettings);
+        expect(compiled.caseSensitive).toBeUndefined();
+    });
+});
+
+describe('Default field labels render correctly for various input formats', () => {
+    test('should handle uppercase field names', () => {
+        expect(friendlyName('MYFIELDID')).toEqual('Myfieldid');
+        expect(friendlyName('MY_FIELD_ID')).toEqual('My field id');
+    });
+
+    test('should handle camel case names', () => {
+        expect(friendlyName('myFieldId')).toEqual('My field id');
+    });
+
+    test('should handle snake case names', () => {
+        expect(friendlyName('my_field_id')).toEqual('My field id');
+    });
+
+    test('should handle names with numbers at the start', () => {
+        expect(friendlyName('1_field_id')).toEqual('1 field id');
+    });
+    test('should handle names with numbers in the middle', () => {
+        expect(friendlyName('my_1field_id')).toEqual('My 1field id');
+    });
+    test('should handle numbers in the input', () => {
+        expect(friendlyName('numberrange1')).toBe('Numberrange 1');
+        expect(friendlyName('numberrange_14')).toBe('Numberrange 14');
+        expect(friendlyName('date9')).toBe('Date 9');
+    });
+
+    const commonCases = [
+        ['customer_id', 'Customer id'],
+        ['first_name', 'First name'],
+        ['last_name', 'Last name'],
+        ['created', 'Created'],
+        ['payment_id', 'Payment id'],
+        ['order_id', 'Order id'],
+        ['payment_method', 'Payment method'],
+        ['amount', 'Amount'],
+    ];
+    test.each(commonCases)(
+        'should handle common case %s',
+        (input, expected) => {
+            expect(friendlyName(input)).toBe(expected);
+        },
+    );
+
+    test('should handle empty strings', () => {
+        expect(friendlyName('')).toBe('');
+    });
+
+    test('should handle all uppercase input', () => {
+        expect(friendlyName('TIMESTAMP_EST')).toBe('Timestamp est');
+    });
+    test('should handle mixed case input', () => {
+        expect(friendlyName('Timestamp_EST')).toBe('Timestamp est');
+    });
+
+    const underscoreCases = [
+        ['created_by_first_name', 'Created by first name'],
+        ['order_date', 'Order date'],
+        ['customer_lifetime_value', 'Customer lifetime value'],
+        ['days_since_last_order', 'Days since last order'],
+        [
+            'days_between_created_and_first_order',
+            'Days between created and first order',
+        ],
+    ];
+    test.each(underscoreCases)(
+        'should handle multiple underscores %s',
+        (input, expected) => {
+            expect(friendlyName(input)).toBe(expected);
+        },
+    );
+
+    const edgeCases = [
+        ['_timestamp_', 'Timestamp'],
+        ['__timestamp__', 'Timestamp'],
+        ['timestamp__EST', 'Timestamp est'],
+        ['timestamp_EST_', 'Timestamp est'],
+    ];
+    test.each(edgeCases)('should handle edge case %s', (input, expected) => {
+        expect(friendlyName(input)).toBe(expected);
+    });
+
+    const specialCases = [
+        ['timestamp_tz', 'Timestamp tz'],
+        ['timestamp_ntz', 'Timestamp ntz'],
+        ['timestamp_ltz', 'Timestamp ltz'],
+        ['event_id', 'Event id'],
+        ['context_app_version', 'Context app version'],
+    ];
+    test.each(specialCases)(
+        'should handle special case %s',
+        (input, expected) => {
+            expect(friendlyName(input)).toBe(expected);
+        },
+    );
+
+    const additionalCases = [
+        ['name_with-dash', 'Name with dash'],
+        ['name_with.dot', 'Name with dot'],
+        ['name_with/slash', 'Name with slash'],
+        ['Customer_ID', 'Customer id'],
+        ['User_Name', 'User name'],
+    ];
+    test.each(additionalCases)(
+        'should handle special characters and mixed case %s',
+        (input, expected) => {
+            expect(friendlyName(input)).toBe(expected);
+        },
+    );
+});
+
+describe('Compile metrics with filters', () => {
+    beforeAll(() => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('04 Apr 2020 00:12:00 GMT').getTime());
+    });
+    afterAll(() => {
+        vi.useRealTimers();
+    });
+    test('should show filters as columns metric1', () => {
+        expect(
+            compiler.compileMetric(
+                tablesWithMetricsWithFilters.table1.metrics.metric1,
+                tablesWithMetricsWithFilters,
+                [],
+            ).compiledSql,
+        ).toStrictEqual(
+            `MAX(CASE WHEN (("table1".shared) LIKE '%foo%') THEN ("table1".number_column) ELSE NULL END)`,
+        );
+    });
+    test('should show filters as columns metric2', () => {
+        expect(
+            compiler.compileMetric(
+                tablesWithMetricsWithFilters.table2.metrics.metric2,
+                tablesWithMetricsWithFilters,
+                [],
+            ).compiledSql,
+        ).toStrictEqual(
+            `MAX(CASE WHEN (("table2".dim2) < (10) AND ("table2".dim2) > (5)) THEN ("table2".number_column) ELSE NULL END)`,
+        );
+    });
+
+    test('should show filters as columns metric with sql', () => {
+        expect(
+            compiler.compileMetric(
+                tablesWithMetricsWithFilters.table1.metrics.metric_with_sql,
+                tablesWithMetricsWithFilters,
+                [],
+            ).compiledSql,
+        ).toStrictEqual(
+            `MAX(CASE WHEN (("table1".shared) LIKE '%foo%') THEN (CASE WHEN "table1".number_column THEN 1 ELSE 0 END) ELSE NULL END)`,
+        );
+    });
+});
+
+describe('compileMetric spotlight defaults validation', () => {
+    const baseMetric = tablesWithMetricsWithFilters.table1.metrics.metric1;
+
+    test('accepts a valid default_segment and default_filter', () => {
+        const metric = {
+            ...baseMetric,
+            spotlight: {
+                visibility: 'show' as const,
+                segmentBy: ['shared'],
+                defaultSegment: 'shared',
+                defaultFilter: {
+                    id: 'x',
+                    target: { fieldRef: 'shared' },
+                    operator: FilterOperator.EQUALS,
+                    values: ['foo'],
+                },
+            },
+        };
+        expect(() =>
+            compiler.compileMetric(metric, tablesWithMetricsWithFilters, []),
+        ).not.toThrow();
+    });
+
+    test('accepts a joined (cross-table) default_filter reference', () => {
+        const metric = {
+            ...baseMetric,
+            spotlight: {
+                visibility: 'show' as const,
+                defaultFilter: {
+                    id: 'x',
+                    target: { fieldRef: 'table2.dim2' },
+                    operator: FilterOperator.EQUALS,
+                    values: ['v'],
+                },
+            },
+        };
+        expect(() =>
+            compiler.compileMetric(metric, tablesWithMetricsWithFilters, []),
+        ).not.toThrow();
+    });
+
+    test('does not throw for a metric with no spotlight defaults (no regression)', () => {
+        expect(() =>
+            compiler.compileMetric(
+                baseMetric,
+                tablesWithMetricsWithFilters,
+                [],
+            ),
+        ).not.toThrow();
+    });
+
+    test('throws when default_segment is not in the segment_by allowlist', () => {
+        const metric = {
+            ...baseMetric,
+            spotlight: {
+                visibility: 'show' as const,
+                segmentBy: ['shared'],
+                defaultSegment: 'dim1',
+            },
+        };
+        expect(() =>
+            compiler.compileMetric(metric, tablesWithMetricsWithFilters, []),
+        ).toThrowError(/default_segment 'dim1' must be one of segment_by/);
+    });
+
+    test('throws when default_segment dimension is not segmentable', () => {
+        const metric = {
+            ...baseMetric,
+            spotlight: {
+                visibility: 'show' as const,
+                defaultSegment: 'dim1',
+            },
+        };
+        expect(() =>
+            compiler.compileMetric(metric, tablesWithMetricsWithFilters, []),
+        ).toThrowError(/default_segment 'dim1' .* segmentable/);
+    });
+
+    test('throws when default_filter references an unknown dimension', () => {
+        const metric = {
+            ...baseMetric,
+            spotlight: {
+                visibility: 'show' as const,
+                defaultFilter: {
+                    id: 'x',
+                    target: { fieldRef: 'does_not_exist' },
+                    operator: FilterOperator.EQUALS,
+                    values: ['foo'],
+                },
+            },
+        };
+        expect(() =>
+            compiler.compileMetric(metric, tablesWithMetricsWithFilters, []),
+        ).toThrowError(/default_filter references an unknown dimension/);
+    });
+
+    test('throws when default_filter uses an unsupported operator', () => {
+        const metric = {
+            ...baseMetric,
+            spotlight: {
+                visibility: 'show' as const,
+                defaultFilter: {
+                    id: 'x',
+                    target: { fieldRef: 'shared' },
+                    operator: FilterOperator.GREATER_THAN,
+                    values: [4],
+                },
+            },
+        };
+        expect(() =>
+            compiler.compileMetric(metric, tablesWithMetricsWithFilters, []),
+        ).toThrowError(/default_filter uses operator .* not supported/);
+    });
+});
+
+describe('Parse dimension reference', () => {
+    test('should parse dimensions', () => {
+        expect(parseAllReferences('${dimension} == 1', 'table')).toStrictEqual([
+            { refName: 'dimension', refTable: 'table' },
+        ]);
+        expect(parseAllReferences('${table.dimension}', 'table')).toStrictEqual(
+            [{ refName: 'dimension', refTable: 'table' }],
+        );
+    });
+    test('should parse TABLE', () => {
+        expect(parseAllReferences('${TABLE}', 'table')).toStrictEqual([
+            { refName: 'TABLE', refTable: 'table' },
+        ]);
+    });
+    test('should parse unquoted TABLE column references', () => {
+        expect(
+            getTableColumnReferences(
+                'SUM(${TABLE}.amount) + ${TABLE}."Order Total" + ${TABLE}.`tax``rate` + ${TABLE}.some_other_name + ${TABLE}.amount',
+            ),
+        ).toStrictEqual(['amount', 'some_other_name']);
+        expect(
+            getTableColumnReferences(
+                '${TABLE}.address.city + ${amount} + ${orders.shipping_cost}',
+            ),
+        ).toStrictEqual(['address']);
+    });
+    test('should not swallow adjacent references when parsing unquoted TABLE column references', () => {
+        expect(getTableColumnReferences('${TABLE}.a${amount}')).toStrictEqual([
+            'a',
+        ]);
+    });
+    test('should parse unquoted TABLE column references with legacy \\w+ semantics', () => {
+        expect(
+            getTableColumnReferences('${TABLE}.payment_count_30d'),
+        ).toStrictEqual(['payment_count_30d']);
+        expect(getTableColumnReferences('${TABLE}.2024_revenue')).toStrictEqual(
+            ['2024_revenue'],
+        );
+        expect(getTableColumnReferences('${TABLE}.a$b')).toStrictEqual(['a']);
+        expect(getTableColumnReferences('${TABLE}."a$b"')).toStrictEqual([]);
+    });
+    test('should not parse lightdash attribute', () => {
+        expect(
+            parseAllReferences('${lightdash.attribute.country}', 'table'),
+        ).toStrictEqual([]);
+    });
+
+    test('should not parse short lightdash attribute', () => {
+        expect(parseAllReferences('${ld.attr.country}', 'table')).toStrictEqual(
+            [],
+        );
+    });
+
+    test('should parse references with lightdash prefix', () => {
+        expect(
+            parseAllReferences('${lightdash_dimension} == 1', 'table'),
+        ).toStrictEqual([
+            { refName: 'lightdash_dimension', refTable: 'table' },
+        ]);
+        expect(
+            parseAllReferences('${dimension_lightdash} == 1', 'table'),
+        ).toStrictEqual([
+            { refName: 'dimension_lightdash', refTable: 'table' },
+        ]);
+        expect(
+            parseAllReferences(
+                '${lightdash_table.dimension}',
+                'lightdash_table',
+            ),
+        ).toStrictEqual([
+            { refName: 'dimension', refTable: 'lightdash_table' },
+        ]);
+        expect(
+            parseAllReferences(
+                '${table_lightdash.dimension}',
+                'table_lightdash',
+            ),
+        ).toStrictEqual([
+            { refName: 'dimension', refTable: 'table_lightdash' },
+        ]);
+        expect(
+            parseAllReferences('${ld_dimension} == 1', 'table'),
+        ).toStrictEqual([{ refName: 'ld_dimension', refTable: 'table' }]);
+        expect(
+            parseAllReferences('${ld_table.ld_dimension} == 1', 'ld_table'),
+        ).toStrictEqual([{ refName: 'ld_dimension', refTable: 'ld_table' }]);
+    });
+});
+
+describe('Hyphenated table names in references', () => {
+    const hyphenatedTable = 'some_schema-order_events';
+    const exploreWithHyphenatedJoinedTable: UncompiledExplore = {
+        ...simpleJoinedExplore,
+        joinedTables: [
+            {
+                table: hyphenatedTable,
+                sqlOn: `\${a.dim1} = \${${hyphenatedTable}.dim1}`,
+            },
+        ],
+        tables: {
+            a: simpleJoinedExplore.tables.a,
+            [hyphenatedTable]: {
+                ...simpleJoinedExplore.tables.b,
+                name: hyphenatedTable,
+                dimensions: {
+                    dim1: {
+                        ...simpleJoinedExplore.tables.b.dimensions.dim1,
+                        table: hyphenatedTable,
+                    },
+                },
+            },
+        },
+    };
+
+    test('should parse references with hyphenated table names', () => {
+        expect(
+            parseAllReferences(`\${${hyphenatedTable}.dim1}`, 'a'),
+        ).toStrictEqual([{ refName: 'dim1', refTable: hyphenatedTable }]);
+    });
+
+    test('should parse single-part references containing hyphens', () => {
+        expect(parseAllReferences('${my-field}', 'a')).toStrictEqual([
+            { refName: 'my-field', refTable: 'a' },
+        ]);
+    });
+
+    test('should compile join sql_on referencing a hyphenated table', () => {
+        const result = compiler.compileExplore(
+            exploreWithHyphenatedJoinedTable,
+        );
+
+        expect(result.joinedTables[0].compiledSqlOn).toBe(
+            '("a".dim1) = ("some_schema-order_events".dim1)',
+        );
+        expect(result.joinedTables[0].tablesReferences).toStrictEqual([
+            'a',
+            hyphenatedTable,
+        ]);
+    });
+
+    test('should compile a dimension referencing a field in a hyphenated table', () => {
+        const explore: UncompiledExplore = {
+            ...exploreWithHyphenatedJoinedTable,
+            tables: {
+                ...exploreWithHyphenatedJoinedTable.tables,
+                a: {
+                    ...exploreWithHyphenatedJoinedTable.tables.a,
+                    dimensions: {
+                        ...exploreWithHyphenatedJoinedTable.tables.a.dimensions,
+                        dim2: {
+                            ...exploreWithHyphenatedJoinedTable.tables.a
+                                .dimensions.dim1,
+                            name: 'dim2',
+                            label: 'dim2',
+                            sql: `\${${hyphenatedTable}.dim1}`,
+                        },
+                    },
+                },
+            },
+        };
+
+        const result = compiler.compileExplore(explore);
+
+        expect(result.tables.a.dimensions.dim2.compiledSql).toBe(
+            '("some_schema-order_events".dim1)',
+        );
+        expect(result.tables.a.dimensions.dim2.tablesReferences).toEqual(
+            expect.arrayContaining([hyphenatedTable]),
+        );
+    });
+
+    test('should compile a metric referencing a dimension in a hyphenated table', () => {
+        const explore: UncompiledExplore = {
+            ...exploreWithHyphenatedJoinedTable,
+            tables: {
+                ...exploreWithHyphenatedJoinedTable.tables,
+                a: {
+                    ...exploreWithHyphenatedJoinedTable.tables.a,
+                    metrics: {
+                        m1: {
+                            fieldType: FieldType.METRIC,
+                            type: MetricType.SUM,
+                            name: 'm1',
+                            label: 'm1',
+                            table: 'a',
+                            tableLabel: 'a',
+                            sql: `\${${hyphenatedTable}.dim1}`,
+                            hidden: false,
+                        },
+                    },
+                },
+            },
+        };
+
+        const result = compiler.compileExplore(explore);
+
+        expect(result.tables.a.metrics.m1.compiledSql).toBe(
+            'SUM(("some_schema-order_events".dim1))',
+        );
+    });
+
+    test('should still not parse lightdash/ld prefixed references with hyphenated names', () => {
+        expect(
+            parseAllReferences('${lightdash.attributes.my-attr}', 'a'),
+        ).toStrictEqual([]);
+        expect(parseAllReferences('${ld.attr.my-attr}', 'a')).toStrictEqual([]);
+    });
+});
+
+describe('Explore with user attributes', () => {
+    test('should compile explore with table and field required attributes', () => {
+        expect(
+            compiler.compileExplore(exploreWithRequiredAttributes),
+        ).toStrictEqual(exploreWithRequiredAttributesCompiled);
+    });
+});
+
+describe('Explore with always true join', () => {
+    test('should compile explore with always true join', () => {
+        expect(
+            compiler.compileExplore(simpleJoinedExploreWithAlwaysTrue),
+        ).toStrictEqual(compiledSimpleJoinedExploreWithAlwaysTrue);
+    });
+});
+
+describe('Compiled custom dimensions', () => {
+    test('should compile custom dimension with no references', () => {
+        expect(
+            compiler.compileCustomDimension(
+                customSqlDimensionWithNoReferences,
+                simpleJoinedExplore.tables,
+                [],
+            ),
+        ).toStrictEqual(expectedCompiledCustomSqlDimensionWithNoReferences);
+    });
+    test('should compile custom dimension with references', () => {
+        expect(
+            compiler.compileCustomDimension(
+                customSqlDimensionWithReferences,
+                simpleJoinedExplore.tables,
+                [],
+            ),
+        ).toStrictEqual(expectedCompiledCustomSqlDimensionWithReferences);
+    });
+});
+
+describe('Explore compilation with model-level parameters', () => {
+    describe('Parameter inheritance on tables', () => {
+        test('should compile explore with table parameters', () => {
+            const result = compiler.compileExplore(exploreWithParameters);
+
+            expect(result).toStrictEqual(compiledExploreWithParameters);
+        });
+
+        test('should copy parameters to compiled tables', () => {
+            const result = compiler.compileExplore(exploreWithParameters);
+
+            expect(result.tables.a.parameters).toEqual({
+                region: {
+                    label: 'Region',
+                    description: 'Filter by region',
+                    default: 'US',
+                },
+            });
+
+            expect(result.tables.b.parameters).toEqual({
+                active_status: {
+                    label: 'Active Status',
+                    description: 'Define active status',
+                    default: 'active',
+                },
+            });
+        });
+
+        test('should track parameter references in joins', () => {
+            const result = compiler.compileExplore(exploreWithParameters);
+
+            expect(result.joinedTables[0].parameterReferences).toEqual([
+                'b.active_status',
+            ]);
+        });
+    });
+
+    describe('Parameter validation in joins', () => {
+        test('should throw error for invalid parameter references', () => {
+            expect(() =>
+                compiler.compileExplore(exploreWithInvalidParameterReference),
+            ).toThrowError(CompileError);
+        });
+
+        test('should throw error with descriptive message for missing parameters', () => {
+            expect(() =>
+                compiler.compileExplore(exploreWithInvalidParameterReference),
+            ).toThrow('Missing parameters: b.nonexistent_param');
+        });
+
+        test('should hint the model name prefix when a short-form parameter reference matches a model-level parameter', () => {
+            // Reproduces PROD-6943: a short-form reference like
+            // `${lightdash.parameters.active_status}` doesn't match the
+            // model-prefixed available parameter `b.active_status`.
+            const exploreWithShortFormParameterReference = {
+                ...exploreWithParameters,
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: "${a.dim1} = ${b.dim1} AND ${ld.parameters.active_status} = 'active'",
+                    },
+                ],
+            };
+
+            expect(() =>
+                compiler.compileExplore(exploreWithShortFormParameterReference),
+            ).toThrow(
+                /Missing parameters: active_status\..*Hint:.*"active_status" is a model-level parameter.*\${lightdash\.parameters\.b\.active_status}/,
+            );
+        });
+
+        test('should treat reserved parameter names as available during compilation', () => {
+            const exploreWithReservedParameterReference: UncompiledExplore = {
+                ...exploreWithParameters,
+                tables: {
+                    ...exploreWithParameters.tables,
+                    a: {
+                        ...exploreWithParameters.tables.a,
+                        dimensions: {
+                            ...exploreWithParameters.tables.a.dimensions,
+                            grain_flag: {
+                                ...exploreWithParameters.tables.a.dimensions
+                                    .dim1,
+                                name: 'grain_flag',
+                                label: 'grain_flag',
+                                sql: "{% if ld.parameters.date_zoom == 'week' %}1{% else %}0{% endif %}",
+                            },
+                        },
+                    },
+                },
+            };
+
+            expect(() =>
+                compiler.compileExplore(exploreWithReservedParameterReference),
+            ).not.toThrow();
+        });
+
+        test('should warn (not throw) when a model parameter shadows a reserved name', () => {
+            const exploreShadowingReservedName: UncompiledExplore = {
+                ...exploreWithParameters,
+                meta: {
+                    parameters: {
+                        date_zoom: { label: 'My date zoom', default: 'custom' },
+                    },
+                },
+            };
+
+            const result = compiler.compileExplore(
+                exploreShadowingReservedName,
+            );
+
+            expect(result.warnings).toBeDefined();
+            expect(
+                result.warnings?.some((w) =>
+                    /reserved|overrides/i.test(w.message),
+                ),
+            ).toBe(true);
+        });
+    });
+
+    describe('Partial compilation surfaces field-level errors clearly', () => {
+        const partialCompiler = new ExploreCompiler(warehouseClientMock, {
+            allowPartialCompilation: true,
+        });
+
+        test('should produce a warning that names the failing dimension and hints the model prefix', () => {
+            // Reproduces PROD-6943: a dimension referencing a model-level
+            // parameter via the short form silently compiles to NULL. The
+            // warning surfaced to the user must name the dimension and
+            // explain how to fix the reference.
+            const exploreWithBadDimension: UncompiledExplore = {
+                ...exploreWithParameters,
+                joinedTables: [],
+                tables: {
+                    ...exploreWithParameters.tables,
+                    a: {
+                        ...exploreWithParameters.tables.a,
+                        dimensions: {
+                            ...exploreWithParameters.tables.a.dimensions,
+                            selected_team: {
+                                ...exploreWithParameters.tables.a.dimensions
+                                    .dim1,
+                                name: 'selected_team',
+                                label: 'selected_team',
+                                sql: "CASE WHEN ${lightdash.parameters.region} = 'US' THEN 1 ELSE 0 END",
+                            },
+                        },
+                    },
+                },
+            };
+
+            const result = partialCompiler.compileExplore(
+                exploreWithBadDimension,
+            );
+
+            expect(result.warnings).toBeDefined();
+            const warningMessages = (result.warnings ?? []).map(
+                (w) => w.message,
+            );
+            const dimWarning = warningMessages.find((m) =>
+                m.includes('selected_team'),
+            );
+            expect(dimWarning).toBeDefined();
+            expect(dimWarning).toContain(
+                'Dimension "selected_team" failed to compile',
+            );
+            expect(dimWarning).toContain('Missing parameters: region');
+            expect(dimWarning).toContain('${lightdash.parameters.a.region}');
+            // Confirm the placeholder NULL compiledSql is still present so
+            // the rest of the explore still ships.
+            expect(result.tables.a.dimensions.selected_team.compiledSql).toBe(
+                'NULL',
+            );
+            expect(
+                result.tables.a.dimensions.selected_team.compilationError
+                    ?.message,
+            ).toContain('selected_team');
+        });
+    });
+
+    describe('Parameter resolution in join conditions', () => {
+        test('should preserve parameter references in compiled SQL', () => {
+            const result = compiler.compileExplore(exploreWithParameters);
+
+            expect(result.joinedTables[0].compiledSqlOn).toContain(
+                '${ld.parameters.b.active_status}',
+            );
+        });
+
+        test('should compile table references but preserve parameter references', () => {
+            const result = compiler.compileExplore(exploreWithParameters);
+
+            const compiledSql = result.joinedTables[0].compiledSqlOn;
+            expect(compiledSql).toContain('"a".dim1');
+            expect(compiledSql).toContain('"b".dim1');
+            expect(compiledSql).toContain('${ld.parameters.b.active_status}');
+        });
+
+        test('should track both table and parameter references', () => {
+            const result = compiler.compileExplore(exploreWithParameters);
+
+            expect(result.joinedTables[0].tablesReferences).toEqual(['a', 'b']);
+            expect(result.joinedTables[0].parameterReferences).toEqual([
+                'b.active_status',
+            ]);
+        });
+    });
+
+    describe('Parameter scoping across joined tables', () => {
+        test('should validate parameter exists in correct table scope', () => {
+            expect(() =>
+                compiler.compileExplore(exploreWithInvalidParameterReference),
+            ).toThrow('Missing parameters: b.nonexistent_param');
+        });
+
+        test('should allow parameters from any table in the explore', () => {
+            const exploreWithMultipleParamReferences = {
+                ...exploreWithParameters,
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: "${a.dim1} = ${b.dim1} AND ${ld.parameters.a.region} = 'US' AND ${ld.parameters.b.active_status} = 'active'",
+                    },
+                ],
+            };
+
+            expect(() =>
+                compiler.compileExplore(exploreWithMultipleParamReferences),
+            ).not.toThrow();
+        });
+    });
+
+    describe('Edge cases', () => {
+        test('should handle join with no parameters', () => {
+            const exploreWithoutParams = {
+                ...exploreWithParameters,
+                tables: {
+                    ...exploreWithParameters.tables,
+                    a: {
+                        ...exploreWithParameters.tables.a,
+                        parameters: {},
+                    },
+                    b: {
+                        ...exploreWithParameters.tables.b,
+                        parameters: {},
+                    },
+                },
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: '${a.dim1} = ${b.dim1}',
+                    },
+                ],
+            };
+
+            expect(() =>
+                compiler.compileExplore(exploreWithoutParams),
+            ).not.toThrow();
+        });
+
+        test('should handle tables with undefined parameters', () => {
+            const exploreWithUndefinedParams = {
+                ...exploreWithParameters,
+                tables: {
+                    ...exploreWithParameters.tables,
+                    a: {
+                        ...exploreWithParameters.tables.a,
+                        parameters: undefined,
+                    },
+                    b: {
+                        ...exploreWithParameters.tables.b,
+                        parameters: undefined,
+                    },
+                },
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: '${a.dim1} = ${b.dim1}',
+                    },
+                ],
+            };
+
+            expect(() =>
+                compiler.compileExplore(exploreWithUndefinedParams),
+            ).not.toThrow();
+        });
+
+        test('should handle mixed project and model parameter syntax', () => {
+            const exploreWithMixedSyntax = {
+                ...exploreWithParameters,
+                // Add project-level parameters
+                projectParameters: {
+                    region: {
+                        label: 'Global Region',
+                        description: 'Global region filter',
+                        default: 'US',
+                    },
+                },
+                tables: {
+                    ...exploreWithParameters.tables,
+                    b: {
+                        ...exploreWithParameters.tables.b,
+                        parameters: {
+                            active_status: {
+                                label: 'Active Status',
+                                description:
+                                    'Define what constitutes an active order',
+                                default: 'active',
+                            },
+                        },
+                    },
+                },
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: "${a.dim1} = ${b.dim1} AND ${ld.parameters.b.active_status} = 'active' AND ${ld.parameters.region} = 'US'",
+                    },
+                ],
+            };
+
+            const result = compiler.compileExplore(exploreWithMixedSyntax);
+            expect(result.joinedTables[0].parameterReferences).toEqual([
+                'b.active_status',
+                'region',
+            ]);
+        });
+
+        test('should allow same parameter name at project and model levels without conflict', () => {
+            const exploreWithSameNamedParams = {
+                ...exploreWithParameters,
+                projectParameters: {
+                    region: {
+                        label: 'Global Region',
+                        description: 'Global region filter',
+                        default: 'US',
+                    },
+                    status: {
+                        label: 'Global Status',
+                        description: 'Global status filter',
+                        default: 'active',
+                    },
+                },
+                tables: {
+                    ...exploreWithParameters.tables,
+                    a: {
+                        ...exploreWithParameters.tables.a,
+                        parameters: {
+                            region: {
+                                label: 'Table A Region',
+                                description: 'Region specific to table A',
+                                default: 'EU',
+                            },
+                        },
+                    },
+                    b: {
+                        ...exploreWithParameters.tables.b,
+                        parameters: {
+                            status: {
+                                label: 'Table B Status',
+                                description: 'Status specific to table B',
+                                default: 'inactive',
+                            },
+                        },
+                    },
+                },
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: "${a.dim1} = ${b.dim1} AND ${ld.parameters.region} = 'US' AND ${ld.parameters.a.region} = 'EU' AND ${ld.parameters.status} = 'active' AND ${ld.parameters.b.status} = 'inactive'",
+                    },
+                ],
+            };
+
+            // This should NOT throw an error because parameters are properly scoped
+            expect(() =>
+                compiler.compileExplore(exploreWithSameNamedParams),
+            ).not.toThrow();
+
+            const result = compiler.compileExplore(exploreWithSameNamedParams);
+
+            // Should track all scoped parameters correctly
+            expect(result.joinedTables[0].parameterReferences).toEqual([
+                'region',
+                'a.region',
+                'status',
+                'b.status',
+            ]);
+
+            // Model parameters should be preserved on compiled tables
+            expect(result.tables.a.parameters).toEqual({
+                region: {
+                    label: 'Table A Region',
+                    description: 'Region specific to table A',
+                    default: 'EU',
+                },
+            });
+
+            expect(result.tables.b.parameters).toEqual({
+                status: {
+                    label: 'Table B Status',
+                    description: 'Status specific to table B',
+                    default: 'inactive',
+                },
+            });
+        });
+
+        test('should handle complex scoping scenarios with multiple same-named parameters', () => {
+            const exploreWithComplexScoping = {
+                ...exploreWithParameters,
+                projectParameters: {
+                    date_range: {
+                        label: 'Global Date Range',
+                        description: 'Global date filter',
+                        default: '2024-01-01',
+                    },
+                },
+                tables: {
+                    ...exploreWithParameters.tables,
+                    a: {
+                        ...exploreWithParameters.tables.a,
+                        parameters: {
+                            date_range: {
+                                label: 'Table A Date Range',
+                                description: 'Date range for table A',
+                                default: '2024-02-01',
+                            },
+                        },
+                    },
+                    b: {
+                        ...exploreWithParameters.tables.b,
+                        parameters: {
+                            date_range: {
+                                label: 'Table B Date Range',
+                                description: 'Date range for table B',
+                                default: '2024-03-01',
+                            },
+                        },
+                    },
+                },
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: "${a.dim1} = ${b.dim1} AND ${ld.parameters.date_range} >= '2024-01-01' AND ${ld.parameters.a.date_range} >= '2024-02-01' AND ${lightdash.parameters.b.date_range} >= '2024-03-01'",
+                    },
+                ],
+            };
+
+            expect(() =>
+                compiler.compileExplore(exploreWithComplexScoping),
+            ).not.toThrow();
+
+            const result = compiler.compileExplore(exploreWithComplexScoping);
+            expect(result.joinedTables[0].parameterReferences).toEqual([
+                'date_range',
+                'a.date_range',
+                'b.date_range',
+            ]);
+        });
+    });
+
+    describe('Field Sets', () => {
+        it('should expand field sets in join.fields', () => {
+            const explore: UncompiledExplore = {
+                name: 'test_explore',
+                label: 'Test Explore',
+                tags: [],
+                baseTable: 'a',
+                groupLabel: undefined,
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: '${a.dim1} = ${b.dim1}',
+                        fields: ['all_fields*', '-dim3'],
+                    },
+                ],
+                tables: {
+                    a: {
+                        name: 'a',
+                        label: 'a',
+                        database: 'database',
+                        schema: 'schema',
+                        sqlTable: 'test.a',
+                        dimensions: {
+                            dim1: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim1',
+                                label: 'Dim 1',
+                                table: 'a',
+                                tableLabel: 'a',
+                                sql: '${TABLE}.dim1',
+                                hidden: false,
+                                index: 0,
+                            },
+                        },
+                        metrics: {},
+                        lineageGraph: {},
+                    },
+                    b: {
+                        name: 'b',
+                        label: 'b',
+                        database: 'database',
+                        schema: 'schema',
+                        sqlTable: 'test.b',
+                        dimensions: {
+                            dim1: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim1',
+                                label: 'Dim 1',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: '${TABLE}.dim1',
+                                hidden: false,
+                                index: 0,
+                            },
+                            dim2: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim2',
+                                label: 'Dim 2',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: '${TABLE}.dim2',
+                                hidden: false,
+                                index: 1,
+                            },
+                            dim3: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim3',
+                                label: 'Dim 3',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: '${TABLE}.dim3',
+                                hidden: false,
+                                index: 2,
+                            },
+                        },
+                        metrics: {},
+                        lineageGraph: {},
+                        sets: {
+                            id_fields: {
+                                fields: ['dim1', 'dim2'],
+                            },
+                            all_fields: {
+                                fields: ['id_fields*', 'dim3'],
+                            },
+                        },
+                    },
+                },
+                targetDatabase: SupportedDbtAdapter.POSTGRES,
+                meta: {},
+            };
+
+            const result = compiler.compileExplore(explore);
+
+            // Should include dim1 and dim2 from id_fields, but exclude dim3
+            expect(result.tables.b.dimensions).toHaveProperty('dim1');
+            expect(result.tables.b.dimensions).toHaveProperty('dim2');
+            expect(result.tables.b.dimensions).not.toHaveProperty('dim3');
+        });
+
+        it('should include time interval and custom granularity child dimensions when their base is listed in join.fields', () => {
+            const explore: UncompiledExplore = {
+                name: 'test_explore',
+                label: 'Test Explore',
+                tags: [],
+                baseTable: 'a',
+                groupLabel: undefined,
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: '${a.dim1} = ${b.dim1}',
+                        fields: ['dim1', 'order_date'],
+                    },
+                ],
+                tables: {
+                    a: {
+                        name: 'a',
+                        label: 'a',
+                        database: 'database',
+                        schema: 'schema',
+                        sqlTable: 'test.a',
+                        dimensions: {
+                            dim1: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim1',
+                                label: 'Dim 1',
+                                table: 'a',
+                                tableLabel: 'a',
+                                sql: '${TABLE}.dim1',
+                                hidden: false,
+                                index: 0,
+                            },
+                        },
+                        metrics: {},
+                        lineageGraph: {},
+                    },
+                    b: {
+                        name: 'b',
+                        label: 'b',
+                        database: 'database',
+                        schema: 'schema',
+                        sqlTable: 'test.b',
+                        dimensions: {
+                            dim1: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim1',
+                                label: 'Dim 1',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: '${TABLE}.dim1',
+                                hidden: false,
+                                index: 0,
+                            },
+                            order_date: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.DATE,
+                                name: 'order_date',
+                                label: 'Order date',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: '${TABLE}.order_date',
+                                hidden: false,
+                                index: 1,
+                                isIntervalBase: true,
+                            },
+                            order_date_month: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.DATE,
+                                name: 'order_date_month',
+                                label: 'Order date month',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: "DATE_TRUNC('MONTH', ${TABLE}.order_date)",
+                                hidden: false,
+                                index: 2,
+                                timeInterval: TimeFrames.MONTH,
+                                timeIntervalBaseDimensionName: 'order_date',
+                                timeIntervalBaseDimensionType:
+                                    DimensionType.DATE,
+                            },
+                            order_date_week_starting_friday: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.DATE,
+                                name: 'order_date_week_starting_friday',
+                                label: 'Order date week starting Friday',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: "DATE_TRUNC('WEEK', ${TABLE}.order_date + INTERVAL '2 days') - INTERVAL '2 days'",
+                                hidden: false,
+                                index: 3,
+                                timeInterval: undefined,
+                                customTimeInterval: 'week_starting_friday',
+                                timeIntervalBaseDimensionName: 'order_date',
+                                timeIntervalBaseDimensionType:
+                                    DimensionType.DATE,
+                            },
+                            unrelated_dim: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'unrelated_dim',
+                                label: 'Unrelated',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: '${TABLE}.unrelated_dim',
+                                hidden: false,
+                                index: 4,
+                            },
+                        },
+                        metrics: {},
+                        lineageGraph: {},
+                    },
+                },
+                targetDatabase: SupportedDbtAdapter.POSTGRES,
+                meta: {},
+            };
+
+            const result = compiler.compileExplore(explore);
+
+            expect(result.tables.b.dimensions).toHaveProperty('order_date');
+            expect(result.tables.b.dimensions).toHaveProperty(
+                'order_date_month',
+            );
+            // PROD-7858: custom granularity children should be retained alongside
+            // standard time intervals when the base dimension is in join.fields
+            expect(result.tables.b.dimensions).toHaveProperty(
+                'order_date_week_starting_friday',
+            );
+            expect(result.tables.b.dimensions).not.toHaveProperty(
+                'unrelated_dim',
+            );
+        });
+
+        it('should throw error for non-existent set in join', () => {
+            const explore: UncompiledExplore = {
+                name: 'test_explore',
+                label: 'Test Explore',
+                tags: [],
+                baseTable: 'a',
+                groupLabel: undefined,
+                joinedTables: [
+                    {
+                        table: 'b',
+                        sqlOn: '${a.dim1} = ${b.dim1}',
+                        fields: ['nonexistent_set*'],
+                    },
+                ],
+                tables: {
+                    a: {
+                        name: 'a',
+                        label: 'a',
+                        database: 'database',
+                        schema: 'schema',
+                        sqlTable: 'test.a',
+                        dimensions: {
+                            dim1: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim1',
+                                label: 'Dim 1',
+                                table: 'a',
+                                tableLabel: 'a',
+                                sql: '${TABLE}.dim1',
+                                hidden: false,
+                                index: 0,
+                            },
+                        },
+                        metrics: {},
+                        lineageGraph: {},
+                    },
+                    b: {
+                        name: 'b',
+                        label: 'b',
+                        database: 'database',
+                        schema: 'schema',
+                        sqlTable: 'test.b',
+                        dimensions: {
+                            dim1: {
+                                fieldType: FieldType.DIMENSION,
+                                type: DimensionType.STRING,
+                                name: 'dim1',
+                                label: 'Dim 1',
+                                table: 'b',
+                                tableLabel: 'b',
+                                sql: '${TABLE}.dim1',
+                                hidden: false,
+                                index: 0,
+                            },
+                        },
+                        metrics: {},
+                        lineageGraph: {},
+                    },
+                },
+                targetDatabase: SupportedDbtAdapter.POSTGRES,
+                meta: {},
+            };
+
+            expect(() => compiler.compileExplore(explore)).toThrow(
+                /Set "nonexistent_set" not found/,
+            );
+        });
+    });
+});
+
+describe('sqlContainsAggregation', () => {
+    describe('should detect common aggregation functions', () => {
+        test.each([
+            ['count(${field})', true],
+            ['count(distinct ${field})', true],
+            ['COUNT(DISTINCT ${field})', true],
+            ['sum(${amount})', true],
+            ['SUM(${amount})', true],
+            ['avg(${amount})', true],
+            ['average(${amount})', true],
+            ['min(${amount})', true],
+            ['max(${amount})', true],
+            ['median(${amount})', true],
+            ['stddev(${amount})', true],
+            ['stddev_pop(${amount})', true],
+            ['stddev_samp(${amount})', true],
+            ['variance(${amount})', true],
+            ['var_pop(${amount})', true],
+            ['var_samp(${amount})', true],
+            ['percentile(${amount}, 90)', true],
+            ['percentile_cont(0.5)', true],
+            ['percentile_disc(0.5)', true],
+            ['approx_count_distinct(${field})', true],
+            ['any_value(${field})', true],
+            ['array_agg(${field})', true],
+            ['string_agg(${field}, ",")', true],
+            ['group_concat(${field})', true],
+            ['listagg(${field})', true],
+            ['corr(${x}, ${y})', true],
+            ['covar_pop(${x}, ${y})', true],
+            ['covar_samp(${x}, ${y})', true],
+            ['mode(${field})', true],
+            ['approx_percentile(${field}, 0.5)', true],
+            ["COUNT_IF(${field} <> 'n/a')", true],
+            ['countif(${field} > 0)', true],
+            ['max_by(${field}, ${date})', true],
+            ['MAX_BY(${field}, ${date})', true],
+            ['min_by(${field}, ${date})', true],
+            ['MIN_BY(${field}, ${date})', true],
+        ])('"%s" should return %s', (sql, expected) => {
+            expect(sqlContainsAggregation(sql)).toBe(expected);
+        });
+    });
+
+    describe('should detect aggregation in complex SQL', () => {
+        test.each([
+            ['CASE WHEN x THEN count(${field}) ELSE 0 END', true],
+            ['COALESCE(sum(${amount}), 0)', true],
+            ['sum(${amount}) * 1.1', true],
+            ['2 + count(distinct ${user_id})', true],
+            ['ROUND(avg(${amount}), 2)', true],
+        ])('"%s" should return true', (sql) => {
+            expect(sqlContainsAggregation(sql)).toBe(true);
+        });
+    });
+
+    describe('should not detect aggregation in non-aggregate SQL', () => {
+        test.each([
+            ['${field} * 2', false],
+            ['${field1} + ${field2}', false],
+            ['${summary_field}', false], // 'summary' contains 'sum' but is not sum()
+            ['${count_field}', false], // 'count_field' contains 'count' but is not count()
+            ['COALESCE(${amount}, 0)', false],
+            ["CASE WHEN ${status} = 'active' THEN 1 ELSE 0 END", false],
+            ['UPPER(${name})', false],
+            ['CONCAT(${first_name}, ${last_name})', false],
+            ['max_bytes(${field})', false],
+        ])('"%s" should return false', (sql) => {
+            expect(sqlContainsAggregation(sql)).toBe(false);
+        });
+    });
+
+    describe('should handle edge cases', () => {
+        test('should return false for empty string', () => {
+            expect(sqlContainsAggregation('')).toBe(false);
+        });
+
+        test('should return false for undefined', () => {
+            expect(sqlContainsAggregation(undefined)).toBe(false);
+        });
+
+        test('should return false for null', () => {
+            expect(sqlContainsAggregation(null)).toBe(false);
+        });
+    });
+});
+
+describe('sqlAggregationWrapsReferences', () => {
+    test('should return true when aggregation wraps a metric reference', () => {
+        expect(
+            sqlAggregationWrapsReferences('sum(${max_value})', ['max_value']),
+        ).toBe(true);
+    });
+
+    test('should return true for count(distinct ${metric})', () => {
+        expect(
+            sqlAggregationWrapsReferences('count(distinct ${max_value})', [
+                'max_value',
+            ]),
+        ).toBe(true);
+    });
+
+    test('should return true when one of multiple refs is inside aggregation', () => {
+        expect(
+            sqlAggregationWrapsReferences(
+                'sum(${max_value}) / NULLIF(${count_records}, 0)',
+                ['max_value'],
+            ),
+        ).toBe(true);
+    });
+
+    test('should return false when ref is outside aggregation (sibling aggregates)', () => {
+        expect(
+            sqlAggregationWrapsReferences(
+                'sum(${TABLE}.value) / NULLIF(${count_records}, 0)',
+                ['count_records'],
+            ),
+        ).toBe(false);
+    });
+
+    test('should return false when aggregation wraps raw column, not metric ref', () => {
+        expect(
+            sqlAggregationWrapsReferences('sum(raw_col) / ${count_records}', [
+                'count_records',
+            ]),
+        ).toBe(false);
+    });
+
+    test('should return false for empty refs', () => {
+        expect(sqlAggregationWrapsReferences('sum(${max_value})', [])).toBe(
+            false,
+        );
+    });
+
+    test('should return false for empty sql', () => {
+        expect(sqlAggregationWrapsReferences('', ['max_value'])).toBe(false);
+    });
+
+    test('should handle nested parentheses correctly', () => {
+        expect(
+            sqlAggregationWrapsReferences(
+                'sum(case when ${max_value} > 100 then ${max_value} else 0 end)',
+                ['max_value'],
+            ),
+        ).toBe(true);
+    });
+
+    test('should handle cross-table references', () => {
+        expect(
+            sqlAggregationWrapsReferences('sum(${other_table.max_value})', [
+                'other_table.max_value',
+            ]),
+        ).toBe(true);
+    });
+
+    test('should return true when max_by wraps a metric reference', () => {
+        expect(
+            sqlAggregationWrapsReferences(
+                'max_by(${active_customers}, ${updated_on})',
+                ['active_customers'],
+            ),
+        ).toBe(true);
+    });
+});
+
+describe('relative date metric filters are baked at compile time', () => {
+    const tableWithRelativeDateMetricFilter: Record<string, Table> = {
+        table1: {
+            name: 'table1',
+            label: 'table1',
+            database: 'database',
+            schema: 'schema',
+            sqlTable: '"db"."schema"."table1"',
+            sqlWhere: undefined,
+            dimensions: {
+                last_bet_date: {
+                    type: DimensionType.TIMESTAMP,
+                    name: 'last_bet_date',
+                    label: 'last_bet_date',
+                    table: 'table1',
+                    tableLabel: 'table1',
+                    fieldType: FieldType.DIMENSION,
+                    sql: '${TABLE}.last_bet_date',
+                    hidden: false,
+                },
+            },
+            metrics: {
+                bettor_in_last_30_days: {
+                    type: MetricType.COUNT,
+                    fieldType: FieldType.METRIC,
+                    table: 'table1',
+                    tableLabel: 'table1',
+                    name: 'bettor_in_last_30_days',
+                    label: 'User has bet in the last 30 days',
+                    sql: '${TABLE}.last_bet_date',
+                    hidden: false,
+                    filters: [
+                        {
+                            id: 'f1',
+                            target: { fieldRef: 'last_bet_date' },
+                            operator: FilterOperator.IN_THE_PAST,
+                            values: [30],
+                            settings: {
+                                unitOfTime: UnitOfTime.days,
+                                completed: false,
+                            },
+                        },
+                    ],
+                },
+            },
+            lineageGraph: {},
+            groupLabel: undefined,
+        },
+    };
+
+    const compileAt = (isoNow: string) => {
+        vi.setSystemTime(new Date(isoNow).getTime());
+        return compiler.compileMetric(
+            tableWithRelativeDateMetricFilter.table1.metrics
+                .bettor_in_last_30_days,
+            tableWithRelativeDateMetricFilter,
+            [],
+        );
+    };
+
+    beforeAll(() => vi.useFakeTimers());
+    afterAll(() => vi.useRealTimers());
+
+    test('the window is anchored to compile time and moves on recompile', () => {
+        const compiledInMay = compileAt('2026-05-04T04:12:11Z').compiledSql;
+        const compiledInJune = compileAt('2026-06-04T04:12:11Z').compiledSql;
+
+        // Boundaries are static string literals baked into the SQL...
+        expect(compiledInMay).toContain("'2026-04-04");
+        expect(compiledInJune).toContain("'2026-05-05");
+        // ...with no runtime expression to roll them forward...
+        expect(compiledInJune).not.toMatch(/current_timestamp|now\(\)/i);
+        // ...so the same metric compiles to a different window depending only on
+        // when compilation ran (the frozen string cached in cached_explore).
+        expect(compiledInMay).not.toEqual(compiledInJune);
+    });
+
+    test('the predicate is captured for query-time re-evaluation', () => {
+        const compiled = compileAt('2026-06-04T04:12:11Z');
+
+        // The compile-time predicate is stored verbatim, keyed by filter id, so
+        // the query builder can locate it inside compiledSql and swap in a
+        // freshly evaluated boundary.
+        expect(compiled.compiledRelativeDateFilters).toHaveLength(1);
+        const [stored] = compiled.compiledRelativeDateFilters!;
+        expect(stored.id).toBe('f1');
+        expect(compiled.compiledSql).toContain(stored.compiledSql);
+        expect(stored.compiledSql).toContain("'2026-05-05");
+    });
+});
+
+describe('absolute timestamp metric filters are recorded for query-time re-rendering', () => {
+    const buildTable = (
+        dimensionType: DimensionType,
+        filter: Record<string, unknown>,
+    ): Record<string, Table> => ({
+        table1: {
+            name: 'table1',
+            label: 'table1',
+            database: 'database',
+            schema: 'schema',
+            sqlTable: '"db"."schema"."table1"',
+            sqlWhere: undefined,
+            dimensions: {
+                created_at: {
+                    type: dimensionType,
+                    name: 'created_at',
+                    label: 'created_at',
+                    table: 'table1',
+                    tableLabel: 'table1',
+                    fieldType: FieldType.DIMENSION,
+                    sql: '${TABLE}.created_at',
+                    hidden: false,
+                },
+            },
+            metrics: {
+                filtered_count: {
+                    type: MetricType.COUNT,
+                    fieldType: FieldType.METRIC,
+                    table: 'table1',
+                    tableLabel: 'table1',
+                    name: 'filtered_count',
+                    label: 'filtered_count',
+                    sql: '${TABLE}.created_at',
+                    hidden: false,
+                    filters: [filter as never],
+                },
+            },
+            lineageGraph: {},
+            groupLabel: undefined,
+        },
+    });
+
+    const compileFor = (
+        dimensionType: DimensionType,
+        filter: Record<string, unknown>,
+    ) => {
+        const tables = buildTable(dimensionType, filter);
+        return compiler.compileMetric(
+            tables.table1.metrics.filtered_count,
+            tables,
+            [],
+        );
+    };
+
+    test('an absolute TIMESTAMP predicate is recorded with its swap anchor', () => {
+        const compiled = compileFor(DimensionType.TIMESTAMP, {
+            id: 'f1',
+            target: { fieldRef: 'created_at' },
+            operator: FilterOperator.EQUALS,
+            values: ['2024-01-14T17:00:00.000Z'],
+        });
+        expect(compiled.compiledTimestampFilters).toHaveLength(1);
+        const [stored] = compiled.compiledTimestampFilters!;
+        expect(stored.id).toBe('f1');
+        expect(stored.fieldId).toBe('table1_created_at');
+        expect(compiled.compiledSql).toContain(stored.compiledSql);
+        expect(compiled.compiledRelativeDateFilters).toBeUndefined();
+    });
+
+    test('a relative operator stays in the relative list only', () => {
+        const compiled = compileFor(DimensionType.TIMESTAMP, {
+            id: 'f1',
+            target: { fieldRef: 'created_at' },
+            operator: FilterOperator.IN_THE_PAST,
+            values: [30],
+            settings: { unitOfTime: UnitOfTime.days, completed: false },
+        });
+        expect(compiled.compiledRelativeDateFilters).toHaveLength(1);
+        expect(compiled.compiledTimestampFilters).toBeUndefined();
+    });
+
+    const withDerivedMetric = (tables: Record<string, Table>) => {
+        // eslint-disable-next-line no-param-reassign
+        tables.table1.metrics.derived = {
+            type: MetricType.NUMBER,
+            fieldType: FieldType.METRIC,
+            table: 'table1',
+            tableLabel: 'table1',
+            name: 'derived',
+            label: 'derived',
+            sql: '${table1.filtered_count}',
+            hidden: false,
+        };
+        return tables;
+    };
+
+    test('a derived metric carries the referenced metric recorded timestamp filters', () => {
+        const tables = withDerivedMetric(
+            buildTable(DimensionType.TIMESTAMP, {
+                id: 'f1',
+                target: { fieldRef: 'created_at' },
+                operator: FilterOperator.EQUALS,
+                values: ['2024-01-14T17:00:00.000Z'],
+            }),
+        );
+        const compiled = compiler.compileMetric(
+            tables.table1.metrics.derived,
+            tables,
+            [],
+        );
+        expect(compiled.compiledTimestampFilters).toHaveLength(1);
+        const [stored] = compiled.compiledTimestampFilters!;
+        expect(stored.id).toBe('f1');
+        expect(stored.fieldId).toBe('table1_created_at');
+        expect(compiled.compiledSql).toContain(stored.compiledSql);
+    });
+
+    test('a derived metric carries the referenced metric recorded relative date filters', () => {
+        const tables = withDerivedMetric(
+            buildTable(DimensionType.TIMESTAMP, {
+                id: 'f1',
+                target: { fieldRef: 'created_at' },
+                operator: FilterOperator.IN_THE_PAST,
+                values: [30],
+                settings: { unitOfTime: UnitOfTime.days, completed: false },
+            }),
+        );
+        const compiled = compiler.compileMetric(
+            tables.table1.metrics.derived,
+            tables,
+            [],
+        );
+        expect(compiled.compiledRelativeDateFilters).toHaveLength(1);
+        const [stored] = compiled.compiledRelativeDateFilters!;
+        expect(stored.fieldId).toBe('table1_created_at');
+        expect(compiled.compiledSql).toContain(stored.compiledSql);
+    });
+
+    test('DATE targets and value-less operators are not recorded', () => {
+        const onDate = compileFor(DimensionType.DATE, {
+            id: 'f1',
+            target: { fieldRef: 'created_at' },
+            operator: FilterOperator.EQUALS,
+            values: ['2024-01-14'],
+        });
+        expect(onDate.compiledTimestampFilters).toBeUndefined();
+
+        const nullCheck = compileFor(DimensionType.TIMESTAMP, {
+            id: 'f1',
+            target: { fieldRef: 'created_at' },
+            operator: FilterOperator.NOT_NULL,
+            values: [],
+        });
+        expect(nullCheck.compiledTimestampFilters).toBeUndefined();
+    });
+});

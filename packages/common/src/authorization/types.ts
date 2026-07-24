@@ -1,0 +1,89 @@
+import { type Ability, type ForcedSubject } from '@casl/ability';
+import { type OrganizationMemberProfile } from '../types/organizationMemberProfile';
+
+export type AbilityAction =
+    | 'create'
+    | 'delete'
+    | 'export'
+    | 'impersonate'
+    | 'manage'
+    | 'promote'
+    | 'update'
+    | 'view';
+
+interface Project {
+    organizationUuid: string;
+    projectUuid: string;
+}
+
+interface Organization {
+    organizationUuid: string;
+}
+
+export type CaslSubjectNames =
+    | 'AiAgent'
+    | 'AiAgentDocument'
+    | 'AiAgentThread'
+    | 'AiDeepResearch'
+    | 'Analytics'
+    | 'ChangeCsvResults'
+    | 'CompiledSql'
+    | 'CompileProject'
+    | 'ContentAsCode'
+    | 'ContentVerification'
+    | 'CustomFields'
+    | 'CustomSql'
+    | 'CustomSqlTableCalculations'
+    | 'DataApp'
+    | 'DataAppDependency'
+    | 'Dashboard'
+    | 'DeployProject'
+    | 'DashboardComments'
+    | 'DeletedContent'
+    | 'Explore'
+    | 'ExternalConnection'
+    | 'ExportCsv'
+    | 'GitIntegration'
+    | 'GoogleSheets'
+    | 'Group'
+    | 'InviteLink'
+    | 'Job'
+    | 'JobStatus'
+    | 'MetricsTree'
+    | 'Organization'
+    | 'OrganizationAiAgent'
+    | 'OrganizationColorPalette'
+    | 'OrganizationDesign'
+    | 'OrganizationMemberProfile'
+    | 'OrganizationWarehouseCredentials'
+    | 'PersonalAccessToken'
+    | 'PreAggregation'
+    | 'PinnedItems'
+    | 'Project'
+    | 'ProjectHomepage'
+    | 'SavedChart'
+    | 'ScheduledDeliveries'
+    | 'SemanticViewer'
+    | 'SourceCode'
+    | 'Space'
+    | 'SpotlightTableConfig'
+    | 'SqlRunner'
+    | 'Tags'
+    | 'UnderlyingData'
+    | 'User'
+    | 'Validation'
+    | 'VirtualView';
+
+export type Subject =
+    | CaslSubjectNames
+    | Project
+    | Organization
+    | OrganizationMemberProfile
+    | 'all';
+
+export type PossibleAbilities = [
+    AbilityAction,
+    Subject | ForcedSubject<Exclude<Subject, 'all'>>,
+];
+
+export type MemberAbility = Ability<PossibleAbilities>;

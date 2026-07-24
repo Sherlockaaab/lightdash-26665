@@ -1,0 +1,118 @@
+import {
+    type AbilityAction,
+    type CaslSubjectNames,
+} from '../authorization/types';
+import { type ProjectType } from './projects';
+import { type RoleLevel } from './roles';
+
+/**
+ * Scope groups to organize permissions in the UI for admins.
+ */
+export enum ScopeGroup {
+    CONTENT = 'content',
+    PROJECT_MANAGEMENT = 'project_management',
+    ORGANIZATION_MANAGEMENT = 'organization_management',
+    DATA = 'data',
+    SHARING = 'sharing',
+    AI = 'ai',
+    SPOTLIGHT = 'spotlight',
+}
+
+type BaseScopeContext = {
+    userUuid: string;
+    /** The scopes available to the current user */
+    scopes: Set<ScopeName>;
+    isEnterprise: boolean;
+    /** The user's role name in the organization (for dynamic permission logic) */
+    organizationRole?: string;
+    /** Configuration for dynamic permissions like PAT */
+    permissionsConfig?: {
+        pat: {
+            enabled: boolean;
+            allowedOrgRoles: string[];
+        };
+    };
+};
+
+type OrganizationScopeContext = BaseScopeContext & {
+    organizationUuid: string;
+    projectUuid?: never;
+    projectType?: never;
+    projectCreatedByUserUuid?: never;
+};
+
+type ProjectScopeContext = BaseScopeContext & {
+    projectUuid: string;
+    organizationUuid?: never;
+    /** Type of the project this role assignment belongs to (for @self scopes) */
+    projectType?: ProjectType;
+    /** Creator of the project this role assignment belongs to (for @self scopes) */
+    projectCreatedByUserUuid?: string | null;
+};
+
+/**
+ * Context given to scope getCondition functions
+ */
+export type ScopeContext = OrganizationScopeContext | ProjectScopeContext;
+
+export type ScopeModifer = 'self' | 'public' | 'assigned' | 'space' | 'preview';
+type OptionalModifier = `${'' | `@${ScopeModifer}`}`;
+
+/**
+ * The name of the scope, based on ability and subject (e.g. "create:project")
+ */
+export type ScopeName =
+    `${AbilityAction}:${CaslSubjectNames}${OptionalModifier}`;
+
+/**
+ * A scope defines a specific permission in the system
+ */
+/**
+ * A scope this scope depends on to be fully functional
+ */
+export type ScopeDependency = {
+    name: ScopeName;
+    /**
+     * Present only for conditional dependencies: describes the sub-path on
+     * which the dependency is enforced (starts with "When ...")
+     */
+    description?: string;
+};
+
+export type Scope = {
+    /**
+     * The name of the scope, based on ability, subject, and maybe modifier
+     * e.g. "create:Project" or "create:Project@preview"
+     */
+    name: ScopeName;
+    /**
+     * A helpful description of the permission
+     */
+    description: string;
+    /**
+     * Whether this is a commercial/enterprise feature requiring an enterprise license
+     */
+    isEnterprise: boolean;
+    /**
+     * The grouping from the ScopeGroup enum
+     */
+    group: ScopeGroup;
+    /**
+     * Other scopes this scope needs to be fully functional: without them the
+     * backend rejects or degrades part of its feature. Empty when the scope
+     * works standalone.
+     */
+    dependencies: ScopeDependency[];
+    /**
+     * Organization-only scopes are unavailable to project roles.
+     * Scopes without a level are project scopes; organization roles may grant
+     * them across all projects.
+     */
+    level?: RoleLevel;
+    /**
+     * Get the conditions to be applied to the CASL ability derived from the
+     * scope. Returning null means the scope emits no rule for this context
+     * (an empty array still means an unconditional grant).
+     */
+    getConditions: (context: ScopeContext) => Record<string, unknown>[] | null;
+};
